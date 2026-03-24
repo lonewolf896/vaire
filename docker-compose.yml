@@ -1,0 +1,45 @@
+services:
+  vaire:
+    build: .
+    container_name: vaire
+    # Run as the host user so the socket and DB files are owned correctly.
+    user: "${UID}:${GID}"
+    volumes:
+      - ${HOME}/.vaire:/data
+      - ${HOME}/workspace:/workspace:ro
+      - ./tests/fixtures/ingest:/ingest:ro
+    environment:
+      - VAIRE_PATH_REMAP=/workspace:${VAIRE_HOST_WORKSPACE:-${HOME}/workspace}
+      - VAIRE_COGNITIVE_LOAD_LIMIT=8
+
+      # ── Reranking: GTE reranker is in the image (gte-reranker-modernbert-base) ─
+      # CROSS_ENCODER_ENABLED enables the _cross_encoder_rerank() path which tries
+      # GTE first. FlashRank fallback is not installed but GTE succeeds first.
+      # NLI model (nli-deberta-v3-base) not in image → keep disabled.
+      - VAIRE_NLI_RERANKING_ENABLED=false
+
+      # ── Index-time enrichment ────────────────────────────────────────────────
+      # Doc2Query (msmarco-t5-small-v1) is now in the image — enabled.
+      # COMET (mismayil/comet-bart-ai2) deferred — large model, add later.
+      # ConceptNet HTTP API is 5s/request — unusable for batch enrichment.
+      - VAIRE_COMET_ENRICHMENT_ENABLED=false
+      - VAIRE_CONCEPTNET_ENRICHMENT_ENABLED=false
+
+      # ── FTS5: enable keyword signal (SQLite FTS is fast; weight was 0.0) ───
+      - VAIRE_WRRF_FTS_WEIGHT=0.3
+
+      # ── Candidate pool: 826 active memories; 200 candidates is overkill ───
+      - VAIRE_CANDIDATE_POOL_MULTIPLIER=5
+      - VAIRE_WRRF_CANDIDATE_MULTIPLIER=5
+
+      # ── Write gate: raise threshold to filter more low-signal captures ─────
+      - VAIRE_WRITE_GATE_THRESHOLD=0.55
+    healthcheck:
+      test: ["CMD", "python", "-m", "vaire", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    # Optional: limit memory if running on a shared machine.
+    # mem_limit: 2g

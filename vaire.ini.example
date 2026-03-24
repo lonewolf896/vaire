@@ -1,0 +1,36 @@
+# Vaire local configuration
+#
+# Copy this file to vaire.ini and adjust for your system.
+# vaire.ini is gitignored — it holds machine-specific overrides.
+#
+# Values here are read as defaults. Environment variables with
+# the VAIRE_ prefix always take precedence over this file.
+
+[paths]
+# Host-side workspace directory that is bind-mounted into the container.
+# Used by PATH_REMAP to translate container paths back to host paths.
+# Example: if your projects live under /home/alice/workspace, set this.
+host_workspace = ~/workspace
+
+# Database, socket, and PID file locations (defaults are fine for most setups)
+# db_path = ~/.vaire/memory.db
+# socket_path = ~/.vaire/vaire.sock
+# pid_file = ~/.vaire/vaire.pid
+
+[server]
+# port = 8742
+# max_clients = 32
+# cognitive_load_limit = 8
+
+[retrieval]
+# wrrf_fts_weight = 0.3
+# candidate_pool_multiplier = 5
+# wrrf_candidate_multiplier = 5
+
+[write_gate]
+# write_gate_threshold = 0.55
+
+[enrichment]
+# nli_reranking_enabled = false
+# comet_enrichment_enabled = false
+# conceptnet_enrichment_enabled = false

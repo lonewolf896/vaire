@@ -1,0 +1,6 @@
+dbs:
+  - path: /data/memory.db
+    replicas:
+      - path: /data/replicas/memory.db
+        retention: 24h
+        retention-check-interval: 1h

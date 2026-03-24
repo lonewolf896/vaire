@@ -1,0 +1,62 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+.venv/
+venv/
+env/
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+*.db
+*.db-wal
+*.db-shm
+
+.lockstep/
+*.lockstep.yml
+.lockstep.yml
+lockstep-specs/
+
+.claude/
+
+.env
+vaire.ini
+*.log
+
+# Research notes / benchmark artifacts
+research-prompt*.md
+benchmarks/*.md
+benchmarks/*.log
+benchmarks/eval_*.json
+benchmarks/ablation_runs/
+benchmarks/data/
+
+# LaTeX build artifacts
+docs/*.aux
+docs/*.out
+
+# swdev session artifacts
+sw-session-log.md
+sw-decisions.md
+sw-standards.md
+sw-index.md
+timing_log.jsonl
+logs/
+
+# Stale/archived data
+old-ingest/
+ingest/
+
+# Internal planning/development docs
+sw-project.md
+vaire-*-plan.md
+vaire-supplementary-materials.md
+vaire-pseudocode.md

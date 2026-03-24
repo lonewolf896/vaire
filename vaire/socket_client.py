@@ -1,0 +1,790 @@
+"""
+Vaire thin MCP client.
+
+Proxies every MCP tool call to the shared Vaire socket server over a
+Unix domain socket.  Has no state, no database connection, no embedding model.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import secrets
+import socket
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+from .protocol import ProtocolError, read_message, write_message
+
+logger = logging.getLogger(__name__)
+
+# ── Agent identity ─────────────────────────────────────────────────────────────
+
+# One token per process lifetime — stays stable across reconnects.
+# `secrets.token_hex` always returns a non-empty hex string, so this is
+# never empty unless something deeply wrong happened with the runtime.
+_SESSION_TOKEN: str = secrets.token_hex(16)
+
+
+def generate_agent_id() -> str:
+    """Return a unique, stable agent identifier for this client process.
+
+    Format: ``{hostname}:{pid}:{token[:8]}``
+
+    Raises:
+        RuntimeError: if the generated ID is unexpectedly empty or equals
+                      "default".  This should never happen in practice; the
+                      check is a defensive assertion against future refactors.
+    """
+    hostname = socket.gethostname() or "unknown"
+    pid = os.getpid()
+    token_fragment = _SESSION_TOKEN[:8]
+    agent_id = f"{hostname}:{pid}:{token_fragment}"
+
+    # Defensive assertion — the format above cannot produce these values, but
+    # we guard explicitly so a future refactor cannot silently regress.
+    if not agent_id or agent_id == "default":
+        raise RuntimeError(
+            f"generate_agent_id produced an invalid identifier: {agent_id!r}"
+        )
+
+    return agent_id
+
+
+# ── Client exception ───────────────────────────────────────────────────────────
+
+class VaireError(Exception):
+    """Raised when the server returns an error-status response."""
+
+    def __init__(self, message: str, code: str = "UNKNOWN") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# ── Timeout constant ───────────────────────────────────────────────────────────
+
+# Default per-call timeout; overridden by VAIRE_CALL_TIMEOUT_SECONDS in config.
+_DEFAULT_CALL_TIMEOUT: float = 30.0
+
+
+# ── Client ─────────────────────────────────────────────────────────────────────
+
+class VaireClient:
+    """Async Unix socket client with multiplexed request–response matching.
+
+    Maintains a background receiver task that reads all inbound messages and
+    routes each one to the Future registered for its ``id`` by `call()`.
+    """
+
+    def __init__(
+        self,
+        socket_path: str,
+        agent_id: str | None = None,
+        call_timeout: float = _DEFAULT_CALL_TIMEOUT,
+    ) -> None:
+        self._socket_path = socket_path
+        self._agent_id = agent_id or generate_agent_id()
+        self._call_timeout = call_timeout
+
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        # Keyed by request id; each value is resolved by _recv_loop.
+        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._recv_task: asyncio.Task[None] | None = None
+        # Lock to serialise concurrent auto-connect attempts.
+        self._connect_lock: asyncio.Lock = asyncio.Lock()
+
+    @property
+    def agent_id(self) -> str:
+        return self._agent_id
+
+    async def connect(self, retries: int = 5, backoff: float = 0.5) -> None:
+        """Open the Unix domain socket connection and start the receiver loop.
+
+        Retries with exponential backoff when the socket file does not exist yet
+        (e.g. the server container is still starting).
+        """
+        last_err: Exception | None = None
+        for attempt in range(retries):
+            try:
+                self._reader, self._writer = await asyncio.open_unix_connection(
+                    self._socket_path
+                )
+                self._recv_task = asyncio.get_running_loop().create_task(
+                    self._recv_loop()
+                )
+                return
+            except (FileNotFoundError, ConnectionRefusedError) as exc:
+                last_err = exc
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff * (2 ** attempt))
+        raise last_err  # type: ignore[misc]
+
+    async def disconnect(self) -> None:
+        """Gracefully close the connection and cancel the receiver loop."""
+        if self._recv_task is not None:
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except asyncio.CancelledError:
+                pass
+            self._recv_task = None
+
+        if self._writer is not None:
+            self._writer.close()
+            try:
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+            self._writer = None
+            self._reader = None
+
+    async def _ensure_connected(self) -> None:
+        """Connect (or reconnect) if the writer is absent or the recv task has exited."""
+        needs_connect = self._writer is None or (
+            self._recv_task is not None and self._recv_task.done()
+        )
+        if needs_connect:
+            async with self._connect_lock:
+                needs_connect = self._writer is None or (
+                    self._recv_task is not None and self._recv_task.done()
+                )
+                if needs_connect:
+                    # Clean up any stale state before reconnecting.
+                    if self._writer is not None:
+                        try:
+                            self._writer.close()
+                        except Exception:
+                            pass
+                        self._writer = None
+                        self._reader = None
+                    if self._recv_task is not None and not self._recv_task.done():
+                        self._recv_task.cancel()
+                    self._recv_task = None
+                    await self.connect()
+
+    async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Send an RPC request and return the decoded result dict.
+
+        Raises:
+            VaireError:       if the server responds with status "error".
+            asyncio.TimeoutError: if no response arrives within the timeout.
+        """
+        await self._ensure_connected()
+
+        request_id = secrets.token_hex(8)
+        payload = {
+            "id": request_id,
+            "method": method,
+            "agent_id": self._agent_id,
+            "params": params,
+        }
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending[request_id] = future
+
+        try:
+            await write_message(self._writer, payload)
+            response = await asyncio.wait_for(
+                future, timeout=self._call_timeout
+            )
+        except OSError:
+            # Broken pipe or connection reset — reset state and retry once.
+            self._pending.pop(request_id, None)
+            self._writer = None
+            self._reader = None
+            await self._ensure_connected()
+            request_id = secrets.token_hex(8)
+            payload["id"] = request_id
+            future = loop.create_future()
+            self._pending[request_id] = future
+            try:
+                await write_message(self._writer, payload)
+                response = await asyncio.wait_for(
+                    future, timeout=self._call_timeout
+                )
+            except (asyncio.TimeoutError, Exception):
+                self._pending.pop(request_id, None)
+                raise
+        except (asyncio.TimeoutError, Exception):
+            self._pending.pop(request_id, None)
+            raise
+
+        if response.get("status") == "error":
+            raise VaireError(
+                response.get("error", "Unknown error"),
+                code=response.get("code", "UNKNOWN"),
+            )
+
+        return response.get("result", {})
+
+    async def _recv_loop(self) -> None:
+        """Background task: read responses and resolve matching futures."""
+        assert self._reader is not None
+        try:
+            while True:
+                try:
+                    msg = await read_message(self._reader)
+                except ProtocolError as exc:
+                    if exc.code == "DISCONNECTED":
+                        break
+                    logger.warning("Protocol error from server: %s", exc)
+                    continue
+
+                response_id = msg.get("id")
+                future = self._pending.pop(response_id, None)
+                if future is not None and not future.done():
+                    future.set_result(msg)
+                else:
+                    logger.debug(
+                        "Received response for unknown/expired request id=%s",
+                        response_id,
+                    )
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Cancel all pending callers so they don't hang after disconnect.
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.cancel()
+            self._pending.clear()
+            # Reset connection state so _ensure_connected() triggers on the next call.
+            self._writer = None
+            self._reader = None
+            self._recv_task = None
+
+
+# ── MCP thin proxy ─────────────────────────────────────────────────────────────
+
+mcp = FastMCP(name="vaire")
+
+# Module-level singleton; created lazily on first use so settings are resolved
+# at runtime, not import time.
+_client: VaireClient | None = None
+_client_lock: asyncio.Lock | None = None
+
+
+def _get_client_lock() -> asyncio.Lock:
+    """Return (and lazily create) the module-level client creation lock."""
+    global _client_lock
+    if _client_lock is None:
+        _client_lock = asyncio.Lock()
+    return _client_lock
+
+
+def _build_client() -> VaireClient:
+    from .config import get_settings
+
+    settings = get_settings()
+    return VaireClient(
+        socket_path=str(settings.socket_path_resolved),
+        agent_id=generate_agent_id(),
+        call_timeout=float(settings.CALL_TIMEOUT_SECONDS),
+    )
+
+
+async def get_client_async() -> VaireClient:
+    """Return the module-level client, creating it safely under an async lock."""
+    global _client
+    if _client is None:
+        async with _get_client_lock():
+            if _client is None:
+                _client = _build_client()
+    return _client
+
+
+def get_client() -> VaireClient:
+    """Return the module-level client, creating it on first call.
+
+    Safe for single-threaded sync use.  Prefer get_client_async() when called
+    from an async context to avoid a race between concurrent coroutines.
+    """
+    global _client
+    if _client is None:
+        _client = _build_client()
+    return _client
+
+
+# ── Async call helpers ─────────────────────────────────────────────────────────
+# All @mcp.tool() stubs are async and may run concurrently; use the async
+# client accessor so the singleton is created under a lock.
+
+async def _client_call(method: str, params: dict) -> Any:
+    """Fetch the client singleton (async-safe) and invoke method."""
+    return await (await get_client_async()).call(method, params)
+
+
+# ── MCP tool stubs ─────────────────────────────────────────────────────────────
+# Each tool forwards its arguments verbatim to the server; no logic lives here.
+
+@mcp.tool()
+async def remember(
+    content: str,
+    context: str,
+    tags: list[str] | None = None,
+) -> dict:
+    """Store a memory in Vaire."""
+    return await _client_call(
+        "remember",
+        {"content": content, "context": context, "tags": tags or []},
+    )
+
+
+@mcp.tool()
+async def recall(
+    query: str,
+    context: str | None = None,
+    max_results: int = 10,
+) -> dict:
+    """Retrieve memories matching a query."""
+    return await _client_call(
+        "recall",
+        {"query": query, "context": context, "max_results": max_results},
+    )
+
+
+@mcp.tool()
+async def forget(memory_id: int) -> dict:
+    """Delete a memory by ID."""
+    return await _client_call("forget", {"memory_id": memory_id})
+
+
+@mcp.tool()
+async def get_project_context(directory: str) -> dict:
+    """Return all hot memories for a directory."""
+    return await _client_call(
+        "get_project_context", {"directory": directory}
+    )
+
+
+@mcp.tool()
+async def memory_stats() -> dict:
+    """Return system memory statistics."""
+    return await _client_call("memory_stats", {})
+
+
+@mcp.tool()
+async def consolidate_now() -> dict:
+    """Trigger an immediate consolidation cycle."""
+    return await _client_call("consolidate_now", {})
+
+
+@mcp.tool()
+async def rate_memory(memory_id: int, rating: float) -> dict:
+    """Rate a memory's usefulness."""
+    return await _client_call(
+        "rate_memory", {"memory_id": memory_id, "rating": rating}
+    )
+
+
+@mcp.tool()
+async def validate_memory(memory_id: int) -> dict:
+    """Check a memory's validity against current file state."""
+    return await _client_call("validate_memory", {"memory_id": memory_id})
+
+
+@mcp.tool()
+async def recall_hierarchical(
+    query: str,
+    level: int | None = None,
+    max_results: int = 10,
+) -> list:
+    """Retrieve memories from the fractal hierarchy."""
+    return await _client_call(
+        "recall_hierarchical",
+        {"query": query, "level": level, "max_results": max_results},
+    )
+
+
+@mcp.tool()
+async def drill_down(cluster_id: int) -> list:
+    """Drill into a cluster to see its members."""
+    return await _client_call("drill_down", {"cluster_id": cluster_id})
+
+
+@mcp.tool()
+async def create_trigger(
+    content: str,
+    trigger_condition: str,
+    trigger_type: str,
+    target_directory: str | None = None,
+) -> dict:
+    """Create a prospective memory trigger."""
+    return await _client_call(
+        "create_trigger",
+        {
+            "content": content,
+            "trigger_condition": trigger_condition,
+            "trigger_type": trigger_type,
+            "target_directory": target_directory,
+        },
+    )
+
+
+@mcp.tool()
+async def get_project_story(directory: str) -> str:
+    """Get the autobiographical narrative for a project directory."""
+    return await _client_call("get_project_story", {"directory": directory})
+
+
+@mcp.tool()
+async def add_rule(
+    rule_type: str,
+    scope: str,
+    condition: str,
+    action: str,
+    priority: int = 0,
+    scope_value: str = "",
+) -> dict:
+    """Add a neuro-symbolic rule for filtering/re-ranking memories."""
+    return await _client_call(
+        "add_rule",
+        {
+            "rule_type": rule_type,
+            "scope": scope,
+            "condition": condition,
+            "action": action,
+            "priority": priority,
+            "scope_value": scope_value,
+        },
+    )
+
+
+@mcp.tool()
+async def get_rules(directory: str = "") -> list:
+    """Get active rules."""
+    return await _client_call("get_rules", {"directory": directory})
+
+
+@mcp.tool()
+async def navigate_memory(query: str, top_k: int = 5) -> list:
+    """Navigate concept space using Successor Representation cognitive maps."""
+    return await _client_call("navigate_memory", {"query": query, "top_k": top_k})
+
+
+@mcp.tool()
+async def get_causal_chain(entity: str) -> dict:
+    """Get causal causes and effects for an entity."""
+    return await _client_call("get_causal_chain", {"entity": entity})
+
+
+@mcp.tool()
+async def assess_coverage(query: str, directory: str = "") -> dict:
+    """Assess how well Vaire knows about a topic."""
+    return await _client_call(
+        "assess_coverage", {"query": query, "directory": directory}
+    )
+
+
+@mcp.tool()
+async def detect_gaps(directory: str) -> list:
+    """Detect knowledge gaps for a project directory."""
+    return await _client_call("detect_gaps", {"directory": directory})
+
+
+@mcp.tool()
+async def checkpoint(
+    directory: str,
+    current_task: str = "",
+    files_being_edited: list[str] | None = None,
+    key_decisions: list[str] | None = None,
+    open_questions: list[str] | None = None,
+    next_steps: list[str] | None = None,
+    active_errors: list[str] | None = None,
+    custom_context: str = "",
+) -> dict:
+    """Snapshot your current working state for post-compaction recovery."""
+    return await _client_call(
+        "checkpoint",
+        {
+            "directory": directory,
+            "current_task": current_task,
+            "files_being_edited": files_being_edited,
+            "key_decisions": key_decisions,
+            "open_questions": open_questions,
+            "next_steps": next_steps,
+            "active_errors": active_errors,
+            "custom_context": custom_context,
+        },
+    )
+
+
+@mcp.tool()
+async def restore(directory: str = "") -> dict:
+    """Restore context after compaction using Hippocampal Replay."""
+    return await _client_call("restore", {"directory": directory})
+
+
+@mcp.tool()
+async def anchor(content: str, context: str, reason: str = "") -> dict:
+    """Mark critical context as compaction-resistant."""
+    return await _client_call(
+        "anchor", {"content": content, "context": context, "reason": reason}
+    )
+
+
+@mcp.tool()
+async def install_hooks(project_directory: str = "") -> dict:
+    """Install Claude Code hooks for automatic memory capture and replay."""
+    return await _client_call(
+        "install_hooks", {"project_directory": project_directory}
+    )
+
+
+@mcp.tool()
+async def sync_instructions(claude_md_path: str = "") -> dict:
+    """Sync Vaire instructions into the global CLAUDE.md file."""
+    return await _client_call(
+        "sync_instructions", {"claude_md_path": claude_md_path}
+    )
+
+
+@mcp.tool()
+async def ingest_file(file_path: str, dry_run: bool = False) -> dict:
+    """Ingest a markdown/text file into Vaire's memory store."""
+    return await _client_call(
+        "ingest_file", {"file_path": file_path, "dry_run": dry_run}
+    )
+
+
+@mcp.tool()
+async def ingest_directory(directory_path: str, recursive: bool = True) -> dict:
+    """Ingest all supported files in a directory into Vaire."""
+    return await _client_call(
+        "ingest_directory",
+        {"directory_path": directory_path, "recursive": recursive},
+    )
+
+
+@mcp.tool()
+async def ingest_status(job_id: str) -> dict:
+    """Get the status of a running or completed ingestion job."""
+    return await _client_call("ingest_status", {"job_id": job_id})
+
+
+@mcp.tool()
+async def ingest_preview(file_path: str) -> dict:
+    """Preview how a file would be chunked without writing to storage."""
+    return await _client_call("ingest_preview", {"file_path": file_path})
+
+
+# ── Groomer MCP instance ───────────────────────────────────────────────────────
+
+groomer_mcp = FastMCP(name="vaire-groomer")
+
+# Module-level singleton for the groomer client; uses a groomer- prefixed agent_id.
+_groomer_client: VaireClient | None = None
+_groomer_client_lock: asyncio.Lock | None = None
+
+
+def _get_groomer_client_lock() -> asyncio.Lock:
+    global _groomer_client_lock
+    if _groomer_client_lock is None:
+        _groomer_client_lock = asyncio.Lock()
+    return _groomer_client_lock
+
+
+def _build_groomer_client() -> VaireClient:
+    import os as _os
+    import socket as _sock
+    from .config import get_settings
+    settings = get_settings()
+    hostname = _sock.gethostname() or "unknown"
+    pid = _os.getpid()
+    token_fragment = _SESSION_TOKEN[:8]
+    groomer_agent_id = f"groomer-{hostname}:{pid}:{token_fragment}"
+    return VaireClient(
+        socket_path=str(settings.socket_path_resolved),
+        agent_id=groomer_agent_id,
+        call_timeout=float(settings.CALL_TIMEOUT_SECONDS),
+    )
+
+
+async def get_groomer_client_async() -> VaireClient:
+    """Return the groomer client singleton, creating it safely under an async lock."""
+    global _groomer_client
+    if _groomer_client is None:
+        async with _get_groomer_client_lock():
+            if _groomer_client is None:
+                _groomer_client = _build_groomer_client()
+    return _groomer_client
+
+
+def get_groomer_client() -> VaireClient:
+    """Return the groomer client singleton, creating it on first call.
+
+    Prefer get_groomer_client_async() from async contexts.
+    """
+    global _groomer_client
+    if _groomer_client is None:
+        _groomer_client = _build_groomer_client()
+    return _groomer_client
+
+
+# ── Groomer async call helper ──────────────────────────────────────────────────
+
+async def _groomer_call(method: str, params: dict) -> Any:
+    """Fetch the groomer client singleton (async-safe) and invoke method."""
+    return await (await get_groomer_client_async()).call(method, params)
+
+
+# ── Groomer tool stubs ─────────────────────────────────────────────────────────
+
+
+@groomer_mcp.tool()
+async def groom_audit(
+    directory: str | None = None,
+    min_age_days: int | None = None,
+    max_heat: float | None = None,
+    tags: list[str] | None = None,
+    store_type: str | None = None,
+    limit: int = 50,
+) -> list:
+    """Browse the corpus with optional filters, ordered oldest/coldest first."""
+    return await _groomer_call(
+        "groom_audit",
+        {
+            "directory": directory,
+            "min_age_days": min_age_days,
+            "max_heat": max_heat,
+            "tags": tags,
+            "store_type": store_type,
+            "limit": limit,
+        },
+    )
+
+
+@groomer_mcp.tool()
+async def groom_inspect(memory_id: int) -> dict:
+    """Return the full memory record including archive history."""
+    return await _groomer_call("groom_inspect", {"memory_id": memory_id})
+
+
+@groomer_mcp.tool()
+async def groom_duplicates(
+    similarity_threshold: float = 0.85,
+    directory: str | None = None,
+    limit: int = 50,
+) -> list:
+    """Return candidate duplicate groups."""
+    return await _groomer_call(
+        "groom_duplicates",
+        {
+            "similarity_threshold": similarity_threshold,
+            "directory": directory,
+            "limit": limit,
+        },
+    )
+
+
+@groomer_mcp.tool()
+async def groom_contradictions(
+    directory: str | None = None,
+    limit: int = 50,
+) -> list:
+    """Scan for memories with negation mismatches or action divergence."""
+    return await _groomer_call(
+        "groom_contradictions", {"directory": directory, "limit": limit}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_orphans(directory: str | None = None, limit: int = 50) -> list:
+    """Return low-connectivity memories (cold, untagged)."""
+    return await _groomer_call(
+        "groom_orphans", {"directory": directory, "limit": limit}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_stale(directory: str | None = None, limit: int = 50) -> list:
+    """Return memories flagged as stale."""
+    return await _groomer_call(
+        "groom_stale", {"directory": directory, "limit": limit}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_stats(directory: str | None = None) -> dict:
+    """Return grooming-specific corpus statistics."""
+    return await _groomer_call("groom_stats", {"directory": directory})
+
+
+@groomer_mcp.tool()
+async def groom_merge(
+    memory_ids: list[int],
+    merged_content: str,
+    merged_tags: list[str] | None = None,
+) -> dict:
+    """Merge N memories into one; archive the originals."""
+    return await _groomer_call(
+        "groom_merge",
+        {
+            "memory_ids": memory_ids,
+            "merged_content": merged_content,
+            "merged_tags": merged_tags or [],
+        },
+    )
+
+
+@groomer_mcp.tool()
+async def groom_split(memory_id: int, splits: list[dict]) -> dict:
+    """Split one memory into N; archive the original."""
+    return await _groomer_call(
+        "groom_split", {"memory_id": memory_id, "splits": splits}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_retag(memory_id: int, new_tags: list[str]) -> dict:
+    """Replace a memory's tags."""
+    return await _groomer_call(
+        "groom_retag", {"memory_id": memory_id, "new_tags": new_tags}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_reclassify(memory_id: int, new_directory: str) -> dict:
+    """Move a memory to a different directory context."""
+    return await _groomer_call(
+        "groom_reclassify",
+        {"memory_id": memory_id, "new_directory": new_directory},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_update_content(memory_id: int, new_content: str) -> dict:
+    """Rewrite a memory's content; re-embeds automatically."""
+    return await _groomer_call(
+        "groom_update_content",
+        {"memory_id": memory_id, "new_content": new_content},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_promote(memory_id: int) -> dict:
+    """Boost a memory: heat=1.0, protected, _anchor tag."""
+    return await _groomer_call("groom_promote", {"memory_id": memory_id})
+
+
+@groomer_mcp.tool()
+async def groom_demote(memory_id: int) -> dict:
+    """Demote a memory: heat=0.01, unprotected."""
+    return await _groomer_call("groom_demote", {"memory_id": memory_id})
+
+
+@groomer_mcp.tool()
+async def groom_bulk_delete(filter: dict) -> dict:
+    """Delete memories matching filter dict (at least one criterion required)."""
+    return await _groomer_call("groom_bulk_delete", {"filter": filter})
+
+
+@groomer_mcp.tool()
+async def groom_auto(directory: str | None = None, depth: str = "light") -> dict:
+    """Run a structured grooming pass (depth: light/medium/deep)."""
+    return await _groomer_call(
+        "groom_auto", {"directory": directory, "depth": depth}
+    )
