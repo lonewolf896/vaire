@@ -74,6 +74,9 @@ class IniSettingsSource(PydanticBaseSettingsSource):
 class Settings(BaseSettings):
     PORT: int = 8742
     IDLE_THRESHOLD_SECONDS: int = 300
+    ACTION_LOG_INTERVAL: int = 60  # light cycle: decay + action log processing
+    MEDIUM_CYCLE_INTERVAL: int = 900  # medium cycle: + entity extraction + merge (15 min)
+    SLEEP_CYCLE_MIN_GAP_HOURS: float = 6.0  # minimum hours between full sleep cycles
     DECAY_FACTOR: float = 0.95
     COLD_THRESHOLD: float = 0.05
     HOT_THRESHOLD: float = 0.7

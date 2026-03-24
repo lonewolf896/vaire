@@ -11,6 +11,21 @@ from vaire.thermodynamics import MemoryThermodynamics
 
 logger = logging.getLogger(__name__)
 
+# Patterns that indicate a "specific" entity worth deriving patterns from.
+# File paths, dotted module names, CamelCase classes, snake_case functions,
+# error types — anything that looks like a code identifier rather than
+# a plain English word.
+_SPECIFIC_ENTITY_RE = re.compile(
+    r"(?:"
+    r"/[\w./-]+"          # file paths: /foo/bar.py
+    r"|[\w]+\.[\w.]+"     # dotted names: vaire.consolidation, Chart.yaml
+    r"|[A-Z][a-z]+[A-Z]"  # CamelCase: AstrocyteEngine, TypeError
+    r"|[\w]+_[\w]+"       # snake_case: _process_action_log, memory_stats
+    r"|[\w]*(?:Error|Exception|Warning)\b"  # error types
+    r"|[\w]+\.\w{1,5}$"  # file extensions: foo.py, values.yaml
+    r")"
+)
+
 # Negation patterns for contradiction detection
 _NEGATION_RE = re.compile(
     r"\b(not|don't|doesn't|didn't|won't|can't|cannot|isn't|aren't|wasn't|weren't|"
@@ -52,6 +67,20 @@ class MemoryCurator:
         self._embeddings = embeddings
         self._thermo = thermodynamics
         self._settings = settings
+
+    @staticmethod
+    def _is_specific_entity(name: str) -> bool:
+        """Return True if the entity name looks like a code identifier.
+
+        Rejects plain English words (password, correctly, looping, yaml, etc.)
+        in favour of file paths, dotted modules, CamelCase classes,
+        snake_case functions, and error types.
+        """
+        # Must be at least 4 chars
+        if len(name) < 4:
+            return False
+        # Must match at least one "specific" pattern
+        return _SPECIFIC_ENTITY_RE.search(name) is not None
 
     # ── a. Active Curation on Ingestion ──────────────────────────────────
 
@@ -458,6 +487,12 @@ class MemoryCurator:
 
             src_name = src_entity[0]
             tgt_name = tgt_entity[0]
+
+            # Skip generic entities that produce meaningless patterns.
+            # A useful entity is a file path, function name, class name,
+            # error type, or similar identifier — not a plain English word.
+            if not self._is_specific_entity(src_name) or not self._is_specific_entity(tgt_name):
+                continue
 
             # Check if we already derived a fact for this pair
             derived_content = f"{src_name} and {tgt_name} are frequently modified together"

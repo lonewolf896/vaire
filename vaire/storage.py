@@ -492,6 +492,12 @@ class StorageEngine:
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_action_log_processed ON action_log(processed, timestamp)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS metadata(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         c.commit()
 
     # -- helpers --
