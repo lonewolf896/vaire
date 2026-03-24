@@ -19,7 +19,7 @@ Docker is the recommended way to run Vaire. The image bundles all three ML model
 ### 1. Clone and build
 
 ```bash
-git clone https://github.com/amanhij/Vaire.git
+git clone https://github.com/lonewolf896/Vaire.git
 cd Vaire
 UID=$(id -u) GID=$(id -g) docker compose up -d --build
 ```
@@ -126,7 +126,7 @@ pip install vaire
 Or from source:
 
 ```bash
-git clone https://github.com/amanhij/Vaire.git
+git clone https://github.com/lonewolf896/Vaire.git
 cd Vaire
 pip install -e .
 ```
