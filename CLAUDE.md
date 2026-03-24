@@ -43,5 +43,20 @@ Claude Code → python -m vaire client (MCP thin client)
 | `recall` | Retrieve relevant past context before starting work |
 | `forget` | Remove stale or incorrect memories |
 | `get_project_context` | Hot memories for a directory |
-| `consolidate_now` | Force consolidation after a heavy session |
+| `consolidate_now` | Force a full consolidation cycle (rarely needed — 3-tier daemon handles this) |
 | `memory_stats` | System health check |
+
+## Consolidation tiers
+
+The astrocyte daemon runs continuously on three schedules:
+
+| Tier | Interval | Phases |
+|---|---|---|
+| Light | 60s (`ACTION_LOG_INTERVAL`) | Heat decay + action log → outcome extraction |
+| Medium | 15min (`MEDIUM_CYCLE_INTERVAL`) | Entity extraction + duplicate merge |
+| Full | 5min idle (`IDLE_THRESHOLD_SECONDS`) | Causal discovery + memify + CLS + compression |
+| Sleep | 6h gap (`SLEEP_CYCLE_MIN_GAP_HOURS`) | Dream replay + community detection |
+
+Action log entries are grouped into 30-min time windows. Only complete windows are processed.
+Outcome extraction transforms raw tool calls into narratives (files edited, git ops, errors).
+The write gate filters redundant outcomes. Entity specificity filter rejects generic words.

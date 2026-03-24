@@ -1,10 +1,9 @@
 # Vaire
 
-<!-- mcp-name: io.github.amanhij/vaire -->
+<!-- mcp-name: io.github.lonewolf896/vaire -->
 
-[![PyPI](https://img.shields.io/pypi/v/vaire)](https://pypi.org/project/vaire/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-1248%20passed-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-1215%20passed-brightgreen)](#testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
 *Named after Vairë the Weaver, who weaves the story of the world in the halls of Mandos.*
@@ -35,35 +34,21 @@ Ingest chunks — markdown files, specs, runbooks — are stored with `is_protec
 
 ---
 
-## Two minutes to never repeat yourself again
+## Three-tier consolidation: how Vaire thinks while you work
 
-```bash
-pip install vaire
-```
+Vaire's consolidation daemon runs continuously, not just when you're idle. It operates on three tiers, modeled on the distinction between waking maintenance and deep sleep consolidation in biological memory:
 
-Add to your Claude Code config:
+**Light cycle (every 60 seconds)** — The always-on heartbeat. Applies thermodynamic decay to memory heat values (unused memories cool, accessed ones stay warm) and processes the action log. Raw tool calls captured by the PostToolUse hook are grouped into 30-minute windows and transformed into outcome narratives: "edited: consolidation.py; git: commit, push; errors encountered: timezone mismatch." Only complete time windows are processed — the current bucket stays open until it closes.
 
-```json
-{
-  "mcpServers": {
-    "vaire": {
-      "command": "vaire"
-    }
-  }
-}
-```
+**Medium cycle (every 15 minutes)** — Keeps the knowledge graph fresh during active work. Extracts entities and relationships from new memories and merges near-duplicates. This is what makes `recall` and `navigate_memory` accurate even during long sessions — the graph doesn't go stale waiting for idle time.
 
-Tell Claude how to use it. Drop this in your global `~/.claude/CLAUDE.md` (your home directory, not per-project):
+**Full cycle (5 minutes of idle)** — The heavy machinery. Runs causal discovery (PC algorithm on entity relationships), the memify self-improvement cycle (prune dead memories, strengthen high-value ones, derive new patterns from the knowledge graph), CLS dual-store promotion (episodic to semantic), and rate-distortion compression of old memories. These phases are computationally expensive and benefit from running without contention.
 
-```markdown
-## Memory
-- On every new session, call `recall` with the current project name
-- Before starting any task, call `get_project_context` for the current directory
-- After completing significant work, call `remember` to store decisions and outcomes
-- When the user switches to a new subject mid-session, call `restore` before responding
-```
+**Sleep cycle (6-hour minimum gap)** — The deepest consolidation. Dream replay compares random memory pairs to discover non-obvious connections. Louvain community detection reorganizes the fractal hierarchy. Temporal compression collapses related episodes. This mirrors how biological sleep consolidates the day's experiences into structured long-term knowledge. The gap is configurable (`VAIRE_SLEEP_CYCLE_MIN_GAP_HOURS`) and persisted across container restarts.
 
-Or just let Vaire handle it. On every startup, it automatically syncs `~/.claude/CLAUDE.md` with the latest instructions via `sync_instructions`. You set it up once and never think about it again.
+Every incoming memory passes through a **predictive coding write gate** that computes surprisal — how much the new information violates what Vaire already knows. Redundant information is blocked. Action log entries get an additional **outcome extraction** step that transforms raw tool calls into what-was-accomplished narratives, and a **specificity filter** that only derives patterns from code identifiers (file paths, function names, error types) rather than generic English words.
+
+The result: Vaire runs as an always-on daemon serving multiple agents, consolidating knowledge continuously without waiting for silence.
 
 ## What this actually feels like
 
@@ -127,7 +112,7 @@ v1.3.0 fixes all of this:
 
 **Decision auto-protection.** When you say "decided to use Redis instead of Memcached" or "chose the event-sourcing pattern over CRUD," Vaire detects the decision pattern and automatically marks it as protected. Protected memories never compress and never decay fast. Your decisions outlive your sessions.
 
-**Automatic action capture.** A `PostToolUse` hook fires after every single tool call Claude makes. File edits, bash commands, searches — all captured into a lightweight action log. The consolidation daemon periodically processes these into real memories. You don't call `remember` for routine work. The system just knows.
+**Automatic action capture with outcome extraction.** A `PostToolUse` hook fires after every single tool call Claude makes. File edits, bash commands, searches — all captured into a lightweight action log. The consolidation daemon processes these into outcome narratives that describe *what was accomplished* (files edited, git operations, errors encountered) rather than storing raw tool-call logs. Outcomes pass through the write gate, so only surprising or novel work sessions are retained. You don't call `remember` for routine work. The system just knows.
 
 **Session context injection.** A `SessionStart` hook fires on every new session and injects your project context — hot memories, anchored facts, recent actions, last checkpoint — directly into Claude's context window. Claude starts every session already knowing what you were doing.
 
@@ -202,7 +187,7 @@ Vaire doesn't store memories the way a database stores rows. It treats them more
 
 **Memories compete for space.** A pool of engram slots, each with an excitability score that spikes on use and decays over time. When a new memory arrives, it goes to the most excitable slot. Memories in the same slot get temporally linked, creating chains of related experiences even when their content has nothing in common. This models how real neurons allocate engrams through CREB-dependent excitability.
 
-**Background consolidation runs like sleep.** When you're idle, an astrocyte daemon wakes up and processes recent experiences. It extracts entities and relationships, builds the knowledge graph, merges near-duplicates, discovers causal chains, and runs "dream replay" where random memory pairs are compared and new connections emerge. Four domain-specialized processes handle different types of knowledge at different rates: code structure, architectural decisions, error patterns, and dependencies.
+**Background consolidation runs in tiers.** An astrocyte daemon runs continuously on three schedules. Light cycles (60s) apply heat decay and process the action log into outcome narratives. Medium cycles (15min) extract entities and merge duplicates to keep the knowledge graph fresh. Full cycles (on idle) run causal discovery, self-improvement, and rate-distortion compression. Sleep cycles (6h+ gap) trigger dream replay where random memory pairs are compared and new connections emerge. Four domain-specialized processes handle different types of knowledge at different rates: code structure, architectural decisions, error patterns, and dependencies.
 
 **A cognitive map organizes everything.** Successor representations build a 2D map of concept space where memories that get accessed in similar contexts cluster together, even if their content is completely different. Debugging memories cluster near other debugging memories. Architecture decisions cluster together. Navigate this map, and you find related knowledge that keyword search would never surface.
 
@@ -276,7 +261,7 @@ Everything runs locally. A single SQLite database with WAL mode, FTS5 full-text 
 
 | Module | Role |
 |--------|------|
-| `consolidation.py` | Background astrocyte daemon for periodic consolidation |
+| `consolidation.py` | Three-tier astrocyte daemon: light (60s), medium (15min), full (idle), sleep (6h) |
 | `astrocyte_pool.py` | Domain-specialized worker processes for code, decisions, errors, deps |
 | `sleep_compute.py` | Dream replay, Louvain community detection, temporal compression |
 | `fractal.py` | Multi-scale memory tree with drill-down navigation |
@@ -293,7 +278,7 @@ Everything runs locally. A single SQLite database with WAL mode, FTS5 full-text 
 | `causal_discovery.py` | PC algorithm for causal DAGs from coding session data |
 | `cognitive_map.py` | Successor Representation for navigation-based retrieval |
 | `narrative.py` | Autobiographical project story synthesis |
-| `curation.py` | Duplicate merging, contradiction detection, cross-reference linking |
+| `curation.py` | Duplicate merging, contradiction detection, cross-reference linking, entity specificity filtering |
 
 </details>
 
@@ -322,8 +307,8 @@ The Docker image bundles all three ML models so they never re-download on startu
 - **doc2query/msmarco-t5-small-v1** (~80MB) — synthetic query generation
 
 ```bash
-git clone https://github.com/amanhij/Vaire.git
-cd Vaire
+git clone https://github.com/lonewolf896/vaire.git
+cd vaire
 UID=$(id -u) GID=$(id -g) docker compose up -d
 ```
 
@@ -400,6 +385,9 @@ All settings use the `VAIRE_` environment variable prefix:
 | `VAIRE_COGNITIVE_LOAD_LIMIT` | `8` | Active context chunk limit |
 | `VAIRE_WRRF_FTS_WEIGHT` | `0.3` | Weight of FTS5 keyword signal in WRRF fusion |
 | `VAIRE_CANDIDATE_POOL_MULTIPLIER` | `5` | Candidate pool size multiplier for retrieval |
+| `VAIRE_ACTION_LOG_INTERVAL` | `60` | Seconds between light cycles (decay + action log) |
+| `VAIRE_MEDIUM_CYCLE_INTERVAL` | `900` | Seconds between medium cycles (entity extraction + merge) |
+| `VAIRE_SLEEP_CYCLE_MIN_GAP_HOURS` | `6.0` | Minimum hours between full sleep cycles |
 | `VAIRE_PATH_REMAP` | `` | Container→host path rewrite (`/container:/host`) for correct `directory_context` in Docker |
 
 Full list in `vaire/config.py`.
@@ -415,7 +403,7 @@ Full list in `vaire/config.py`.
 python -m pytest vaire/tests/ -x -q
 ```
 
-1248 tests across 47 test files covering every subsystem.
+1215 tests across 47 test files covering every subsystem.
 
 ## References
 
