@@ -181,17 +181,16 @@ class KnowledgeGraph:
                     existing["id"],
                     datetime.now(timezone.utc).isoformat(),
                 )
-                self._storage._conn.execute(
+                self._storage.execute_write(
                     "UPDATE relationships SET is_causal = 1 WHERE id = ?",
                     (existing["id"],),
                 )
-                self._storage._conn.commit()
             else:
                 src_e = self._storage.get_entity_by_name(causal_src)
                 tgt_e = self._storage.get_entity_by_name(causal_tgt)
                 if src_e and tgt_e:
                     now = datetime.now(timezone.utc).isoformat()
-                    self._storage._conn.execute(
+                    self._storage.execute_write(
                         "INSERT INTO relationships("
                         "source_entity_id, target_entity_id, relationship_type, "
                         "weight, created_at, last_reinforced, event_time, record_time, "
@@ -200,7 +199,6 @@ class KnowledgeGraph:
                         (src_e["id"], tgt_e["id"], "caused_by",
                          1.0, now, now, now, now, 1, 0.8),
                     )
-                    self._storage._conn.commit()
                     created += 1
         return created
 
@@ -420,7 +418,7 @@ class KnowledgeGraph:
         record_time_iso: str,
         confidence: float,
     ) -> int:
-        cur = self._storage._conn.execute(
+        cur = self._storage.execute_write(
             "INSERT INTO relationships("
             "source_entity_id, target_entity_id, relationship_type, "
             "weight, created_at, last_reinforced, event_time, record_time, "
@@ -431,16 +429,14 @@ class KnowledgeGraph:
              event_time_iso, record_time_iso,
              0, confidence),
         )
-        self._storage._conn.commit()
         return cur.lastrowid
 
     def _reinforce_typed_relationship(self, rel_id: int, now_iso: str) -> None:
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE relationships SET weight = weight + 1, last_reinforced = ? "
             "WHERE id = ?",
             (now_iso, rel_id),
         )
-        self._storage._conn.commit()
 
     def _get_adjacent(
         self, entity_id: int, rel_types: list[str] | None

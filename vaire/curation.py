@@ -204,20 +204,18 @@ class MemoryCurator:
         merged_embedding = self._embeddings.encode(embed_text)
 
         # Update memory in DB
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE memories SET content = ?, tags = ?, heat = 1.0, "
             "last_accessed = ? WHERE id = ?",
             (merged_content, json.dumps(merged_tags), self._storage._now_iso(), existing_id),
         )
-        self._storage._conn.commit()
 
         # Update embedding in vec0
         if merged_embedding is not None:
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET embedding = ? WHERE id = ?",
                 (merged_embedding, existing_id),
             )
-            self._storage._conn.commit()
             try:
                 self._storage.update_vector(existing_id, merged_embedding)
             except Exception:
@@ -255,11 +253,10 @@ class MemoryCurator:
         })
 
         if contextual_prefix:
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET contextual_prefix = ? WHERE id = ?",
                 (contextual_prefix, memory_id),
             )
-            self._storage._conn.commit()
 
         self._storage.update_memory_scores(
             memory_id,
@@ -334,11 +331,10 @@ class MemoryCurator:
                 })
                 # Reduce confidence of old contradicting memory
                 old_confidence = mem.get("confidence", 1.0)
-                self._storage._conn.execute(
+                self._storage.execute_write(
                     "UPDATE memories SET confidence = ? WHERE id = ?",
                     (max(old_confidence - 0.2, 0.1), mem_id),
                 )
-                self._storage._conn.commit()
                 continue
 
             # Check 2: same entities but different actions
@@ -355,11 +351,10 @@ class MemoryCurator:
                         "reason": "action_divergence",
                     })
                     old_confidence = mem.get("confidence", 1.0)
-                    self._storage._conn.execute(
+                    self._storage.execute_write(
                         "UPDATE memories SET confidence = ? WHERE id = ?",
                         (max(old_confidence - 0.1, 0.1), mem_id),
                     )
-                    self._storage._conn.commit()
 
         return contradictions
 
@@ -398,18 +393,19 @@ class MemoryCurator:
             "WHERE access_count > 5 AND confidence > 0.8 AND importance < 1.0"
         ).fetchall()
 
+        writes: list[tuple[str, tuple]] = []
         for row in rows:
             mem_id = row[0]
             current_importance = row[1] if row[1] is not None else 0.5
             new_importance = min(current_importance + 0.1, 1.0)
-            self._storage._conn.execute(
+            writes.append((
                 "UPDATE memories SET importance = ? WHERE id = ?",
                 (new_importance, mem_id),
-            )
+            ))
             stats["strengthened"] += 1
 
-        if rows:
-            self._storage._conn.commit()
+        if writes:
+            self._storage.execute_writes(writes)
 
     def _memify_reweight(self, stats: dict) -> None:
         """Adjust relationship weights based on usage patterns.
@@ -422,6 +418,7 @@ class MemoryCurator:
             "FROM relationships r"
         ).fetchall()
 
+        writes: list[tuple[str, tuple]] = []
         for row in rows:
             rel_id, weight, src_id, tgt_id = row[0], row[1], row[2], row[3]
             if weight is None:
@@ -451,14 +448,14 @@ class MemoryCurator:
                 continue
 
             if abs(new_weight - weight) > 1e-9:
-                self._storage._conn.execute(
+                writes.append((
                     "UPDATE relationships SET weight = ? WHERE id = ?",
                     (new_weight, rel_id),
-                )
+                ))
                 stats["reweighted"] += 1
 
-        if stats["reweighted"] > 0:
-            self._storage._conn.commit()
+        if writes:
+            self._storage.execute_writes(writes)
 
     def _memify_derive(self, stats: dict) -> None:
         """Generate synthetic derived-fact memories for high-weight entity pairs."""

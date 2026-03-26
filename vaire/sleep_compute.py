@@ -272,12 +272,10 @@ class SleepComputeEngine:
 
             # Assign memories to this cluster
             for mid in memory_ids:
-                self._storage._conn.execute(
+                self._storage.execute_write(
                     "UPDATE memories SET cluster_id = ? WHERE id = ?",
                     (cluster_id, mid),
                 )
-            if memory_ids:
-                self._storage._conn.commit()
 
             results.append({
                 "cluster_id": cluster_id,
@@ -471,11 +469,10 @@ class SleepComputeEngine:
 
             # Update content, set compressed flag, re-embed
             new_embedding = self._embeddings.encode(compressed_content)
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET content = ?, compressed = 1 WHERE id = ?",
                 (compressed_content, mem_id),
             )
-            self._storage._conn.commit()
 
             if new_embedding is not None:
                 self._storage.update_memory_embedding(

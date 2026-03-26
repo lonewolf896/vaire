@@ -177,12 +177,11 @@ class ReconsolidationEngine:
 
         if action == "update":
             new_content = self._update_memory_content(memory_id, current_context)
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET reconsolidation_count = ?, last_reconsolidated = ? "
                 "WHERE id = ?",
                 (recon_count, now_iso, memory_id),
             )
-            self._storage._conn.commit()
             return {
                 "action": "update",
                 "memory_id": memory_id,
@@ -205,12 +204,11 @@ class ReconsolidationEngine:
         })
 
         # Update reconsolidation tracking on the NEW memory
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE memories SET reconsolidation_count = ?, last_reconsolidated = ? "
             "WHERE id = ?",
             (recon_count, now_iso, new_mem_id),
         )
-        self._storage._conn.commit()
 
         return {
             "action": "archive",
@@ -266,11 +264,10 @@ class ReconsolidationEngine:
 
         # Persist
         now_iso = now.isoformat()
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE memories SET plasticity = ?, last_excitability_update = ? WHERE id = ?",
             (new_plasticity, now_iso, memory_id),
         )
-        self._storage._conn.commit()
 
         return new_plasticity
 
@@ -291,11 +288,10 @@ class ReconsolidationEngine:
         elif memory.get("access_count", 0) > 5:
             stability = max(stability - increment * 0.5, 0.0)
 
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE memories SET stability = ? WHERE id = ?",
             (stability, memory_id),
         )
-        self._storage._conn.commit()
 
         return stability
 
@@ -342,11 +338,10 @@ class ReconsolidationEngine:
         new_embedding = self._embeddings.encode(merged)
 
         # Update in storage
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE memories SET content = ?, embedding = ? WHERE id = ?",
             (merged, new_embedding, memory_id),
         )
-        self._storage._conn.commit()
 
         # Also update sqlite-vec vector
         if new_embedding is not None:

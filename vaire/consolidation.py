@@ -166,11 +166,10 @@ class AstrocyteEngine:
     def _save_last_sleep_cycle(self, ts: datetime) -> None:
         """Persist last sleep cycle timestamp to DB."""
         try:
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
                 ("last_sleep_cycle", ts.isoformat()),
             )
-            self._storage._conn.commit()
         except Exception:
             logger.debug("Could not persist last_sleep_cycle (metadata table may not exist)")
 
@@ -426,6 +425,7 @@ class AstrocyteEngine:
         decay = self._settings.DECAY_FACTOR
         cold = self._settings.COLD_THRESHOLD
 
+        heat_updates: list[tuple[int, float]] = []
         for mem in self._storage.get_all_memories_for_decay():
             if mem.get("is_protected"):
                 continue
@@ -441,8 +441,10 @@ class AstrocyteEngine:
                 new_heat = 0.0
                 stats["memories_archived"] += 1
             if abs(new_heat - mem["heat"]) > 1e-9:
-                self._storage.update_memory_heat(mem["id"], new_heat)
+                heat_updates.append((mem["id"], new_heat))
                 stats["memories_updated"] += 1
+        if heat_updates:
+            self._storage.batch_update_heat(heat_updates)
 
         for ent in self._storage.get_all_entities_for_decay():
             try:
@@ -832,11 +834,10 @@ class AstrocyteEngine:
             # Mark all as processed (even if skipped — prevents reprocessing)
             ids = [a["id"] for a in actions]
             placeholders = ",".join("?" * len(ids))
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 f"UPDATE action_log SET processed = 1 WHERE id IN ({placeholders})",
-                ids,
+                tuple(ids),
             )
             stats["processed"] += len(actions)
 
-        self._storage._conn.commit()
         return stats

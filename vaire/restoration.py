@@ -118,16 +118,16 @@ class HippocampalReplay:
             "embedding_model": self._embeddings.get_model_name(),
         })
         # Set protection and importance flags
-        self._storage._conn.execute(
-            "UPDATE memories SET is_protected = 1, importance = 1.0 WHERE id = ?",
-            (memory_id,),
-        )
+        stmts = [
+            ("UPDATE memories SET is_protected = 1, importance = 1.0 WHERE id = ?",
+             (memory_id,)),
+        ]
         if reason:
-            self._storage._conn.execute(
+            stmts.append((
                 "UPDATE memories SET contextual_prefix = ? WHERE id = ?",
                 (f"[ANCHOR: {reason}] ", memory_id),
-            )
-        self._storage._conn.commit()
+            ))
+        self._storage.execute_writes(stmts)
         return memory_id
 
     def should_micro_checkpoint(self, content: str, tags: list[str], surprisal: float = 0.0) -> tuple[bool, str]:
@@ -200,11 +200,10 @@ class HippocampalReplay:
             auto_created = True
         else:
             # Update existing checkpoint with new epoch
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE checkpoints SET epoch = ? WHERE id = ?",
                 (new_epoch, active["id"]),
             )
-            self._storage._conn.commit()
 
         return {
             "status": "drained",

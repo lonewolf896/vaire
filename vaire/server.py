@@ -187,7 +187,7 @@ async def hook_auto_capture(request: Request) -> JSONResponse:
     if tool_name.startswith("mcp__vaire__"):
         return JSONResponse({"status": "skipped", "reason": "vaire_tool"})
 
-    storage._conn.execute(
+    storage.execute_write(
         "INSERT INTO action_log (tool_name, tool_input_summary, directory, session_id, timestamp) "
         "VALUES (?, ?, ?, ?, ?)",
         (
@@ -198,7 +198,6 @@ async def hook_auto_capture(request: Request) -> JSONResponse:
             datetime.now(timezone.utc).isoformat(),
         ),
     )
-    storage._conn.commit()
     return JSONResponse({"status": "captured"})
 
 
@@ -389,11 +388,10 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
         )
 
         if contextual_prefix:
-            storage._conn.execute(
+            storage.execute_write(
                 "UPDATE memories SET contextual_prefix = ? WHERE id = ?",
                 (contextual_prefix, memory_id),
             )
-            storage._conn.commit()
 
         storage.update_memory_scores(
             memory_id,
@@ -405,20 +403,18 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
 
     # Apply CRDT provenance to the stored memory
     if crdt_provenance:
-        storage._conn.execute(
+        storage.execute_write(
             "UPDATE memories SET provenance_agent = ?, vector_clock = ? WHERE id = ?",
             (crdt_provenance["provenance_agent"], crdt_provenance["vector_clock"], memory_id),
         )
-        storage._conn.commit()
 
     # CLS dual-store: classify memory as episodic or semantic
     if _consolidation is not None and _consolidation.cls is not None:
         store_type = _consolidation.cls.classify_memory(content, tags, context)
-        storage._conn.execute(
+        storage.execute_write(
             "UPDATE memories SET store_type = ? WHERE id = ?",
             (store_type, memory_id),
         )
-        storage._conn.commit()
 
     # Register file hash so staleness detector can find the filepath later
     if fhash is not None:
@@ -474,11 +470,10 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
                 entities=hdc_entities,
                 store_type="episodic",
             )
-            storage._conn.execute(
+            storage.execute_write(
                 "UPDATE memories SET hdc_vector = ? WHERE id = ?",
                 (_hdc.to_bytes(hdc_vec), memory_id),
             )
-            storage._conn.commit()
         except Exception:
             logger.debug("HDC encoding failed for memory %s", memory_id)
 
@@ -491,11 +486,10 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
     # 2. Decision auto-protection: detect decisions and shield from decay
     auto_protected = False
     if settings.DECISION_AUTO_PROTECT and _DECISION_STRONG_RE.search(content):
-        storage._conn.execute(
+        storage.execute_write(
             "UPDATE memories SET is_protected = 1, importance = 1.0 WHERE id = ?",
             (memory_id,),
         )
-        storage._conn.commit()
         auto_protected = True
         logger.debug("Decision auto-protected: memory %s", memory_id)
 
@@ -640,14 +634,13 @@ def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str
     for m in merged:
         new_heat = min(m["heat"] + 0.1, 1.0)
         storage.update_memory_heat(m["id"], new_heat)
-        storage._conn.execute(
+        storage.execute_write(
             "UPDATE memories SET last_accessed = ? WHERE id = ?", (now, m["id"])
         )
         m["heat"] = new_heat
         m["last_accessed"] = now
         if thermo is not None:
             thermo.record_access(m["id"], was_useful=True)
-    storage._conn.commit()
 
     # Record SR transitions: link previous recall → current recall
     if _cognitive_map is not None and merged:
@@ -1716,7 +1709,7 @@ def init_engines(
     from vaire.write_queue import WriteQueue
     from vaire.groomer import GroomerEngine
     from vaire.ingest import IngestionPipeline, MarkdownChunker
-    _cache = MemoryCache(_settings)
+    _cache = MemoryCache(_storage)
     _groomer = GroomerEngine(_storage, _embeddings, _cache, _settings)
     _write_queue = WriteQueue(_storage, _cache, _settings)
     _chunker = MarkdownChunker(_settings)

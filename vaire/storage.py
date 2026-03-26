@@ -48,6 +48,12 @@ class StorageEngine:
         # asyncio event-loop thread (and run_in_executor threads) all call storage
         # methods at the same time.
         self._tls = threading.local()
+
+        # Write serialization: all DB mutations go through this lock so the
+        # consolidation daemon thread and the asyncio write queue never compete
+        # for the SQLite WAL writer lock.
+        self._write_lock = threading.Lock()
+
         self._init_schema()
         self._migrate_schema()
 
@@ -72,6 +78,38 @@ class StorageEngine:
             conn = self._make_connection()
             self._tls.conn = conn
         return conn
+
+    # ── Write serialization helpers ─────────────────────────────────────────────
+
+    @property
+    def _in_batch(self) -> bool:
+        """True when a batch transaction is active on this thread (suppresses auto-commit)."""
+        return getattr(self._tls, "_in_batch", False)
+
+    @_in_batch.setter
+    def _in_batch(self, value: bool) -> None:
+        self._tls._in_batch = value
+
+    def _guarded_commit(self) -> None:
+        """Commit unless we're inside a batch transaction (write queue)."""
+        if not self._in_batch:
+            self._conn.commit()
+
+    def execute_write(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        """Execute a single write statement under the write lock. Auto-commits."""
+        with self._write_lock:
+            cur = self._conn.execute(sql, params)
+            self._guarded_commit()
+            return cur
+
+    def execute_writes(self, statements: list[tuple[str, tuple]]) -> None:
+        """Execute multiple write statements atomically under the write lock."""
+        with self._write_lock:
+            for sql, params in statements:
+                self._conn.execute(sql, params)
+            self._guarded_commit()
+
+    # ── Schema initialization ─────────────────────────────────────────────────
 
     def _init_schema(self):
         c = self._conn
@@ -538,7 +576,7 @@ class StorageEngine:
                 episode.get("overlap_end"),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_session_episodes(self, session_id: str) -> list[dict]:
@@ -574,7 +612,7 @@ class StorageEngine:
                 embedding_model,
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         memory_id = cur.lastrowid
         # Enrich FTS content with split identifiers
         enriched = self._enrich_content_for_fts(memory["content"])
@@ -583,7 +621,7 @@ class StorageEngine:
                 "UPDATE memories_fts SET content = ? WHERE rowid = ?",
                 (enriched, memory_id),
             )
-            self._conn.commit()
+            self._guarded_commit()
         # Index-time enrichment
         enrichment_data = {}
         if (settings and getattr(settings, 'INDEX_ENRICHMENT_ENABLED', False)
@@ -624,7 +662,7 @@ class StorageEngine:
                                     "UPDATE memories SET embedding = ? WHERE id = ?",
                                     (new_embedding, memory_id),
                                 )
-                        self._conn.commit()
+                        self._guarded_commit()
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).warning("Enrichment failed: %s", e)
@@ -748,14 +786,14 @@ class StorageEngine:
         self._conn.execute(
             "UPDATE memories SET heat = ? WHERE id = ?", (new_heat, memory_id)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def update_memory_staleness(self, memory_id: int, is_stale: bool):
         self._conn.execute(
             "UPDATE memories SET is_stale = ? WHERE id = ?",
             (int(is_stale), memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def delete_memory(self, memory_id: int):
         # Delete from sqlite-vec first (ignore if not present)
@@ -769,7 +807,7 @@ class StorageEngine:
             "DELETE FROM memory_archives WHERE original_memory_id = ?", (memory_id,)
         )
         self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_memories_for_directory(
         self, directory: str, min_heat: float = 0.1
@@ -911,14 +949,14 @@ class StorageEngine:
             "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
             (memory_id, embedding),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def delete_vector(self, memory_id: int):
         """Delete an embedding from the memory_vectors vec0 table."""
         self._conn.execute(
             "DELETE FROM memory_vectors WHERE rowid = ?", (memory_id,)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def update_vector(self, memory_id: int, embedding: bytes):
         """Update an embedding in memory_vectors (delete + re-insert)."""
@@ -931,7 +969,7 @@ class StorageEngine:
             "INSERT INTO memory_implicit_vectors(rowid, embedding) VALUES (?, ?)",
             (memory_id, embedding),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def search_implicit_vectors(
         self,
@@ -997,7 +1035,7 @@ class StorageEngine:
             "UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?",
             (embedding, embedding_model, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
         # Update the vec0 table too
         try:
             self.update_vector(memory_id, embedding)
@@ -1019,7 +1057,7 @@ class StorageEngine:
             f"CREATE VIRTUAL TABLE memory_vectors USING vec0("
             f"embedding float[{new_dim}])"
         )
-        self._conn.commit()
+        self._guarded_commit()
         self._embedding_dim = new_dim
 
     # -- Entities --
@@ -1038,7 +1076,7 @@ class StorageEngine:
                 int(entity.get("archived", False)),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_entity_by_name(self, name: str) -> dict | None:
@@ -1067,7 +1105,7 @@ class StorageEngine:
         self._conn.execute(
             "UPDATE entities SET heat = ? WHERE id = ?", (new_heat, entity_id)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_all_entities_for_decay(self) -> list[dict]:
         rows = self._conn.execute(
@@ -1079,7 +1117,7 @@ class StorageEngine:
         self._conn.execute(
             "UPDATE entities SET archived = 1 WHERE id = ?", (entity_id,)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def reinforce_entity(self, entity_id: int, heat_bump: float = 0.1):
         self._conn.execute(
@@ -1087,7 +1125,7 @@ class StorageEngine:
             "WHERE id = ?",
             (heat_bump, self._now_iso(), entity_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Relationships --
 
@@ -1106,7 +1144,7 @@ class StorageEngine:
                 relationship.get("last_reinforced", now),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_relationship_between(
@@ -1126,7 +1164,7 @@ class StorageEngine:
             "WHERE id = ?",
             (weight_increase, self._now_iso(), rel_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Episodes (additional) --
 
@@ -1158,7 +1196,7 @@ class StorageEngine:
                 "INSERT INTO file_hashes(filepath, hash, last_checked) VALUES (?, ?, ?)",
                 (filepath, hash_value, now),
             )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_file_hash(self, filepath: str) -> str | None:
         row = self._conn.execute(
@@ -1188,7 +1226,7 @@ class StorageEngine:
                 log.get("duration_ms", 0),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     # -- Stats --
@@ -1243,7 +1281,7 @@ class StorageEngine:
                 cluster.get("heat", 1.0),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_cluster(self, cluster_id: int) -> dict | None:
@@ -1274,7 +1312,7 @@ class StorageEngine:
         self._conn.execute(
             f"UPDATE memory_clusters SET {set_clause} WHERE id = ?", values
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Prospective Memories --
 
@@ -1295,7 +1333,7 @@ class StorageEngine:
                 pm.get("triggered_count", 0),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_active_prospective_memories(self) -> list[dict]:
@@ -1311,7 +1349,7 @@ class StorageEngine:
             "triggered_count = triggered_count + 1 WHERE id = ?",
             (now, pm_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Narrative Entries --
 
@@ -1332,7 +1370,7 @@ class StorageEngine:
                 entry.get("heat", 1.0),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_narratives_for_directory(
@@ -1364,7 +1402,7 @@ class StorageEngine:
                 proc.get("last_active", now),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_astrocyte_processes(self) -> list[dict]:
@@ -1395,7 +1433,7 @@ class StorageEngine:
         self._conn.execute(
             f"UPDATE astrocyte_processes SET {set_clause} WHERE id = ?", values
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Thermodynamics helpers --
 
@@ -1421,7 +1459,7 @@ class StorageEngine:
         self._conn.execute(
             f"UPDATE memories SET {set_clause} WHERE id = ?", values
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def update_memory_metamemory(
         self,
@@ -1436,7 +1474,7 @@ class StorageEngine:
             "WHERE id = ?",
             (access_count, useful_count, confidence, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_memories_in_time_window(
         self, center_time: str, window_minutes: int
@@ -1467,7 +1505,7 @@ class StorageEngine:
                 int(rule.get("is_active", True)),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_rules_for_scope(self, scope: str, scope_value: str | None = None) -> list[dict]:
@@ -1501,11 +1539,11 @@ class StorageEngine:
         self._conn.execute(
             f"UPDATE memory_rules SET {set_clause} WHERE id = ?", values
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def delete_rule(self, rule_id: int):
         self._conn.execute("DELETE FROM memory_rules WHERE id = ?", (rule_id,))
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Memory Archives --
 
@@ -1523,7 +1561,7 @@ class StorageEngine:
                 archive.get("archive_reason", ""),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_archives_for_memory(self, memory_id: int) -> list[dict]:
@@ -1549,7 +1587,7 @@ class StorageEngine:
                 transition.get("session_id", ""),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_transition(self, from_id: int, to_id: int) -> dict | None:
@@ -1566,7 +1604,7 @@ class StorageEngine:
             "WHERE from_memory_id = ? AND to_memory_id = ?",
             (now, from_id, to_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_transitions_from(self, memory_id: int) -> list[dict]:
         rows = self._conn.execute(
@@ -1587,7 +1625,7 @@ class StorageEngine:
             "UPDATE memories SET sr_x = ?, sr_y = ? WHERE id = ?",
             (sr_x, sr_y, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_memories_with_sr_coords(self) -> list[dict]:
         rows = self._conn.execute(
@@ -1611,7 +1649,7 @@ class StorageEngine:
                 int(edge.get("is_validated", False)),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_causal_edges_for_entity(self, entity_id: int) -> list[dict]:
@@ -1637,7 +1675,7 @@ class StorageEngine:
                 "VALUES (?, 0.0, ?)",
                 (i, self._now_iso()),
             )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_engram_slot(self, slot_index: int) -> dict | None:
         row = self._conn.execute(
@@ -1657,7 +1695,7 @@ class StorageEngine:
             "WHERE slot_index = ?",
             (excitability, last_activated, slot_index),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def assign_memory_slot(self, memory_id: int, slot_index: int):
         """Assign a memory to an engram slot and update excitability timestamp."""
@@ -1667,7 +1705,7 @@ class StorageEngine:
             "last_excitability_update = ? WHERE id = ?",
             (slot_index, 1.0, now, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_memories_in_slot(self, slot_index: int) -> list[dict]:
         """Return all memory IDs assigned to a given slot."""
@@ -1714,7 +1752,7 @@ class StorageEngine:
                 "WHERE id = ?",
                 (content, embedding, compression_level, memory_id),
             )
-        self._conn.commit()
+        self._guarded_commit()
         # Update the vec0 table too
         if embedding is not None:
             try:
@@ -1751,7 +1789,7 @@ class StorageEngine:
                 now,
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cursor.lastrowid
 
     def get_active_checkpoint(self) -> dict | None:
@@ -1826,7 +1864,7 @@ class StorageEngine:
                 "VALUES(?, ?, ?, ?, ?)",
                 (row["id"], entity_name, attribute_type, attribute_key, attribute_value),
             )
-            self._conn.commit()
+            self._guarded_commit()
             return row["id"]
 
         evidence = [memory_id] if memory_id is not None else []
@@ -1845,7 +1883,7 @@ class StorageEngine:
             "VALUES(?, ?, ?, ?, ?)",
             (row_id, entity_name, attribute_type, attribute_key, attribute_value),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return row_id
 
     def search_profiles_fts(self, query: str, limit: int = 10) -> list[dict]:
@@ -1900,7 +1938,7 @@ class StorageEngine:
             "VALUES(?, ?, ?, ?)",
             (row_id, subject, belief_type, content),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return row_id
 
     def search_beliefs_fts(self, query: str, limit: int = 10) -> list[dict]:
@@ -2037,14 +2075,14 @@ class StorageEngine:
                     (content, embedding, heat, project_dir, tags_json,
                      now, agent_id, memory_id),
                 )
-                self._conn.commit()
+                self._guarded_commit()
                 # Sync FTS
                 enriched = self._enrich_content_for_fts(content)
                 self._conn.execute(
                     "UPDATE memories_fts SET content=? WHERE rowid=?",
                     (enriched, memory_id),
                 )
-                self._conn.commit()
+                self._guarded_commit()
                 # Sync vector table
                 if embedding is not None:
                     try:
@@ -2064,14 +2102,14 @@ class StorageEngine:
             (content, embedding, heat, importance, int(is_protected),
              project_dir, tags_json, now, now, agent_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
         new_id = cur.lastrowid
         enriched = self._enrich_content_for_fts(content)
         self._conn.execute(
             "UPDATE memories_fts SET content=? WHERE rowid=?",
             (enriched, new_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
         if embedding is not None:
             try:
                 self.insert_vector(new_id, embedding)
@@ -2087,7 +2125,7 @@ class StorageEngine:
             "UPDATE memories SET heat=?, last_accessed=? WHERE id=?",
             (new_heat, accessed_at, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def update_memory_tags(
         self, memory_id: int, tags: list[str], agent_id: str
@@ -2097,7 +2135,7 @@ class StorageEngine:
             "UPDATE memories SET tags=?, provenance_agent=? WHERE id=?",
             (_json.dumps(tags), agent_id, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def upsert_entity(
         self,
@@ -2117,14 +2155,14 @@ class StorageEngine:
                 "archived=0 WHERE id=?",
                 (now, existing[0]),
             )
-            self._conn.commit()
+            self._guarded_commit()
             return int(existing[0])
         cur = self._conn.execute(
             "INSERT INTO entities(name, type, created_at, last_accessed, heat) "
             "VALUES (?,?,?,?,?)",
             (name, entity_type, now, now, heat),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def upsert_relationship(
@@ -2154,7 +2192,7 @@ class StorageEngine:
                 "confidence=?, event_time=? WHERE id=?",
                 (now, confidence, event_time, existing[0]),
             )
-            self._conn.commit()
+            self._guarded_commit()
             return int(existing[0])
         cur = self._conn.execute(
             "INSERT INTO relationships(source_entity_id, target_entity_id, "
@@ -2162,7 +2200,7 @@ class StorageEngine:
             "confidence, event_time) VALUES (?,?,?,1.0,?,?,?,?)",
             (src_id, tgt_id, rel_type, now, now, confidence, event_time),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_memory_by_id(self, memory_id: int) -> dict | None:
@@ -2170,16 +2208,31 @@ class StorageEngine:
         return self.get_memory(memory_id)
 
     def begin_transaction(self) -> None:
-        """Begin an explicit SQLite transaction (deferred)."""
+        """Begin an explicit batch transaction.
+
+        Acquires the write lock and suppresses auto-commit in individual
+        storage methods until commit() or rollback() is called.  The write
+        queue uses this to batch multiple operations atomically.
+        """
+        self._write_lock.acquire()
+        self._in_batch = True
         self._conn.execute("BEGIN")
 
     def commit(self) -> None:
-        """Commit the current transaction."""
-        self._conn.commit()
+        """Commit the current transaction and release the write lock."""
+        try:
+            self._conn.commit()
+        finally:
+            self._in_batch = False
+            self._write_lock.release()
 
     def rollback(self) -> None:
-        """Roll back the current transaction."""
-        self._conn.rollback()
+        """Roll back the current transaction and release the write lock."""
+        try:
+            self._conn.rollback()
+        finally:
+            self._in_batch = False
+            self._write_lock.release()
 
     def batch_update_heat(
         self, updates: list[tuple[int, float]]
@@ -2191,7 +2244,7 @@ class StorageEngine:
             "UPDATE memories SET heat=? WHERE id=?",
             [(heat, mid) for mid, heat in updates],
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # ── Group C — background / consolidation ──────────────────────────────────
 
@@ -2290,7 +2343,7 @@ class StorageEngine:
         self._conn.execute(
             "UPDATE memories SET is_stale = 1 WHERE id = ?", (memory_id,)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_episodes_for_memory(self, memory_id: int) -> list[dict]:
         """Return episodes that sourced this memory (via source_episode_id)."""
@@ -2329,7 +2382,7 @@ class StorageEngine:
             "vector_clock, timestamp) VALUES (?,?,?,?,?)",
             (memory_id, agent_id, operation, vector_clock, timestamp),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # ── Phase 7: Grooming queries ──────────────────────────────────────────────
 
@@ -2544,7 +2597,7 @@ class StorageEngine:
                     reason,
                 ),
             )
-        self._conn.commit()
+        self._guarded_commit()
 
     def bulk_delete_by_filter(self, filter: dict) -> int:  # [COMMITS]
         """Delete memories matching filter. At least one criterion required. [COMMITS]"""
@@ -2621,7 +2674,7 @@ class StorageEngine:
                     self.insert_vector(memory_id, embedding)
                 except Exception:
                     pass
-        self._conn.commit()
+        self._guarded_commit()
 
     def promote_memory(self, memory_id: int) -> None:  # [COMMITS]
         """Set heat=1.0, is_protected=1, add _anchor tag. [COMMITS]"""
@@ -2635,7 +2688,7 @@ class StorageEngine:
             "UPDATE memories SET heat=1.0, is_protected=1, tags=? WHERE id=?",
             (json.dumps(existing_tags), memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def demote_memory(self, memory_id: int) -> None:  # [COMMITS]
         """Set heat=0.01, is_protected=0, remove _anchor tag. [COMMITS]"""
@@ -2647,7 +2700,7 @@ class StorageEngine:
             "UPDATE memories SET heat=0.01, is_protected=0, tags=? WHERE id=?",
             (json.dumps(existing_tags), memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # ── Groomer query tools ─────────────────────────────────────────────────────
 

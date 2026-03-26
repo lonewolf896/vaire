@@ -195,11 +195,10 @@ class FractalMemoryTree:
 
         # Assign memories to this cluster
         for m in memories:
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET cluster_id = ? WHERE id = ?",
                 (cluster_id, m["id"]),
             )
-        self._storage._conn.commit()
 
         return {
             "cluster_id": cluster_id,

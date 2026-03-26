@@ -393,11 +393,10 @@ class DualStoreCLS:
             })
 
             # Set store_type to semantic
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET store_type = 'semantic' WHERE id = ?",
                 (semantic_id,),
             )
-            self._storage._conn.commit()
 
             # e. Link episodic memories to semantic via derived_from
             for mem in cluster_mems:
