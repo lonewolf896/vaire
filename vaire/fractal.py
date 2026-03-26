@@ -329,7 +329,8 @@ class FractalMemoryTree:
             if mem is None:
                 continue
             similarity = 1.0 / (1.0 + distance)
-            mem.pop("embedding", None)
+            for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+                mem.pop(_bf, None)
             results.append({
                 "level": 0,
                 "type": "memory",
@@ -423,7 +424,8 @@ class FractalMemoryTree:
             results = []
             for r in rows:
                 mem = self._storage._row_to_dict(r)
-                mem.pop("embedding", None)
+                for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+                    mem.pop(_bf, None)
                 results.append({
                     "level": 0,
                     "type": "memory",
@@ -450,7 +452,8 @@ class FractalMemoryTree:
         if mem is None:
             return {"memory": None, "level_1_cluster": None, "level_2_cluster": None}
 
-        mem.pop("embedding", None)
+        for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+            mem.pop(_bf, None)
         result: dict = {
             "memory": {
                 "id": mem["id"],

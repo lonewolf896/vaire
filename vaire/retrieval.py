@@ -1381,7 +1381,8 @@ class HippoRetriever:
             mem = self._storage.get_memory(mid)
             if mem and mem["heat"] >= min_heat:
                 mem["_retrieval_score"] = round(total_score, 4)
-                mem.pop("embedding", None)
+                for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+                    mem.pop(_bf, None)
                 result_memories.append(mem)
                 seen_ids.add(mid)
             if len(result_memories) >= rerank_pool:
@@ -1404,7 +1405,8 @@ class HippoRetriever:
                         mem = self._storage.get_memory(mid)
                         if mem and mem["heat"] >= min_heat:
                             mem["_retrieval_score"] = round(fused_scores.get(mid, 0.0), 4)
-                            mem.pop("embedding", None)
+                            for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+                                mem.pop(_bf, None)
                             result_memories.append(mem)
                             seen_ids.add(mid)
 
@@ -1628,7 +1630,8 @@ class HippoRetriever:
                 for mid, distance in vec_hits:
                     mem = self._storage.get_memory(mid)
                     if mem:
-                        mem.pop("embedding", None)
+                        for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+                            mem.pop(_bf, None)
                         vec_results.append(mem)
             # Also do FTS
             fts_results = self._storage.search_memories_fts(

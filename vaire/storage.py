@@ -886,17 +886,20 @@ class StorageEngine:
             "september": "09", "october": "10", "november": "11", "december": "12",
         }
         conditions = []
+        params: list = []
         for hint in month_hints:
             mm = month_map.get(hint.lower())
             if mm:
                 # Match ISO dates like 2023-05-...
-                conditions.append(f"substr(created_at, 6, 2) = '{mm}'")
+                conditions.append("substr(created_at, 6, 2) = ?")
+                params.append(mm)
         if not conditions:
             return []
         where = " OR ".join(conditions)
+        params.extend([min_heat, limit])
         rows = self._conn.execute(
             f"SELECT id FROM memories WHERE ({where}) AND heat >= ? LIMIT ?",
-            (min_heat, limit),
+            params,
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -2659,6 +2662,7 @@ class StorageEngine:
         created_after: str | None = None,
         id_range: list[int] | None = None,
         directory: str | None = None,
+        max_heat: float | None = None,
         limit: int = 50,
         fields: list[str] | None = None,
     ) -> list[dict]:
@@ -2666,6 +2670,9 @@ class StorageEngine:
         conditions: list[str] = []
         params: list = []
 
+        if max_heat is not None:
+            conditions.append("heat <= ?")
+            params.append(max_heat)
         if provenance_agent:
             conditions.append("provenance_agent = ?")
             params.append(provenance_agent)

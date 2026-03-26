@@ -141,29 +141,31 @@ def cmd_capture(args):
         sys.exit(0)  # nothing meaningful to capture
 
     conn = sqlite3.connect(str(db_path), timeout=1)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS action_log("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "tool_name TEXT NOT NULL,"
-        "tool_input_summary TEXT DEFAULT '',"
-        "directory TEXT DEFAULT '',"
-        "session_id TEXT DEFAULT '',"
-        "timestamp TEXT NOT NULL,"
-        "processed INTEGER DEFAULT 0)"
-    )
-    conn.execute(
-        "INSERT INTO action_log (tool_name, tool_input_summary, directory, session_id, timestamp) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (
-            tool_name,
-            summary,
-            directory,
-            session_id,
-            datetime.now(timezone.utc).isoformat(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS action_log("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "tool_name TEXT NOT NULL,"
+            "tool_input_summary TEXT DEFAULT '',"
+            "directory TEXT DEFAULT '',"
+            "session_id TEXT DEFAULT '',"
+            "timestamp TEXT NOT NULL,"
+            "processed INTEGER DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO action_log (tool_name, tool_input_summary, directory, session_id, timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                tool_name,
+                summary,
+                directory,
+                session_id,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _load_approved_groomers(settings) -> frozenset[str]:
@@ -292,22 +294,23 @@ def cmd_context(args):
 
     directory = args.directory
     conn = sqlite3.connect(str(db_path), timeout=2)
-    conn.row_factory = sqlite3.Row
+    try:
+        conn.row_factory = sqlite3.Row
 
-    hot = conn.execute(
-        "SELECT content, heat FROM memories "
-        "WHERE directory_context = ? AND heat > 0.5 "
-        "ORDER BY heat DESC LIMIT 6",
-        (directory,),
-    ).fetchall()
+        hot = conn.execute(
+            "SELECT content, heat FROM memories "
+            "WHERE directory_context = ? AND heat > 0.5 "
+            "ORDER BY heat DESC LIMIT 6",
+            (directory,),
+        ).fetchall()
 
-    anchored = conn.execute(
-        "SELECT content FROM memories "
-        "WHERE is_protected = 1 AND heat > 0 AND tags LIKE '%_anchor%' "
-        "ORDER BY created_at DESC"
-    ).fetchall()
-
-    conn.close()
+        anchored = conn.execute(
+            "SELECT content FROM memories "
+            "WHERE is_protected = 1 AND heat > 0 AND tags LIKE '%_anchor%' "
+            "ORDER BY created_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
 
     if not hot and not anchored:
         return

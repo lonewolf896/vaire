@@ -50,6 +50,13 @@ class GroomerEngine:
         """Browse the corpus with optional filters, ordered oldest/coldest first."""
         # Use groomer_search for the extended filters, fall back to get_memories_by_filter for basics
         if any(v is not None for v in (provenance_agent, content_length_min, content_length_max, tags_empty, id_range)):
+            # Convert min_age_days to created_before ISO string for groomer_search
+            created_before = None
+            if min_age_days is not None:
+                from datetime import datetime as _dt, timedelta, timezone as _tz
+                created_before = (
+                    _dt.now(_tz.utc) - timedelta(days=min_age_days)
+                ).isoformat()
             memories = self._storage.groomer_search(
                 provenance_agent=provenance_agent,
                 content_length_min=content_length_min,
@@ -57,6 +64,8 @@ class GroomerEngine:
                 tags_empty=tags_empty,
                 id_range=id_range,
                 directory=directory,
+                max_heat=max_heat,
+                created_before=created_before,
                 limit=limit,
             )
             return [self._summarise(m) for m in memories]
