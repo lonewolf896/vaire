@@ -201,6 +201,9 @@ class AstrocytePool:
 
             stats["memories_processed"] += 1
 
+            if mem.get("is_protected"):
+                continue
+
             try:
                 last = datetime.fromisoformat(mem["last_accessed"])
             except (ValueError, TypeError):

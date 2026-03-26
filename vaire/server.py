@@ -1523,6 +1523,24 @@ def build_groomer_dispatch() -> dict:
     async def groom_auto(agent_id: str = "", **p):
         return g.auto_groom(**p)
 
+    async def groom_forget(agent_id: str = "", **p):
+        return g.forget(**p)
+
+    async def groom_search(agent_id: str = "", **p):
+        return g.search(**p)
+
+    async def groom_bulk_retag(agent_id: str = "", **p):
+        return g.bulk_retag(**p)
+
+    async def groom_content_scan(agent_id: str = "", **p):
+        return g.content_scan(**p)
+
+    async def groom_provenance(agent_id: str = "", **p):
+        return g.provenance(**p)
+
+    async def groom_bulk_update_content(agent_id: str = "", **p):
+        return g.bulk_update_content(**p)
+
     return {
         "groom_audit": groom_audit,
         "groom_inspect": groom_inspect,
@@ -1540,6 +1558,12 @@ def build_groomer_dispatch() -> dict:
         "groom_demote": groom_demote,
         "groom_bulk_delete": groom_bulk_delete,
         "groom_auto": groom_auto,
+        "groom_forget": groom_forget,
+        "groom_search": groom_search,
+        "groom_bulk_retag": groom_bulk_retag,
+        "groom_content_scan": groom_content_scan,
+        "groom_provenance": groom_provenance,
+        "groom_bulk_update_content": groom_bulk_update_content,
     }
 
 

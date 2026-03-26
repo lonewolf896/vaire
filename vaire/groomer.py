@@ -40,9 +40,26 @@ class GroomerEngine:
         max_heat: float | None = None,
         tags: list[str] | None = None,
         store_type: str | None = None,
+        provenance_agent: str | None = None,
+        content_length_min: int | None = None,
+        content_length_max: int | None = None,
+        tags_empty: bool | None = None,
+        id_range: list[int] | None = None,
         limit: int = 50,
     ) -> list[dict]:
         """Browse the corpus with optional filters, ordered oldest/coldest first."""
+        # Use groomer_search for the extended filters, fall back to get_memories_by_filter for basics
+        if any(v is not None for v in (provenance_agent, content_length_min, content_length_max, tags_empty, id_range)):
+            memories = self._storage.groomer_search(
+                provenance_agent=provenance_agent,
+                content_length_min=content_length_min,
+                content_length_max=content_length_max,
+                tags_empty=tags_empty,
+                id_range=id_range,
+                directory=directory,
+                limit=limit,
+            )
+            return [self._summarise(m) for m in memories]
         memories = self._storage.get_memories_by_filter(
             directory=directory,
             min_age_days=min_age_days,
@@ -58,8 +75,13 @@ class GroomerEngine:
         mem = self._storage.get_memory_full(memory_id)
         if mem is None:
             return {"error": f"Memory {memory_id} not found"}
-        # Remove raw embedding from response (not human-readable)
-        mem.pop("embedding", None)
+        # Strip all binary fields (not human-readable / not JSON-serializable)
+        _BINARY_FIELDS = ("embedding", "hdc_vector", "implicit_embedding")
+        for field in _BINARY_FIELDS:
+            mem.pop(field, None)
+        for archive in mem.get("archive_history", []):
+            for field in _BINARY_FIELDS:
+                archive.pop(field, None)
         return mem
 
     def find_duplicates(
@@ -89,19 +111,51 @@ class GroomerEngine:
             re.IGNORECASE,
         )
         _ACTION_RE = re.compile(r"\b(use|using|implement|choose|prefer|adopt)\b", re.IGNORECASE)
+        # Stopwords excluded from topical overlap check
+        _STOPWORDS = frozenset(
+            "a an the is are was were be been being have has had do does did "
+            "will would shall should may might can could not no and or but if "
+            "then else when where how what which who whom this that these those "
+            "it its i me my we our you your he him his she her they them their "
+            "to of in for on with at by from as into through during before after "
+            "above below between out off over under again further once here there "
+            "all each every both few more most other some such than too very "
+            "just also now so get got use using".split()
+        )
+        _MIN_CONTENT_LEN = 50
+        _MIN_WORD_OVERLAP = 2
+
+        def _content_words(text: str) -> set[str]:
+            return {w for w in re.findall(r"\b[a-z][a-z0-9_.-]+\b", text.lower()) if w not in _STOPWORDS}
 
         memories = self._storage.get_memories_by_filter(directory=directory, limit=limit * 4)
         pairs: list[dict] = []
 
-        for i, m1 in enumerate(memories):
-            c1 = m1.get("content", "")
-            neg1 = bool(_NEGATION_RE.search(c1))
-            acts1 = set(a.lower() for a in _ACTION_RE.findall(c1))
+        # Pre-compute per-memory data
+        mem_data: list[tuple[str, bool, set[str], set[str]]] = []
+        for m in memories:
+            c = m.get("content", "")
+            mem_data.append((
+                c,
+                bool(_NEGATION_RE.search(c)),
+                set(a.lower() for a in _ACTION_RE.findall(c)),
+                _content_words(c),
+            ))
 
-            for m2 in memories[i + 1 :]:
-                c2 = m2.get("content", "")
-                neg2 = bool(_NEGATION_RE.search(c2))
-                acts2 = set(a.lower() for a in _ACTION_RE.findall(c2))
+        for i, m1 in enumerate(memories):
+            c1, neg1, acts1, words1 = mem_data[i]
+            if len(c1) < _MIN_CONTENT_LEN:
+                continue
+
+            for j in range(i + 1, len(memories)):
+                c2, neg2, acts2, words2 = mem_data[j]
+                if len(c2) < _MIN_CONTENT_LEN:
+                    continue
+
+                # Require topical overlap before checking heuristics
+                shared_words = words1 & words2
+                if len(shared_words) < _MIN_WORD_OVERLAP:
+                    continue
 
                 reason = None
                 if neg1 != neg2:
@@ -116,7 +170,7 @@ class GroomerEngine:
                         {
                             "memory_id_a": m1["id"],
                             "content_a": c1[:200],
-                            "memory_id_b": m2["id"],
+                            "memory_id_b": memories[j]["id"],
                             "content_b": c2[:200],
                             "reason": reason,
                         }
@@ -128,10 +182,19 @@ class GroomerEngine:
     def find_orphans(
         self,
         directory: str | None = None,
+        max_heat: float = 0.15,
+        include_tagged: bool = False,
+        min_content_length: int | None = None,
         limit: int = 50,
     ) -> list[dict]:
-        """Return low-connectivity memories (cold, untagged)."""
-        memories = self._storage.get_orphan_memories(directory=directory, limit=limit)
+        """Return low-connectivity memories (cold, optionally untagged)."""
+        memories = self._storage.get_orphan_memories(
+            directory=directory,
+            max_heat=max_heat,
+            include_tagged=include_tagged,
+            min_content_length=min_content_length,
+            limit=limit,
+        )
         return [self._summarise(m) for m in memories]
 
     def find_stale(
@@ -171,6 +234,13 @@ class GroomerEngine:
         )
         duplicate_count = sum(len(g) - 1 for g in duplicate_groups)
 
+        # Provenance breakdown (top 5 agents)
+        agent_counts: dict[str, int] = {}
+        for m in all_mems:
+            agent = m.get("provenance_agent") or "unknown"
+            agent_counts[agent] = agent_counts.get(agent, 0) + 1
+        top_agents = sorted(agent_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
         return {
             "total_memories": total,
             "stale_count": stale_count,
@@ -178,6 +248,7 @@ class GroomerEngine:
             "duplicate_count": duplicate_count,
             "duplicate_groups": len(duplicate_groups),
             "heat_distribution": heat_buckets,
+            "top_provenance_agents": [{"agent": a, "count": c} for a, c in top_agents],
         }
 
     # ── Mutation tools ─────────────────────────────────────────────────────────
@@ -500,6 +571,169 @@ class GroomerEngine:
             )
 
         return report
+
+    # ── New groomer tools (Vale feature requests, 2026-03-26) ───────────────────
+
+    def forget(self, memory_ids: list[int], reason: str = "groomer") -> dict:
+        """Delete memories by ID list, archiving each to grooming_archives first."""
+        if not memory_ids:
+            return {"error": "memory_ids list is empty"}
+        archived = []
+        not_found = []
+        for mid in memory_ids:
+            mem = self._storage.get_memory(mid)
+            if mem is None:
+                not_found.append(mid)
+                continue
+            self._storage.archive_memory(mid, replacement_id=None, reason=reason)
+            self._storage.delete_memory(mid)
+            self._invalidate_delete(mid)
+            archived.append(mid)
+        return {"archived": archived, "not_found": not_found, "reason": reason}
+
+    def search(
+        self,
+        provenance_agent: str | None = None,
+        content_like: str | None = None,
+        content_length_min: int | None = None,
+        content_length_max: int | None = None,
+        tags_empty: bool | None = None,
+        created_before: str | None = None,
+        created_after: str | None = None,
+        id_range: list[int] | None = None,
+        directory: str | None = None,
+        limit: int = 50,
+        fields: list[str] | None = None,
+    ) -> list[dict]:
+        """Raw filtered query — no embedding search, no reranking."""
+        return self._storage.groomer_search(
+            provenance_agent=provenance_agent,
+            content_like=content_like,
+            content_length_min=content_length_min,
+            content_length_max=content_length_max,
+            tags_empty=tags_empty,
+            created_before=created_before,
+            created_after=created_after,
+            id_range=id_range,
+            directory=directory,
+            limit=limit,
+            fields=fields,
+        )
+
+    def bulk_retag(
+        self,
+        filter: dict,
+        new_tags: list[str],
+        mode: str = "replace",
+    ) -> dict:
+        """Retag multiple memories by filter. mode: replace|append|remove."""
+        if mode not in ("replace", "append", "remove"):
+            return {"error": f"Invalid mode: {mode!r}. Must be replace, append, or remove."}
+        memories = self._storage.get_memories_by_filter(**{
+            k: v for k, v in filter.items()
+            if k in self._VALID_FILTER_KEYS
+        })
+        updated = 0
+        for mem in memories:
+            old_tags = mem.get("tags") or []
+            if mode == "replace":
+                final_tags = list(new_tags)
+            elif mode == "append":
+                final_tags = list(set(old_tags) | set(new_tags))
+            else:  # remove
+                final_tags = [t for t in old_tags if t not in new_tags]
+            self._storage.update_memory_full(mem["id"], tags=final_tags)
+            self._invalidate_upsert(
+                mem["id"], mem["content"], mem.get("heat", 0),
+                final_tags, mem.get("directory_context", ""),
+            )
+            updated += 1
+        return {"updated": updated, "mode": mode, "new_tags": new_tags}
+
+    def content_scan(
+        self,
+        pattern: str,
+        replacement: str | None = None,
+        dry_run: bool = True,
+    ) -> dict:
+        """Scan all memories for regex pattern. Optionally replace (re-embeds)."""
+        import re as _re
+        try:
+            regex = _re.compile(pattern)
+        except _re.error as exc:
+            return {"error": f"Invalid regex: {exc}"}
+
+        all_mems = self._storage.get_memories_by_filter(limit=99999)
+        matches: list[dict] = []
+        replaced = 0
+
+        for mem in all_mems:
+            content = mem.get("content", "")
+            found = list(regex.finditer(content))
+            if not found:
+                continue
+            match_info = {
+                "memory_id": mem["id"],
+                "matches": [{"text": m.group(), "start": m.start(), "end": m.end()} for m in found[:5]],
+                "match_count": len(found),
+            }
+            matches.append(match_info)
+
+            if replacement is not None and not dry_run:
+                new_content = regex.sub(replacement, content)
+                embedding = self._embeddings.encode_document(new_content)
+                self._storage.update_memory_full(
+                    mem["id"], content=new_content, embedding=embedding,
+                )
+                self._invalidate_upsert(
+                    mem["id"], new_content, mem.get("heat", 0),
+                    mem.get("tags", []), mem.get("directory_context", ""),
+                )
+                replaced += 1
+
+        result: dict = {
+            "pattern": pattern,
+            "total_matches": len(matches),
+            "dry_run": dry_run,
+            "matches": matches[:100],
+        }
+        if replacement is not None:
+            result["replacement"] = replacement
+            result["replaced"] = replaced
+        return result
+
+    def bulk_update_content(
+        self,
+        memory_ids: list[int],
+        find: str,
+        replace: str,
+    ) -> dict:
+        """Find/replace across specified memory IDs. Re-embeds all affected memories."""
+        if not memory_ids:
+            return {"error": "memory_ids list is empty"}
+        updated = []
+        not_found = []
+        for mid in memory_ids:
+            mem = self._storage.get_memory(mid)
+            if mem is None:
+                not_found.append(mid)
+                continue
+            content = mem.get("content", "")
+            if find not in content:
+                continue
+            new_content = content.replace(find, replace)
+            embedding = self._embeddings.encode_document(new_content)
+            self._storage.update_memory_full(mid, content=new_content, embedding=embedding)
+            self._invalidate_upsert(
+                mid, new_content, mem.get("heat", 0),
+                mem.get("tags", []), mem.get("directory_context", ""),
+            )
+            updated.append(mid)
+        return {"updated": updated, "not_found": not_found}
+
+    def provenance(self, directory: str | None = None) -> list[dict]:
+        """List distinct provenance_agent values with counts, date ranges, top tags."""
+        return self._storage.groomer_provenance(directory=directory)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 

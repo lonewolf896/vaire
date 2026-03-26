@@ -439,7 +439,21 @@ async def add_rule(
     priority: int = 0,
     scope_value: str = "",
 ) -> dict:
-    """Add a neuro-symbolic rule for filtering/re-ranking memories."""
+    """Add a neuro-symbolic rule for filtering/re-ranking memories.
+
+    Args:
+        rule_type: "hard" (must satisfy — uses "filter" action only) or "soft" (preference — uses boost/penalty).
+        scope: "global" (all memories), "directory" (match scope_value path), or "file" (match scope_value pattern).
+        condition: Format is "field operator value". Operators: ==, !=, >, <, >=, <=, contains, not_contains, matches.
+            Fields: tag, content, directory_context, importance, heat, confidence, surprise_score,
+            emotional_valence, plasticity, stability, excitability, access_count, useful_count.
+            Examples: "importance > 0.7", "tag contains architecture", "directory_context matches /project/*".
+        action: "filter" (hard rules only — excludes non-matching memories),
+            "boost:N" (soft rules — multiply score by N, e.g. "boost:1.5"),
+            or "penalty:N" (soft rules — reduce score by N, e.g. "penalty:0.3").
+        priority: Higher values are applied first. Default 0.
+        scope_value: Directory path or file glob pattern. Required when scope is "directory" or "file".
+    """
     return await _client_call(
         "add_rule",
         {
@@ -588,14 +602,22 @@ def _get_groomer_client_lock() -> asyncio.Lock:
 
 
 def _build_groomer_client() -> VaireClient:
-    import os as _os
-    import socket as _sock
+    import configparser
+    from pathlib import Path
     from .config import get_settings
     settings = get_settings()
-    hostname = _sock.gethostname() or "unknown"
-    pid = _os.getpid()
-    token_fragment = _SESSION_TOKEN[:8]
-    groomer_agent_id = f"groomer-{hostname}:{pid}:{token_fragment}"
+    # Read the approved groomer agent_id from ~/.vaire/vaire.ini
+    ini_path = Path(settings.DB_PATH).expanduser().parent / "vaire.ini"
+    groomer_agent_id = ""
+    if ini_path.exists():
+        cfg = configparser.ConfigParser()
+        cfg.read(ini_path)
+        raw = cfg.get("groomer", "approved", fallback="")
+        ids = [g.strip() for g in raw.split(",") if g.strip()]
+        if ids:
+            groomer_agent_id = ids[0]
+    if not groomer_agent_id:
+        groomer_agent_id = f"groomer-{_SESSION_TOKEN[:8]}"
     return VaireClient(
         socket_path=str(settings.socket_path_resolved),
         agent_id=groomer_agent_id,
@@ -641,9 +663,17 @@ async def groom_audit(
     max_heat: float | None = None,
     tags: list[str] | None = None,
     store_type: str | None = None,
+    provenance_agent: str | None = None,
+    content_length_min: int | None = None,
+    content_length_max: int | None = None,
+    tags_empty: bool | None = None,
+    id_range: list[int] | None = None,
     limit: int = 50,
 ) -> list:
-    """Browse the corpus with optional filters, ordered oldest/coldest first."""
+    """Browse the corpus with optional filters, ordered oldest/coldest first.
+
+    Extended filters: provenance_agent, content_length_min/max, tags_empty (bool), id_range ([min, max]).
+    """
     return await _groomer_call(
         "groom_audit",
         {
@@ -652,6 +682,11 @@ async def groom_audit(
             "max_heat": max_heat,
             "tags": tags,
             "store_type": store_type,
+            "provenance_agent": provenance_agent,
+            "content_length_min": content_length_min,
+            "content_length_max": content_length_max,
+            "tags_empty": tags_empty,
+            "id_range": id_range,
             "limit": limit,
         },
     )
@@ -692,10 +727,29 @@ async def groom_contradictions(
 
 
 @groomer_mcp.tool()
-async def groom_orphans(directory: str | None = None, limit: int = 50) -> list:
-    """Return low-connectivity memories (cold, untagged)."""
+async def groom_orphans(
+    directory: str | None = None,
+    max_heat: float = 0.15,
+    include_tagged: bool = False,
+    min_content_length: int | None = None,
+    limit: int = 50,
+) -> list:
+    """Return low-connectivity memories. Configurable thresholds.
+
+    Args:
+        max_heat: Heat threshold (default 0.15).
+        include_tagged: If True, include tagged memories too (default False = untagged only).
+        min_content_length: Minimum content length to include (catches keyword stubs).
+    """
     return await _groomer_call(
-        "groom_orphans", {"directory": directory, "limit": limit}
+        "groom_orphans",
+        {
+            "directory": directory,
+            "max_heat": max_heat,
+            "include_tagged": include_tagged,
+            "min_content_length": min_content_length,
+            "limit": limit,
+        },
     )
 
 
@@ -787,4 +841,118 @@ async def groom_auto(directory: str | None = None, depth: str = "light") -> dict
     """Run a structured grooming pass (depth: light/medium/deep)."""
     return await _groomer_call(
         "groom_auto", {"directory": directory, "depth": depth}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_forget(memory_ids: list[int], reason: str = "groomer") -> dict:
+    """Delete memories by ID list. Archives each to grooming_archives first."""
+    return await _groomer_call(
+        "groom_forget", {"memory_ids": memory_ids, "reason": reason}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_search(
+    provenance_agent: str | None = None,
+    content_like: str | None = None,
+    content_length_min: int | None = None,
+    content_length_max: int | None = None,
+    tags_empty: bool | None = None,
+    created_before: str | None = None,
+    created_after: str | None = None,
+    id_range: list[int] | None = None,
+    directory: str | None = None,
+    limit: int = 50,
+    fields: list[str] | None = None,
+) -> list:
+    """Raw filtered query — no embedding search, no reranking. Just a filtered SELECT.
+
+    Args:
+        provenance_agent: Filter by agent that created the memory.
+        content_like: SQL LIKE pattern match on content (wraps in %...%).
+        content_length_min: Minimum content length in characters.
+        content_length_max: Maximum content length in characters.
+        tags_empty: True = only untagged memories, False = only tagged.
+        created_before: ISO datetime upper bound.
+        created_after: ISO datetime lower bound.
+        id_range: [min_id, max_id] inclusive range.
+        directory: Filter by directory_context.
+        limit: Max results (default 50).
+        fields: Return only these fields (id always included).
+    """
+    return await _groomer_call(
+        "groom_search",
+        {
+            "provenance_agent": provenance_agent,
+            "content_like": content_like,
+            "content_length_min": content_length_min,
+            "content_length_max": content_length_max,
+            "tags_empty": tags_empty,
+            "created_before": created_before,
+            "created_after": created_after,
+            "id_range": id_range,
+            "directory": directory,
+            "limit": limit,
+            "fields": fields,
+        },
+    )
+
+
+@groomer_mcp.tool()
+async def groom_bulk_retag(
+    filter: dict,
+    new_tags: list[str],
+    mode: str = "replace",
+) -> dict:
+    """Retag multiple memories matching a filter.
+
+    Args:
+        filter: Same keys as groom_audit (directory, min_age_days, max_heat, tags, store_type, limit).
+        new_tags: Tags to apply.
+        mode: "replace" (overwrite), "append" (add without removing), or "remove" (remove these tags).
+    """
+    return await _groomer_call(
+        "groom_bulk_retag",
+        {"filter": filter, "new_tags": new_tags, "mode": mode},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_content_scan(
+    pattern: str,
+    replacement: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """Scan all memories for a regex pattern. Optionally find-and-replace (re-embeds automatically).
+
+    Args:
+        pattern: Python regex pattern to search for.
+        replacement: If given with dry_run=False, replaces matches and re-embeds affected memories.
+        dry_run: If True (default), only reports matches without modifying anything.
+    """
+    return await _groomer_call(
+        "groom_content_scan",
+        {"pattern": pattern, "replacement": replacement, "dry_run": dry_run},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_bulk_update_content(
+    memory_ids: list[int],
+    find: str,
+    replace: str,
+) -> dict:
+    """Find/replace across specified memory IDs. Re-embeds all affected memories."""
+    return await _groomer_call(
+        "groom_bulk_update_content",
+        {"memory_ids": memory_ids, "find": find, "replace": replace},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_provenance(directory: str | None = None) -> list:
+    """List distinct provenance_agent values with counts, date ranges, and top tags."""
+    return await _groomer_call(
+        "groom_provenance", {"directory": directory}
     )

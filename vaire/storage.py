@@ -2382,14 +2382,22 @@ class StorageEngine:
     def get_orphan_memories(
         self,
         directory: str | None = None,
+        max_heat: float = 0.15,
+        include_tagged: bool = False,
+        min_content_length: int | None = None,
         limit: int = 50,
     ) -> list[dict]:
-        """Return low-connectivity memories (cold, untagged). NO COMMIT."""
-        cond = "WHERE heat < 0.15 AND (tags IS NULL OR tags = '[]' OR tags = '')"
-        params: list = []
+        """Return low-connectivity memories. NO COMMIT."""
+        cond = "WHERE heat < ?"
+        params: list = [max_heat]
+        if not include_tagged:
+            cond += " AND (tags IS NULL OR tags = '[]' OR tags = '')"
         if directory:
             cond += " AND directory_context = ?"
             params.append(directory)
+        if min_content_length is not None:
+            cond += " AND LENGTH(content) >= ?"
+            params.append(min_content_length)
         rows = self._conn.execute(
             f"SELECT * FROM memories {cond} ORDER BY heat ASC LIMIT ?",
             params + [limit],
@@ -2637,6 +2645,105 @@ class StorageEngine:
             (json.dumps(existing_tags), memory_id),
         )
         self._conn.commit()
+
+    # ── Groomer query tools ─────────────────────────────────────────────────────
+
+    def groomer_search(
+        self,
+        provenance_agent: str | None = None,
+        content_like: str | None = None,
+        content_length_min: int | None = None,
+        content_length_max: int | None = None,
+        tags_empty: bool | None = None,
+        created_before: str | None = None,
+        created_after: str | None = None,
+        id_range: list[int] | None = None,
+        directory: str | None = None,
+        limit: int = 50,
+        fields: list[str] | None = None,
+    ) -> list[dict]:
+        """Raw filtered SELECT for groomer — no embedding search, no reranking. NO COMMIT."""
+        conditions: list[str] = []
+        params: list = []
+
+        if provenance_agent:
+            conditions.append("provenance_agent = ?")
+            params.append(provenance_agent)
+        if content_like:
+            conditions.append("content LIKE ?")
+            params.append(f"%{content_like}%")
+        if content_length_min is not None:
+            conditions.append("LENGTH(content) >= ?")
+            params.append(content_length_min)
+        if content_length_max is not None:
+            conditions.append("LENGTH(content) <= ?")
+            params.append(content_length_max)
+        if tags_empty is True:
+            conditions.append("(tags IS NULL OR tags = '[]' OR tags = '')")
+        elif tags_empty is False:
+            conditions.append("tags IS NOT NULL AND tags != '[]' AND tags != ''")
+        if created_before:
+            conditions.append("created_at < ?")
+            params.append(created_before)
+        if created_after:
+            conditions.append("created_at > ?")
+            params.append(created_after)
+        if id_range and len(id_range) == 2:
+            conditions.append("id >= ? AND id <= ?")
+            params.extend(id_range[:2])
+        if directory:
+            conditions.append("directory_context = ?")
+            params.append(directory)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM memories {where} ORDER BY id ASC LIMIT ?",
+            params + [limit],
+        ).fetchall()
+
+        results = self._rows_to_dicts(rows)
+        # Strip embeddings (not useful for groomer output, not JSON-serializable)
+        for r in results:
+            r.pop("embedding", None)
+
+        if fields:
+            allowed = set(fields) | {"id"}
+            results = [{k: v for k, v in r.items() if k in allowed} for r in results]
+
+        return results
+
+    def groomer_provenance(self, directory: str | None = None) -> list[dict]:
+        """Distinct provenance_agent values with counts, date ranges, top tags. NO COMMIT."""
+        dir_cond = "WHERE directory_context = ?" if directory else ""
+        dir_params = [directory] if directory else []
+
+        rows = self._conn.execute(
+            f"SELECT provenance_agent, COUNT(*) as count, "
+            f"MIN(created_at) as first_seen, MAX(created_at) as last_seen, "
+            f"GROUP_CONCAT(tags, '|||') as all_tags "
+            f"FROM memories {dir_cond} "
+            f"GROUP BY provenance_agent ORDER BY count DESC",
+            dir_params,
+        ).fetchall()
+
+        result = []
+        for row in rows:
+            row_dict = dict(row)
+            # Extract top tags from concatenated tag arrays
+            tag_counts: dict[str, int] = {}
+            raw_tags = row_dict.pop("all_tags", "") or ""
+            for tag_json in raw_tags.split("|||"):
+                try:
+                    tags = json.loads(tag_json) if tag_json.strip() else []
+                except (ValueError, TypeError):
+                    tags = []
+                for t in tags:
+                    if t and not t.startswith("_"):
+                        tag_counts[t] = tag_counts.get(t, 0) + 1
+            top_tags = sorted(tag_counts, key=tag_counts.get, reverse=True)[:5]
+            row_dict["top_tags"] = top_tags
+            result.append(row_dict)
+        return result
 
     def close(self):
         self._conn.close()

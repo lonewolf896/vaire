@@ -58,7 +58,12 @@ def _parse_condition(condition: str) -> tuple[str, str, str]:
             parts = condition.split(f" {op} ", 1)
             return parts[0].strip(), op, parts[1].strip()
 
-    raise ValueError(f"Cannot parse condition: {condition!r}")
+    raise ValueError(
+        f"Cannot parse condition: {condition!r}. "
+        f"Expected format: 'field operator value'. "
+        f"Valid operators: ==, !=, >, <, >=, <=, contains, not_contains, matches. "
+        f"Example: 'importance > 0.7' or 'tag contains architecture'"
+    )
 
 
 def _parse_action(action: str) -> tuple[str, float]:
@@ -70,17 +75,21 @@ def _parse_action(action: str) -> tuple[str, float]:
     """
     if action == "filter":
         return "filter", 0.0
+    _VALID_ACTIONS_HELP = (
+        "Valid actions: 'filter' (hard rules only), "
+        "'boost:N' (e.g. 'boost:1.5'), or 'penalty:N' (e.g. 'penalty:0.3')"
+    )
     if action.startswith("boost:"):
         try:
             return "boost", float(action.split(":", 1)[1])
         except (ValueError, IndexError):
-            raise ValueError(f"Invalid action: {action!r}")
+            raise ValueError(f"Invalid boost value in {action!r}. {_VALID_ACTIONS_HELP}")
     if action.startswith("penalty:"):
         try:
             return "penalty", float(action.split(":", 1)[1])
         except (ValueError, IndexError):
-            raise ValueError(f"Invalid action: {action!r}")
-    raise ValueError(f"Invalid action: {action!r}")
+            raise ValueError(f"Invalid penalty value in {action!r}. {_VALID_ACTIONS_HELP}")
+    raise ValueError(f"Unknown action: {action!r}. {_VALID_ACTIONS_HELP}")
 
 
 def _get_field_value(memory: dict, field: str) -> Any:

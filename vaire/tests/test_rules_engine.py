@@ -124,7 +124,7 @@ class TestParseAction:
         assert _parse_action("penalty:0.2") == ("penalty", 0.2)
 
     def test_invalid(self):
-        with pytest.raises(ValueError, match="Invalid action"):
+        with pytest.raises(ValueError, match="Unknown action"):
             _parse_action("unknown_action")
 
 

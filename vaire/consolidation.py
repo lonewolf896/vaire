@@ -94,6 +94,7 @@ class AstrocyteEngine:
         self._last_sleep_cycle: datetime | None = self._load_last_sleep_cycle()
         self._last_light_cycle: datetime | None = None
         self._last_medium_cycle: datetime | None = None
+        self._last_full_activity: datetime | None = None  # activity stamp when full cycle last ran
 
         self.last_activity: datetime = datetime.now(timezone.utc)
         self.is_running: bool = False
@@ -223,13 +224,15 @@ class AstrocyteEngine:
                     logger.exception("Medium cycle failed")
 
             # Full cycle: + causal discovery + memify + CLS + compression
-            # Only on idle (no agent activity for IDLE_THRESHOLD_SECONDS)
+            # Only on idle, and only if there's been new activity since last run
             if elapsed > self._settings.IDLE_THRESHOLD_SECONDS:
-                try:
-                    self._consolidation_cycle()
-                except Exception:
-                    logger.exception("Full consolidation cycle failed")
-                # Extended idle: trigger sleep cycle
+                if self._last_full_activity != self.last_activity:
+                    try:
+                        self._consolidation_cycle()
+                        self._last_full_activity = self.last_activity
+                    except Exception:
+                        logger.exception("Full consolidation cycle failed")
+                # Extended idle: trigger sleep cycle (also gated by min gap)
                 if elapsed > 2 * self._settings.IDLE_THRESHOLD_SECONDS:
                     self._maybe_sleep_cycle()
 
@@ -424,6 +427,8 @@ class AstrocyteEngine:
         cold = self._settings.COLD_THRESHOLD
 
         for mem in self._storage.get_all_memories_for_decay():
+            if mem.get("is_protected"):
+                continue
             try:
                 last = datetime.fromisoformat(mem["last_accessed"])
                 if last.tzinfo is None:

@@ -1,6 +1,7 @@
 """Entry point for python -m vaire."""
 
 import argparse
+import configparser
 import sys
 from pathlib import Path
 
@@ -165,6 +166,21 @@ def cmd_capture(args):
     conn.close()
 
 
+def _load_approved_groomers(settings) -> frozenset[str]:
+    """Load approved groomer agent_ids from ~/.vaire/vaire.ini.
+
+    Falls back to empty set (prefix-based matching) if the file
+    doesn't exist or has no [groomer] approved entry.
+    """
+    ini_path = Path(settings.DB_PATH).expanduser().parent / "vaire.ini"
+    if not ini_path.exists():
+        return frozenset()
+    cfg = configparser.ConfigParser()
+    cfg.read(ini_path)
+    raw = cfg.get("groomer", "approved", fallback="")
+    return frozenset(g.strip() for g in raw.split(",") if g.strip())
+
+
 def cmd_server(args):
     """Start the Vaire shared memory Unix domain socket server."""
     import asyncio
@@ -196,12 +212,16 @@ def cmd_server(args):
         dispatch.update(build_ingest_dispatch(_server_mod._pipeline))
         groomer = build_groomer_dispatch()
 
+        # Load approved groomers from ini file (not in code — runtime config)
+        approved = _load_approved_groomers(settings)
+
         server = VaireSocketServer(
             socket_path=str(settings.socket_path_resolved),
             pid_file=str(settings.pid_file_resolved),
             dispatch_table=dispatch,
             groomer_methods=groomer,
             max_clients=settings.MAX_CLIENTS,
+            approved_groomers=approved,
         )
 
         await server.start()

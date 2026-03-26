@@ -35,6 +35,8 @@ GROOMER_METHODS: frozenset[str] = frozenset({
     "groom_audit", "groom_inspect", "groom_duplicates", "groom_contradictions",
     "groom_orphans", "groom_stale", "groom_stats",
     "groom_merge", "groom_split", "groom_retag", "groom_reclassify",
+    "groom_forget", "groom_search", "groom_bulk_retag",
+    "groom_content_scan", "groom_provenance", "groom_bulk_update_content",
     "groom_update_content", "groom_promote", "groom_demote", "groom_bulk_delete",
     "groom_auto",
 })
@@ -65,6 +67,7 @@ class VaireSocketServer:
         max_clients: int = 32,
         crdt: CRDTMemorySync | None = None,
         groomer_methods: dict[str, Callable[..., Any]] | None = None,
+        approved_groomers: frozenset[str] | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._pid_file = pid_file
@@ -73,6 +76,7 @@ class VaireSocketServer:
         self._max_clients = max_clients
         self._crdt = crdt
         self._groomer_methods: dict[str, Callable[..., Any]] = groomer_methods or {}
+        self._approved_groomers: frozenset[str] = approved_groomers or frozenset()
 
         self._server: asyncio.Server | None = None
         # Fix #5 — every client task is tracked here; stop() cancels them all.
@@ -281,8 +285,12 @@ class VaireSocketServer:
     # ── Role resolution ────────────────────────────────────────────────────────
 
     def _resolve_role(self, agent_id: str) -> str:
-        """Return 'groomer' if agent_id carries the groomer prefix, else 'agent'."""
-        if agent_id.startswith(self._groomer_id_prefix):
+        """Return 'groomer' if agent_id is in the approved groomers list or
+        carries the groomer prefix (when no allowlist is configured)."""
+        if self._approved_groomers:
+            if agent_id in self._approved_groomers:
+                return "groomer"
+        elif agent_id.startswith(self._groomer_id_prefix):
             return "groomer"
         return "agent"
 

@@ -44,6 +44,9 @@ class IngestionJob:
 class MarkdownChunker:
     """Splits a Markdown file into semantically meaningful chunks."""
 
+    # Match YAML frontmatter: starts at beginning of file, delimited by ---
+    _FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*\n?", re.DOTALL)
+
     def __init__(self, settings: Settings) -> None:
         self._min = settings.INGEST_CHUNK_MIN
         self._max = settings.INGEST_CHUNK_MAX
@@ -54,6 +57,10 @@ class MarkdownChunker:
 
     def chunk_file(self, file_path: str) -> list[Chunk]:
         text = Path(file_path).read_text(encoding="utf-8")
+        if not text.strip():
+            return []
+        # Strip YAML frontmatter — it's metadata, not content worth chunking
+        text = self._FRONTMATTER_RE.sub("", text)
         if not text.strip():
             return []
         chunks = self._split_on_pattern(text, self._h2_re, file_path, [])
@@ -141,10 +148,20 @@ class MarkdownChunker:
         result: list[Chunk] = []
         offset = chunk.char_offset
 
+        # Group heading lines with the paragraph that follows them so
+        # headings don't become orphan fragments.
+        grouped: list[str] = []
         for para in paragraphs:
             para = para.strip()
             if not para:
                 continue
+            # A bare heading (e.g. "### Foo") should attach to the next paragraph
+            if grouped and grouped[-1].startswith("#") and len(grouped[-1]) < self._min:
+                grouped[-1] = grouped[-1] + "\n\n" + para
+            else:
+                grouped.append(para)
+
+        for para in grouped:
             if len(para) > self._max:
                 result.extend(self._hard_split(para, chunk))
             else:
