@@ -796,18 +796,27 @@ class StorageEngine:
         self._guarded_commit()
 
     def delete_memory(self, memory_id: int):
-        # Delete from sqlite-vec first (ignore if not present)
+        # Inline vector + archive + memory deletion for atomicity.
+        # When called standalone, acquires lock; when in batch, lock is already held.
+        if self._in_batch:
+            self._delete_memory_inner(memory_id)
+        else:
+            with self._write_lock:
+                self._delete_memory_inner(memory_id)
+                self._conn.commit()
+
+    def _delete_memory_inner(self, memory_id: int):
+        """Delete vector, archives, and memory row (no commit, no lock)."""
         try:
-            self.delete_vector(memory_id)
+            self._conn.execute(
+                "DELETE FROM memory_vectors WHERE rowid = ?", (memory_id,)
+            )
         except Exception:
             pass
-        # memory_archives has a bare FK to memories(id) without ON DELETE CASCADE,
-        # so we must remove archive rows first or the DELETE will raise an IntegrityError.
         self._conn.execute(
             "DELETE FROM memory_archives WHERE original_memory_id = ?", (memory_id,)
         )
         self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        self._guarded_commit()
 
     def get_memories_for_directory(
         self, directory: str, min_heat: float = 0.1
@@ -1030,19 +1039,33 @@ class StorageEngine:
     def update_memory_embedding(
         self, memory_id: int, embedding: bytes, embedding_model: str
     ):
-        """Update a memory's embedding and embedding_model field."""
+        """Update a memory's embedding and embedding_model field + vec0 table atomically."""
+        if self._in_batch:
+            self._update_embedding_inner(memory_id, embedding, embedding_model)
+        else:
+            with self._write_lock:
+                self._update_embedding_inner(memory_id, embedding, embedding_model)
+                self._conn.commit()
+
+    def _update_embedding_inner(self, memory_id: int, embedding: bytes, embedding_model: str):
+        """Update embedding in memories + vec0 table (no commit, no lock)."""
         self._conn.execute(
             "UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?",
             (embedding, embedding_model, memory_id),
         )
-        self._guarded_commit()
         # Update the vec0 table too
         try:
-            self.update_vector(memory_id, embedding)
+            self._conn.execute("DELETE FROM memory_vectors WHERE rowid = ?", (memory_id,))
+            self._conn.execute(
+                "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                (memory_id, embedding),
+            )
         except Exception:
-            # Vector may not exist yet; insert instead
             try:
-                self.insert_vector(memory_id, embedding)
+                self._conn.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                    (memory_id, embedding),
+                )
             except Exception:
                 pass
 
