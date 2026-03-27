@@ -16,6 +16,50 @@ from vaire.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# ── Credential redaction for enriched content ──────────────────────────
+# Applied to enriched_content before storage to prevent secrets leaking
+# through the enrichment pipeline (TASK-004).
+
+_CREDENTIAL_PATTERNS = re.compile(
+    r"(?:"
+    # Specific token prefixes (match these first)
+    r"glpat-[A-Za-z0-9_-]{20,}"
+    r"|gldt-[A-Za-z0-9_-]{20,}"
+    r"|tk_[a-z0-9]{20,}"
+    r"|sk_(?:test|live|prod)_[A-Za-z0-9]{10,}"
+    r"|AKIA[0-9A-Z]{16}"
+    # Generic key=value patterns for common credential field names
+    r"|(?:password|secret|token|api[_-]?key|auth[_-]?token|bearer)"
+    r"[\s:=]+['\"]?([^\s'\"]{8,})['\"]?"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def redact_credentials(text: str) -> str:
+    """Replace known credential patterns with <REDACTED> markers.
+
+    Applied to enriched_content before storage so secrets that appear
+    in the original content don't leak into the enrichment fields.
+    """
+    def _redact(match):
+        val = match.group()
+        lower = val.lower()
+        if lower.startswith("glpat-"):
+            return "<REDACTED:gitlab-pat>"
+        elif lower.startswith("gldt-"):
+            return "<REDACTED:gitlab-deploy>"
+        elif lower.startswith("tk_"):
+            return "<REDACTED:token>"
+        elif lower.startswith("sk_"):
+            return "<REDACTED:stripe-key>"
+        elif val.startswith("AKIA"):
+            return "<REDACTED:aws-key>"
+        else:
+            return "<REDACTED>"
+
+    return _CREDENTIAL_PATTERNS.sub(_redact, text)
+
 _STOP_WORDS = frozenset({
     "a", "an", "the", "is", "it", "in", "on", "at", "to", "of",
     "for", "and", "or", "but", "not", "with", "by", "from", "as",
@@ -583,5 +627,9 @@ class EnrichmentPipeline:
             result.enriched_content = content + "\n[enrichment] " + " | ".join(all_terms)
         else:
             result.enriched_content = content
+
+        # TASK-004: Redact credentials from enriched_content to prevent
+        # secrets leaking through the enrichment pipeline
+        result.enriched_content = redact_credentials(result.enriched_content)
 
         return result

@@ -8,10 +8,41 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from vaire.config import Settings
 from vaire.storage import StorageEngine
+
+# ── Injection detection patterns (shared with server.py R3) ───────────
+
+_INJECTION_RE = re.compile(
+    r"(?:"
+    r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions"
+    r"|you\s+are\s+now\s+(?:a|an|the)"
+    r"|(?:new|override|replace)\s+system\s*prompt"
+    r"|ADMIN\s+OVERRIDE"
+    r"|</?(system|user|assistant)\s*>"
+    r"|\[/?INST\]"
+    r"|BEGIN\s+(?:HACK|JAILBREAK|INJECTION)"
+    r"|<\|(?:im_start|im_end|endoftext)\|>"
+    r"|(?:forget|disregard|discard)\s+(?:all\s+)?(?:previous|prior|earlier|everything\s+(?:mentioned|above|before))"
+    r"|(?:act|behave|respond)\s+as\s+(?:if|though)"
+    r"|do\s+not\s+follow\s+(?:any|your|the)\s+(?:rules|instructions|guidelines)"
+    r"|pretend\s+(?:the\s+)?(?:above|previous|prior)\s+(?:context|instructions?)\s+(?:do(?:es)?\s+not|doesn.t)\s+exist"
+    r"|(?:from\s+now\s+on|henceforth),?\s+(?:you|ignore|disregard|forget)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Suspicious encoding patterns
+_ENCODING_RE = re.compile(
+    r"(?:"
+    r"[A-Za-z0-9+/]{400,}={0,2}"   # large base64 blobs (400+ to reduce false positives)
+    r"|(?:\\x[0-9a-fA-F]{2}){20,}"  # hex-encoded payloads
+    r"|(?:%[0-9a-fA-F]{2}){20,}"    # URL-encoded payloads
+    r")"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +163,11 @@ class GroomerEngine:
             "just also now so get got use using".split()
         )
         _MIN_CONTENT_LEN = 50
-        _MIN_WORD_OVERLAP = 2
+        _MAX_CONTENT_LEN = 2000   # Skip reference docs / long multi-topic memories
+        _MAX_NEGATION_LEN = 500   # Negation heuristic only on short factual statements
+        _MIN_WORD_OVERLAP = 3
+        _MIN_SHARED_RATIO = 0.15  # Shared words must be ≥15% of smaller word set
+        _MIN_EMBEDDING_SIM = 0.65 # Semantic similarity gate when embeddings available
 
         def _content_words(text: str) -> set[str]:
             return {w for w in re.findall(r"\b[a-z][a-z0-9_.-]+\b", text.lower()) if w not in _STOPWORDS}
@@ -141,7 +176,7 @@ class GroomerEngine:
         pairs: list[dict] = []
 
         # Pre-compute per-memory data
-        mem_data: list[tuple[str, bool, set[str], set[str]]] = []
+        mem_data: list[tuple[str, bool, set[str], set[str], bytes | None]] = []
         for m in memories:
             c = m.get("content", "")
             mem_data.append((
@@ -149,16 +184,17 @@ class GroomerEngine:
                 bool(_NEGATION_RE.search(c)),
                 set(a.lower() for a in _ACTION_RE.findall(c)),
                 _content_words(c),
+                m.get("embedding"),
             ))
 
         for i, m1 in enumerate(memories):
-            c1, neg1, acts1, words1 = mem_data[i]
-            if len(c1) < _MIN_CONTENT_LEN:
+            c1, neg1, acts1, words1, emb1 = mem_data[i]
+            if len(c1) < _MIN_CONTENT_LEN or len(c1) > _MAX_CONTENT_LEN:
                 continue
 
             for j in range(i + 1, len(memories)):
-                c2, neg2, acts2, words2 = mem_data[j]
-                if len(c2) < _MIN_CONTENT_LEN:
+                c2, neg2, acts2, words2, emb2 = mem_data[j]
+                if len(c2) < _MIN_CONTENT_LEN or len(c2) > _MAX_CONTENT_LEN:
                     continue
 
                 # Require topical overlap before checking heuristics
@@ -166,10 +202,25 @@ class GroomerEngine:
                 if len(shared_words) < _MIN_WORD_OVERLAP:
                     continue
 
+                # Shared words must be a meaningful fraction of the smaller memory
+                smaller_set = min(len(words1), len(words2))
+                if smaller_set > 0 and len(shared_words) / smaller_set < _MIN_SHARED_RATIO:
+                    continue
+
+                # Embedding similarity gate — if both have vectors, require semantic overlap
+                if emb1 and emb2:
+                    sim = self._embeddings.similarity(emb1, emb2)
+                    if sim < _MIN_EMBEDDING_SIM:
+                        continue
+
                 reason = None
-                if neg1 != neg2:
+                # Negation heuristic only applies to short factual statements —
+                # long memories (RCA reports, narratives) naturally contain negation
+                # as part of explanations, not as contradictable claims.
+                if neg1 != neg2 and len(c1) <= _MAX_NEGATION_LEN and len(c2) <= _MAX_NEGATION_LEN:
                     reason = "negation_mismatch"
-                elif acts1 and acts2 and acts1 != acts2:
+                elif (acts1 and acts2 and acts1 != acts2
+                      and len(c1) <= _MAX_NEGATION_LEN and len(c2) <= _MAX_NEGATION_LEN):
                     shared = acts1 & acts2
                     if len(shared) < len(acts1 | acts2) * 0.5:
                         reason = "action_divergence"
@@ -274,10 +325,14 @@ class GroomerEngine:
             return {"error": "merge requires at least 2 memory_ids"}
 
         # Determine best attributes from inputs
-        inputs = [self._storage.get_memory(mid) for mid in memory_ids]
-        inputs = [m for m in inputs if m is not None]
+        inputs_raw = [self._storage.get_memory(mid) for mid in memory_ids]
+        missing = [mid for mid, m in zip(memory_ids, inputs_raw) if m is None]
+        inputs = [m for m in inputs_raw if m is not None]
         if not inputs:
             return {"error": "No valid memories found for provided memory_ids"}
+        if missing:
+            logger.warning("merge: %d of %d memory_ids not found: %s",
+                           len(missing), len(memory_ids), missing)
 
         best_heat = max(m.get("heat", 0) for m in inputs)
         all_tags = list(
@@ -431,7 +486,12 @@ class GroomerEngine:
         }
 
     def update_content(self, memory_id: int, new_content: str) -> dict:
-        """Rewrite a memory's content; re-embeds automatically."""
+        """Rewrite a memory's content; re-embeds automatically.
+
+        TASK-004: Also clears enriched_content so stale enrichment (which
+        may contain pre-redaction secrets) is discarded. Re-enrichment
+        happens on the next consolidation cycle if enabled.
+        """
         mem = self._storage.get_memory(memory_id)
         if mem is None:
             return {"error": f"Memory {memory_id} not found"}
@@ -439,6 +499,12 @@ class GroomerEngine:
         embedding = self._embeddings.encode_document(new_content)
         self._storage.update_memory_full(
             memory_id, content=new_content, embedding=embedding
+        )
+        # Clear enriched_content — it was built from old content and may
+        # contain secrets that were just redacted from the new content.
+        self._storage.execute_write(
+            "UPDATE memories SET enriched_content = NULL WHERE id = ?",
+            (memory_id,),
         )
         self._invalidate_upsert(
             memory_id,
@@ -665,20 +731,31 @@ class GroomerEngine:
         replacement: str | None = None,
         dry_run: bool = True,
     ) -> dict:
-        """Scan all memories for regex pattern. Optionally replace (re-embeds)."""
+        """Scan all memories for regex pattern. Optionally replace (re-embeds).
+
+        R4 hardening: pattern length capped at 500 chars, matches per memory
+        capped at REGEX_TIMEOUT_MATCHES to prevent ReDoS.
+        """
+        import itertools
         import re as _re
+
+        # R4: Limit pattern complexity
+        if len(pattern) > 500:
+            return {"error": "Regex pattern too long (max 500 chars)"}
         try:
             regex = _re.compile(pattern)
         except _re.error as exc:
             return {"error": f"Invalid regex: {exc}"}
 
-        all_mems = self._storage.get_memories_by_filter(limit=99999)
+        max_matches = self._settings.REGEX_TIMEOUT_MATCHES
+        all_mems = self._storage.get_memories_by_filter(limit=5000)
         matches: list[dict] = []
         replaced = 0
 
         for mem in all_mems:
             content = mem.get("content", "")
-            found = list(regex.finditer(content))
+            # R4: Cap finditer to prevent ReDoS on pathological patterns
+            found = list(itertools.islice(regex.finditer(content), max_matches))
             if not found:
                 continue
             match_info = {
@@ -694,6 +771,16 @@ class GroomerEngine:
                 self._storage.update_memory_full(
                     mem["id"], content=new_content, embedding=embedding,
                 )
+                # TASK-004: Also apply replacement to enriched_content
+                # to prevent secrets persisting in the enrichment field
+                enriched = mem.get("enriched_content")
+                if enriched and isinstance(enriched, str):
+                    new_enriched = regex.sub(replacement, enriched)
+                    if new_enriched != enriched:
+                        self._storage.execute_write(
+                            "UPDATE memories SET enriched_content = ? WHERE id = ?",
+                            (new_enriched, mem["id"]),
+                        )
                 self._invalidate_upsert(
                     mem["id"], new_content, mem.get("heat", 0),
                     mem.get("tags", []), mem.get("directory_context", ""),
@@ -733,6 +820,13 @@ class GroomerEngine:
             new_content = content.replace(find, replace)
             embedding = self._embeddings.encode_document(new_content)
             self._storage.update_memory_full(mid, content=new_content, embedding=embedding)
+            # TASK-004: propagate replacement to enriched_content
+            enriched = mem.get("enriched_content")
+            if enriched and isinstance(enriched, str) and find in enriched:
+                self._storage.execute_write(
+                    "UPDATE memories SET enriched_content = ? WHERE id = ?",
+                    (enriched.replace(find, replace), mid),
+                )
             self._invalidate_upsert(
                 mid, new_content, mem.get("heat", 0),
                 mem.get("tags", []), mem.get("directory_context", ""),
@@ -798,3 +892,141 @@ class GroomerEngine:
             self._cache.invalidate(InvalidationEvent.MEMORY_DELETE, id=memory_id)
         except Exception:
             logger.debug("Cache delete invalidation skipped")
+
+    # ── Sanitization pipeline (Phase 6) ───────────────────────────────────
+
+    def sanitize(
+        self,
+        limit: int = 50,
+        auto_approve: bool = False,
+    ) -> dict:
+        """Process the 'unprocessed' queue from remote agents.
+
+        Validates each memory:
+          1. Content length within configured limits
+          2. Prompt injection pattern scan → risk_score
+          3. Tag count/length validation
+          4. Suspicious encoding detection (large base64, hex blobs)
+
+        auto_approve=False: returns a report for groomer review.
+        auto_approve=True: clean→remove 'unprocessed', suspicious→add 'quarantine'.
+
+        Returns: {processed, approved, quarantined, rejected, details}
+        """
+        # Find unprocessed memories
+        unprocessed = self._storage.get_memories_by_filter(
+            tags=["unprocessed"], limit=limit,
+        )
+
+        results = {
+            "processed": 0,
+            "approved": 0,
+            "quarantined": 0,
+            "rejected": 0,
+            "details": [],
+        }
+
+        max_content = self._settings.MAX_CONTENT_LENGTH
+        max_tags = self._settings.MAX_TAG_COUNT
+        max_tag_len = self._settings.MAX_TAG_LENGTH
+
+        for mem in unprocessed:
+            mid = mem["id"]
+            content = mem.get("content", "")
+            tags = mem.get("tags", [])
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except (ValueError, TypeError):
+                    tags = []
+
+            flags: list[str] = []
+            risk_score = 0.0
+
+            # 1. Content length
+            if len(content) > max_content:
+                flags.append(f"content_too_long:{len(content)}")
+                risk_score += 0.3
+
+            # 2. Prompt injection
+            if _INJECTION_RE.search(content):
+                flags.append("injection_pattern")
+                risk_score += 0.5
+
+            # 3. Tag validation
+            if len(tags) > max_tags:
+                flags.append(f"too_many_tags:{len(tags)}")
+                risk_score += 0.1
+            for t in tags:
+                if isinstance(t, str) and len(t) > max_tag_len:
+                    flags.append(f"long_tag:{t[:30]}")
+                    risk_score += 0.1
+                    break  # one flag is enough
+
+            # 4. Suspicious encodings
+            if _ENCODING_RE.search(content):
+                flags.append("suspicious_encoding")
+                risk_score += 0.3
+
+            risk_score = min(risk_score, 1.0)
+
+            # Remote provenance with ANY flags → escalate to manual review
+            is_remote_provenance = mem.get("provenance_agent", "").startswith("remote:")
+            if is_remote_provenance and flags:
+                risk_score = max(risk_score, 0.3)  # ensure at least "suspicious"
+
+            if risk_score < 0.3:
+                status = "clean"
+            elif risk_score < 0.7:
+                status = "suspicious"
+            else:
+                status = "rejected"
+
+            detail = {
+                "memory_id": mid,
+                "status": status,
+                "risk_score": round(risk_score, 2),
+                "flags": flags,
+                "provenance": mem.get("provenance_agent", ""),
+            }
+            results["details"].append(detail)
+            results["processed"] += 1
+
+            if auto_approve:
+                if status == "clean":
+                    # Remove "unprocessed", add "approved_remote"
+                    new_tags = [t for t in tags if t != "unprocessed"]
+                    new_tags.append("approved_remote")
+                    self._storage.execute_write(
+                        "UPDATE memories SET tags = ? WHERE id = ?",
+                        (json.dumps(new_tags), mid),
+                    )
+                    self._invalidate_upsert(
+                        mid, content, mem.get("heat", 0),
+                        new_tags, mem.get("directory_context", ""),
+                    )
+                    results["approved"] += 1
+                elif status == "suspicious":
+                    # Add "quarantine", keep "unprocessed"
+                    new_tags = list(tags)
+                    if "quarantine" not in new_tags:
+                        new_tags.append("quarantine")
+                    self._storage.execute_write(
+                        "UPDATE memories SET tags = ? WHERE id = ?",
+                        (json.dumps(new_tags), mid),
+                    )
+                    results["quarantined"] += 1
+                else:
+                    # Rejected: quarantine + drop protection + zero heat
+                    new_tags = list(tags)
+                    if "quarantine" not in new_tags:
+                        new_tags.append("quarantine")
+                    if "_injection_detected" not in new_tags:
+                        new_tags.append("_injection_detected")
+                    self._storage.execute_write(
+                        "UPDATE memories SET tags = ?, is_protected = 0, heat = 0 WHERE id = ?",
+                        (json.dumps(new_tags), mid),
+                    )
+                    results["rejected"] += 1
+
+        return results
