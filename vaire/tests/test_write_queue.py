@@ -107,8 +107,12 @@ class TestBatching:
         ops = [_make_op(loop, content=f"c{i}") for i in range(3)]
         queue._execute_batch(ops)
 
-        # begin_transaction called exactly once for all 3 ops.
-        mock_storage.begin_transaction.assert_called_once()
+        # BEGIN executed exactly once for all 3 ops.
+        begin_calls = [
+            c for c in mock_storage._conn.execute.call_args_list
+            if c.args and c.args[0] == "BEGIN"
+        ]
+        assert len(begin_calls) == 1
 
         # All futures resolved.
         for op in ops:
