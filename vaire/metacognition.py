@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from vaire.config import Settings
 from vaire.embeddings import EmbeddingEngine
-from vaire.knowledge_graph import KnowledgeGraph
+from vaire.knowledge_graph import KnowledgeGraph, _CODE_TOKEN_STOPLIST
 from vaire.storage import StorageEngine
 
 logger = logging.getLogger(__name__)
@@ -270,11 +270,17 @@ class MetaCognition:
 
         # d) Missing connections: entities that co-occur in content
         #    but have no relationship in the graph
+        # Filter out code token stoplist entities to avoid false gaps
+        filtered_entities = [
+            e for e in all_entities
+            if not (e["name"] == e["name"].lower() and e["name"] in _CODE_TOKEN_STOPLIST)
+            and len(e["name"]) >= 3
+        ]
         entity_cooccurrence = defaultdict(set)
         for m in dir_memories:
             content = m.get("content", "")
             entities_in_mem = []
-            for entity in all_entities:
+            for entity in filtered_entities:
                 if entity["name"] in content:
                     entities_in_mem.append(entity["id"])
             for i, eid_a in enumerate(entities_in_mem):

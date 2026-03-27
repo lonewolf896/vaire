@@ -2014,6 +2014,8 @@ class HippoRetriever:
             hypothesis = _question_to_statement(query)
             pairs = [(m["content"][:512], hypothesis) for m in memories]
             scores = self._nli_model.predict(pairs)  # Shape: (n, 3) for [contradiction, neutral, entailment]
+            if scores is None:
+                return memories
 
             for i, mem in enumerate(memories):
                 if hasattr(scores[i], '__len__') and len(scores[i]) == 3:

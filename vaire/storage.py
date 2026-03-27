@@ -812,7 +812,13 @@ class StorageEngine:
                 "DELETE FROM memory_vectors WHERE rowid = ?", (memory_id,)
             )
         except Exception:
-            pass
+            logger.debug("Vec0 delete failed for memory %d", memory_id, exc_info=True)
+        try:
+            self._conn.execute(
+                "DELETE FROM memory_implicit_vectors WHERE rowid = ?", (memory_id,)
+            )
+        except Exception:
+            logger.debug("Implicit vec0 delete failed for memory %d", memory_id, exc_info=True)
         self._conn.execute(
             "DELETE FROM memory_archives WHERE original_memory_id = ?", (memory_id,)
         )
@@ -1067,7 +1073,7 @@ class StorageEngine:
                     (memory_id, embedding),
                 )
             except Exception:
-                pass
+                logger.debug("Vec0 update failed for memory %d", memory_id, exc_info=True)
 
     def recreate_vector_table(self, new_dim: int):
         """Recreate the memory_vectors vec0 table with new dimensions.
@@ -1784,7 +1790,7 @@ class StorageEngine:
                 try:
                     self.insert_vector(memory_id, embedding)
                 except Exception:
-                    pass
+                    logger.debug("Vec0 sync failed for memory %d in update_memory_compression", memory_id, exc_info=True)
 
     # -- Checkpoints (Hippocampal Replay) --
 
@@ -2028,6 +2034,7 @@ class StorageEngine:
             ).fetchall()
             return [(int(r[0]), float(r[1])) for r in rows]
         except Exception:
+            logger.debug("FTS5 query failed for %r", query, exc_info=True)
             return []
 
     def get_relationships_for_entities(
@@ -2114,7 +2121,7 @@ class StorageEngine:
                         try:
                             self.insert_vector(memory_id, embedding)
                         except Exception:
-                            pass
+                            logger.debug("Vec0 sync failed for memory %d in upsert (update path)", memory_id, exc_info=True)
                 return memory_id
 
         # Insert new
@@ -2137,7 +2144,7 @@ class StorageEngine:
             try:
                 self.insert_vector(new_id, embedding)
             except Exception:
-                pass
+                logger.debug("Vec0 insert failed for new memory %d in upsert", new_id, exc_info=True)
         return new_id
 
     def update_memory_access(
@@ -2696,7 +2703,7 @@ class StorageEngine:
                 try:
                     self.insert_vector(memory_id, embedding)
                 except Exception:
-                    pass
+                    logger.debug("Vec0 sync failed for memory %d in update_memory_full", memory_id, exc_info=True)
         self._guarded_commit()
 
     def promote_memory(self, memory_id: int) -> None:  # [COMMITS]

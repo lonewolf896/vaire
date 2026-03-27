@@ -39,14 +39,59 @@ _CHOSE_RE = re.compile(
     r"(?:chose|switched\s+to|opted\s+for|went\s+with|using\s+instead)\s+([\w][a-zA-Z0-9_.]{1,30})",
     re.IGNORECASE,
 )
-# Common Python keywords to exclude from prose function extraction
-_PY_KEYWORDS = frozenset({
+# Code token stoplist: common keywords across Python, Go, Bash, and Fish.
+# These produce false entities and flood detect_gaps with noise.
+# Extend via GRAPH_ENTITY_EXTRA_STOPWORDS in config.
+_CODE_TOKEN_STOPLIST = frozenset({
+    # Python keywords & builtins
     "if", "else", "elif", "for", "while", "with", "try", "except",
     "finally", "return", "yield", "lambda", "assert", "raise", "pass",
     "and", "not", "or", "in", "is", "del", "print", "len", "range",
     "str", "int", "list", "dict", "set", "tuple", "bool", "type",
     "super", "self", "cls", "open", "zip", "map", "filter", "any", "all",
+    "def", "class", "import", "from", "as", "global", "nonlocal",
+    "break", "continue", "None", "True", "False", "async", "await",
+    "isinstance", "getattr", "setattr", "hasattr", "property",
+    "staticmethod", "classmethod", "enumerate", "sorted", "reversed",
+    "min", "max", "sum", "abs", "round", "hex", "oct", "bin", "chr",
+    "ord", "repr", "hash", "id", "dir", "vars", "help", "input",
+    "float", "complex", "bytes", "bytearray", "memoryview", "object",
+    "frozenset", "slice", "format", "iter", "next", "callable",
+    # Go keywords & builtins
+    "func", "var", "const", "struct", "interface", "package", "main",
+    "switch", "case", "default", "select", "chan", "go", "defer",
+    "fallthrough", "goto", "byte", "rune", "make", "append", "copy",
+    "delete", "cap", "new", "panic", "recover", "close", "string",
+    "error", "nil", "iota", "uint", "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64", "float32", "float64",
+    "complex64", "complex128", "uintptr", "bool",
+    # Bash keywords & builtins
+    "echo", "read", "local", "export", "source", "eval", "exec",
+    "shift", "trap", "wait", "test", "expr", "let", "declare",
+    "unset", "readonly", "typeset", "getopts", "exit", "true", "false",
+    "fi", "do", "done", "then", "esac", "elif", "case", "function",
+    "select", "until", "coproc", "time", "printf", "cd", "pwd",
+    "pushd", "popd", "dirs", "jobs", "fg", "bg", "kill", "alias",
+    "unalias", "bind", "builtin", "caller", "command", "compgen",
+    "complete", "compopt", "disown", "enable", "hash", "logout",
+    "mapfile", "readarray", "shopt", "ulimit", "umask",
+    "sed", "awk", "grep", "cut", "sort", "head", "tail", "cat",
+    "wc", "tr", "tee", "xargs", "find", "chmod", "chown", "mkdir",
+    "rmdir", "touch", "cp", "mv", "rm", "ln", "ls", "stat",
+    # Fish keywords & builtins
+    "begin", "end", "status", "contains", "emit", "argparse",
+    "string", "math", "count", "path",
+    # Common short tokens that are never meaningful entities
+    "f", "i", "j", "k", "n", "x", "y", "v", "e", "r", "s", "t",
+    "ok", "err", "arg", "val", "key", "ctx", "buf", "msg", "cmd",
+    "tmp", "cfg", "src", "dst", "idx", "fmt", "gen", "ref", "ret",
+    "req", "res", "opt", "out", "log", "run", "add", "get", "put",
+    "pop", "raw", "nil", "end", "use", "sys", "env", "pid", "uid",
+    "gid", "tty", "eof", "nop", "sig", "sep", "num", "max", "min",
+    "tag", "doc", "pre", "sub", "mod",
 })
+# Keep backward compat alias
+_PY_KEYWORDS = _CODE_TOKEN_STOPLIST
 
 
 class KnowledgeGraph:
@@ -61,6 +106,14 @@ class KnowledgeGraph:
     def __init__(self, storage: StorageEngine, settings: Settings) -> None:
         self._storage = storage
         self._settings = settings
+        # Build effective stoplist: defaults + config extras
+        extra = settings.GRAPH_ENTITY_EXTRA_STOPWORDS.strip()
+        if extra:
+            self._stoplist = _CODE_TOKEN_STOPLIST | frozenset(
+                w.strip().lower() for w in extra.split(",") if w.strip()
+            )
+        else:
+            self._stoplist = _CODE_TOKEN_STOPLIST
 
     # -- a. Typed Relationship Management --
 
@@ -269,10 +322,15 @@ class KnowledgeGraph:
         for m in _FILE_REF_RE.finditer(content):
             results.append((m.group(1), "file", ""))
 
-        # Deduplicate preserving order
+        # Deduplicate preserving order, filter code token stoplist.
+        # Only filter lowercase names — CamelCase/PascalCase are real entities
+        # (e.g., "Path" is a class, "path" is a Fish builtin).
         seen: set[tuple[str, str, str]] = set()
         unique: list[tuple[str, str, str]] = []
         for triple in results:
+            name = triple[0]
+            if name == name.lower() and name in self._stoplist:
+                continue
             if triple not in seen:
                 seen.add(triple)
                 unique.append(triple)

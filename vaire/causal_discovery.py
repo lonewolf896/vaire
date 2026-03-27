@@ -149,8 +149,8 @@ class CausalDiscovery:
             if np.isnan(r):
                 return True  # constant variable -> treat as independent
             denom = 1.0 - r * r
-            if denom <= 0:
-                return False  # perfect correlation -> dependent
+            if denom <= 1e-10:
+                return False  # near-perfect correlation -> dependent
             t_stat = r * math.sqrt((n - 2) / denom)
             p_value = 2.0 * stats.t.sf(abs(t_stat), df=n - 2)
         else:
@@ -182,7 +182,7 @@ class CausalDiscovery:
                 return True  # Not enough degrees of freedom
 
             denom = 1.0 - r * r
-            if denom <= 0:
+            if denom <= 1e-10:
                 return False
 
             t_stat = r * math.sqrt(dof / denom)

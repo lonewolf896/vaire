@@ -207,9 +207,10 @@ class AstrocyteEngine:
             ):
                 try:
                     self._light_cycle()
-                    self._last_light_cycle = now
                 except Exception:
                     logger.exception("Light cycle failed")
+                finally:
+                    self._last_light_cycle = now
 
             # Medium cycle (every 15min): + entity extraction + merge
             medium_interval = self._settings.MEDIUM_CYCLE_INTERVAL
@@ -218,9 +219,10 @@ class AstrocyteEngine:
             ):
                 try:
                     self._medium_cycle()
-                    self._last_medium_cycle = now
                 except Exception:
                     logger.exception("Medium cycle failed")
+                finally:
+                    self._last_medium_cycle = now
 
             # Full cycle: + causal discovery + memify + CLS + compression
             # Only on idle, and only if there's been new activity since last run

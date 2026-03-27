@@ -57,7 +57,7 @@ ENV TRANSFORMERS_OFFLINE=1 \
 # /data is bind-mounted from the host's ~/.vaire at runtime.
 # Both the SQLite database and the Unix domain socket land here so the
 # host-side thin client can reach the socket at ~/.vaire/vaire.sock.
-RUN mkdir -p /data
+RUN mkdir -p /data /certs
 
 ENV VAIRE_DB_PATH=/data/memory.db
 ENV VAIRE_SOCKET_PATH=/data/vaire.sock

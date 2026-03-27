@@ -236,7 +236,10 @@ class VaireClient:
                 response_id = msg.get("id")
                 future = self._pending.pop(response_id, None)
                 if future is not None and not future.done():
-                    future.set_result(msg)
+                    try:
+                        future.set_result(msg)
+                    except asyncio.InvalidStateError:
+                        pass  # cancelled between done() check and set_result()
                 else:
                     logger.debug(
                         "Received response for unknown/expired request id=%s",

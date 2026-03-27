@@ -131,7 +131,7 @@ class FractalMemoryTree:
         """Compute cosine similarity between two vectors."""
         dot = np.dot(a, b)
         norm = np.linalg.norm(a) * np.linalg.norm(b)
-        if norm == 0:
+        if norm < 1e-12:
             return 0.0
         return float(dot / norm)
 

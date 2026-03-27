@@ -62,6 +62,13 @@ class EmbeddingEngine:
                 "embedding operations will return None"
             )
             self._unavailable = True
+        except Exception:
+            logger.exception(
+                "Failed to load embedding model %r; "
+                "embedding operations will return None",
+                self.model_name,
+            )
+            self._unavailable = True
 
     def get_model_name(self) -> str:
         """Return the current model name."""
