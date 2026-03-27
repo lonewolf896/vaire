@@ -45,6 +45,7 @@ from vaire.staleness import StalenessDetector
 from vaire.storage import StorageEngine
 from vaire.restoration import HippocampalReplay
 from vaire.thermodynamics import MemoryThermodynamics
+from vaire.transport_context import transport_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +275,73 @@ def _file_hash(filepath: str) -> str | None:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+# ── Input Validation & Security ────────────────────────────────────────
+
+# Prompt injection patterns (R3) — single source in groomer.py, imported here.
+# Known limitations: Unicode homoglyphs, zero-width chars, HTML entities, and
+# leetspeak can evade regex detection. The "unprocessed" auto-tag + groomer
+# review pipeline is the real security gate; this regex is defense-in-depth.
+from vaire.groomer import _INJECTION_RE
+
+
+def _validate_input(content: str, tags: list[str]) -> str | None:
+    """Return error message if input limits are exceeded, None if valid."""
+    if len(content) > settings.MAX_CONTENT_LENGTH:
+        return (
+            f"Content length {len(content)} exceeds limit "
+            f"of {settings.MAX_CONTENT_LENGTH} chars"
+        )
+    if len(tags) > settings.MAX_TAG_COUNT:
+        return (
+            f"Tag count {len(tags)} exceeds limit of {settings.MAX_TAG_COUNT}"
+        )
+    for tag in tags:
+        if len(tag) > settings.MAX_TAG_LENGTH:
+            return (
+                f"Tag '{tag[:30]}...' length {len(tag)} exceeds limit "
+                f"of {settings.MAX_TAG_LENGTH} chars"
+            )
+    return None
+
+
+def _normalize_for_injection_scan(text: str) -> str:
+    """Normalize text to defeat common injection evasion techniques.
+
+    Strips zero-width characters, normalizes Unicode confusables to ASCII,
+    and decodes HTML entities. Applied before regex matching only — does
+    NOT modify the stored content.
+    """
+    import html
+    import unicodedata
+
+    # Decode HTML entities (&#112; → p, &amp; → &)
+    text = html.unescape(text)
+    # Replace zero-width characters with spaces (preserves word boundaries)
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff\u00ad]", " ", text)
+    # NFKD decomposition + ASCII folding (strips non-Latin characters)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    # Collapse multiple spaces left by above transforms
+    text = re.sub(r" {2,}", " ", text)
+    return text
+
+
+def _detect_injection(content: str) -> tuple[bool, list[str]]:
+    """Check content for prompt injection patterns.
+
+    Normalizes content first to defeat Unicode homoglyphs, zero-width
+    characters, and HTML entity evasion. Returns (detected, matched_patterns).
+    """
+    if not settings.PROMPT_INJECTION_DETECTION:
+        return False, []
+    normalized = _normalize_for_injection_scan(content)
+    found = list(_INJECTION_RE.finditer(normalized))
+    if found:
+        # Deduplicate matched text and truncate for logging
+        unique = list(dict.fromkeys(m.group()[:80] for m in found))
+        return True, unique[:5]
+    return False, []
+
+
 # ── MCP Tools ──────────────────────────────────────────────────────────
 
 
@@ -288,6 +356,34 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
     force: bypass the write gate and store regardless of surprisal score.
     Use for explicit high-value memories that must be stored unconditionally.
     """
+    # ── Input validation (R1) ──
+    err = _validate_input(content, tags)
+    if err:
+        return {"stored": False, "error": err}
+
+    # ── Prompt injection detection (R3) + Remote auto-tagging (Phase 5) ──
+    injection_detected, injection_matches = _detect_injection(content)
+    transport_info = transport_ctx.get()
+
+    # Copy tags once if any mutation is needed
+    if injection_detected or transport_info.is_remote:
+        tags = list(tags)  # don't mutate caller's list
+
+    if injection_detected:
+        if "_injection_warning" not in tags:
+            tags.append("_injection_warning")
+        logger.warning(
+            "Injection pattern detected in remember(): %s", injection_matches
+        )
+
+    if transport_info.is_remote:
+        if "unprocessed" not in tags:
+            tags.append("unprocessed")
+        logger.info(
+            "Remote remember from %s (%s)",
+            transport_info.agent_cn, transport_info.client_ip,
+        )
+
     storage = _get_storage()
     embeddings = _get_embeddings()
     buffer = _get_buffer()
@@ -408,6 +504,13 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
             (crdt_provenance["provenance_agent"], crdt_provenance["vector_clock"], memory_id),
         )
 
+    # Override provenance for remote calls — stamp with cert CN
+    if transport_info.is_remote and transport_info.agent_cn:
+        storage.execute_write(
+            "UPDATE memories SET provenance_agent = ? WHERE id = ?",
+            (f"remote:{transport_info.agent_cn}", memory_id),
+        )
+
     # CLS dual-store: classify memory as episodic or semantic
     if _consolidation is not None and _consolidation.cls is not None:
         store_type = _consolidation.cls.classify_memory(content, tags, context)
@@ -438,9 +541,11 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
         thermo.synaptic_boost(memory_id, initial_heat)
 
     # Prospective memory: auto-create triggers from content & check existing triggers
+    # Skip auto-trigger creation for remote calls (same restriction as create_trigger)
     triggered_memories = []
     if _prospective is not None:
-        _prospective.auto_create_from_content(content, context)
+        if not transport_info.is_remote:
+            _prospective.auto_create_from_content(content, context)
 
         from datetime import datetime as _dt, timezone as _tz
         trigger_context = {
@@ -484,8 +589,11 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
         _write_gate.record_stored(content, context, embedding)
 
     # 2. Decision auto-protection: detect decisions and shield from decay
+    # Skip for remote calls — prevents injected content from gaining protection
     auto_protected = False
-    if settings.DECISION_AUTO_PROTECT and _DECISION_STRONG_RE.search(content):
+    if (settings.DECISION_AUTO_PROTECT
+            and not transport_info.is_remote
+            and _DECISION_STRONG_RE.search(content)):
         storage.execute_write(
             "UPDATE memories SET is_protected = 1, importance = 1.0 WHERE id = ?",
             (memory_id,),
@@ -581,6 +689,9 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
 @mcp_server.tool()
 def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str | None = None) -> list[dict]:
     """Semantic + keyword search filtered by heat. Boosts accessed memories."""
+    # ── Input validation (R1) — cap query length to prevent embedding OOM ──
+    if len(query) > settings.MAX_CONTENT_LENGTH:
+        query = query[:settings.MAX_CONTENT_LENGTH]
     storage = _get_storage()
 
     # Record activity on consolidation engine
@@ -685,6 +796,9 @@ def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str
 @mcp_server.tool()
 def forget(memory_id: int) -> dict:
     """Mark a memory for deletion by setting heat to 0, then delete it."""
+    # ── Block remote deletion (evidence tampering prevention) ──
+    if transport_ctx.get().is_remote:
+        return {"memory_id": memory_id, "status": "error", "message": "Deletion not permitted via remote transport"}
     storage = _get_storage()
     memory = storage.get_memory(memory_id)
     if memory is None:
@@ -734,7 +848,18 @@ def get_project_context(directory: str) -> dict:
     and includes a suggestion if they're missing.
     """
     storage = _get_storage()
+    # Try the directory as given, then try remapping in both directions so
+    # queries work regardless of whether the caller uses a container-side or
+    # host-side path.
     memories = storage.get_memories_for_directory(directory, min_heat=settings.HOT_THRESHOLD)
+    if not memories:
+        remapped = settings.remap_path(directory)
+        if remapped != directory:
+            memories = storage.get_memories_for_directory(remapped, min_heat=settings.HOT_THRESHOLD)
+    if not memories:
+        reversed_path = settings.reverse_remap_path(directory)
+        if reversed_path != directory:
+            memories = storage.get_memories_for_directory(reversed_path, min_heat=settings.HOT_THRESHOLD)
     for m in memories:
         m.pop("embedding", None)
         m.pop("hdc_vector", None)
@@ -866,6 +991,9 @@ def memory_stats() -> dict:
 @mcp_server.tool()
 def rate_memory(memory_id: int, rating: float = 1.0, was_useful: bool | None = None) -> dict:
     """Rate a memory's usefulness for metamemory tracking."""
+    # ── Block remote metadata manipulation ──
+    if transport_ctx.get().is_remote:
+        return {"memory_id": memory_id, "status": "error", "message": "Rating not permitted via remote transport"}
     storage = _get_storage()
     thermo = _get_thermo()
 
@@ -920,6 +1048,24 @@ def create_trigger(
     target_directory: str | None = None,
 ) -> dict:
     """Create a prospective memory trigger that fires on matching context."""
+    # ── Input validation (R1) ──
+    if len(content) > settings.MAX_CONTENT_LENGTH:
+        return {"status": "error", "message": f"Content exceeds {settings.MAX_CONTENT_LENGTH} char limit"}
+
+    # ── Prompt injection detection (R3) ──
+    injection_detected, _ = _detect_injection(content)
+    if injection_detected:
+        return {"status": "error", "message": "Injection pattern detected in trigger content — rejected"}
+
+    # ── Block remote ingest of triggers (same principle as ingest) ──
+    transport_info = transport_ctx.get()
+    if transport_info.is_remote:
+        logger.warning(
+            "Remote create_trigger blocked from %s (%s)",
+            transport_info.agent_cn, transport_info.client_ip,
+        )
+        return {"status": "error", "message": "Prospective triggers cannot be created remotely"}
+
     if _prospective is None:
         return {"status": "error", "message": "ProspectiveMemoryEngine not initialized"}
     pm_id = _prospective.create_trigger(
@@ -954,6 +1100,10 @@ def add_rule(
     priority: Higher = applied first (default 0).
     scope_value: Directory path or file pattern for scoped rules.
     """
+    # ── Block remote global rule injection ──
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Rule creation not permitted via remote transport"}
+
     if _rules_engine is None:
         return {"status": "error", "message": "RulesEngine not initialized"}
     try:
@@ -1115,8 +1265,22 @@ def anchor(content: str, context: str, reason: str = "") -> dict:
     of other scoring. Use for decisions, constraints, and critical facts
     that must survive compaction.
     """
+    # ── Input validation (R1) ──
+    if len(content) > settings.MAX_CONTENT_LENGTH:
+        return {"error": f"Content exceeds {settings.MAX_CONTENT_LENGTH} char limit"}
+
+    # ── Prompt injection detection (R3) ──
+    injection_detected, _ = _detect_injection(content)
+
+    # ── Remote auto-tagging (Phase 5) ──
+    transport_info = transport_ctx.get()
+
     replay = _get_replay()
     tags = ["_anchor"]
+    if injection_detected:
+        tags.append("_injection_warning")
+    if transport_info.is_remote:
+        tags.append("unprocessed")
     if reason:
         tags.append(f"anchor:{reason}")
     memory_id = replay.anchor_memory(content, context, tags, reason)
@@ -1124,6 +1288,7 @@ def anchor(content: str, context: str, reason: str = "") -> dict:
         "memory_id": memory_id,
         "status": "anchored",
         "is_protected": True,
+        "is_remote": transport_info.is_remote,
         "reason": reason,
     }
 
@@ -1143,6 +1308,10 @@ def install_hooks(project_directory: str = "") -> dict:
 
     project_directory: The project root. Defaults to cwd.
     """
+    # ── Block remote filesystem writes ──
+    if transport_ctx.get().is_remote:
+        return {"error": "Hook installation is not permitted via remote transport"}
+
     import shutil
 
     project_dir = Path(project_directory) if project_directory else Path.cwd()
@@ -1254,6 +1423,147 @@ def install_hooks(project_directory: str = "") -> dict:
 
 
 @mcp_server.tool()
+def ingest_file(file_path: str, project_dir: str = "", tags: list[str] | None = None) -> dict:
+    """Ingest a single file into Vaire memory.
+
+    Chunks the file, generates embeddings, and stores each chunk as a memory.
+    Supported extensions: .md, .txt, .rst, .py, .js, .ts, .yaml, .yml, .json, .toml.
+
+    file_path: Absolute path to the file to ingest.
+    project_dir: directory_context to record for all chunks. If omitted, uses the file path.
+    tags: Optional list of tags to attach to every ingested chunk.
+    """
+    # ── Block remote file access ──
+    transport_info = transport_ctx.get()
+    if transport_info.is_remote:
+        return {"error": "File ingestion is not permitted via remote transport"}
+
+    import asyncio
+    import concurrent.futures
+
+    if _pipeline is None:
+        return {"error": "Ingestion pipeline not initialized"}
+    params = {"file_path": file_path, "project_dir": project_dir, "tags": tags or []}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, _pipeline.ingest_file(params, ""))
+        return future.result()
+
+
+@mcp_server.tool()
+def ingest_directory(
+    directory_path: str,
+    recursive: bool = True,
+    project_dir: str = "",
+    tags: list[str] | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Ingest all supported files in a directory into Vaire memory.
+
+    Returns a job_id immediately and runs ingestion in the background.
+    Poll with ingest_status(job_id) to check progress.
+
+    directory_path: Absolute path to the directory to ingest.
+    recursive: Whether to recurse into subdirectories (default True).
+    project_dir: directory_context for all chunks (host-side path).
+    tags: Optional list of tags to attach to every ingested chunk.
+    dry_run: If True, show what would be ingested without storing.
+    """
+    # ── Block remote file access ──
+    transport_info = transport_ctx.get()
+    if transport_info.is_remote:
+        return {"error": "Directory ingestion is not permitted via remote transport"}
+
+    import uuid as _uuid
+    import asyncio
+    import concurrent.futures
+
+    if _pipeline is None:
+        return {"error": "Ingestion pipeline not initialized"}
+
+    params = {
+        "directory_path": directory_path,
+        "recursive": recursive,
+        "project_dir": project_dir,
+        "tags": tags or [],
+        "dry_run": dry_run,
+    }
+
+    if dry_run:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, _pipeline.ingest_directory(params, ""))
+            return future.result()
+
+    job_id = str(_uuid.uuid4())
+    _mcp_ingest_jobs[job_id] = None  # sentinel: started, not done
+
+    def _run():
+        try:
+            result = asyncio.run(_pipeline.ingest_directory(params, ""))
+            _mcp_ingest_jobs[job_id] = result
+        except Exception as exc:
+            logger.exception("MCP ingest_directory failed for job %s", job_id)
+            _mcp_ingest_jobs[job_id] = {"status": "error", "error": str(exc)}
+
+    import threading
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {
+        "job_id": job_id,
+        "status": "started",
+        "directory_path": directory_path,
+        "message": "Ingestion running in background. Poll ingest_status with this job_id.",
+    }
+
+
+# Background job tracker for MCP ingest_directory calls.
+_mcp_ingest_jobs: dict = {}
+
+
+@mcp_server.tool()
+def ingest_status(job_id: str) -> dict:
+    """Check the status of a background ingest_directory job.
+
+    job_id: The job_id returned by ingest_directory.
+    """
+    if job_id in _mcp_ingest_jobs:
+        result = _mcp_ingest_jobs[job_id]
+        if result is None:
+            return {"job_id": job_id, "status": "running"}
+        # Job is terminal (completed or error) — evict to prevent unbounded growth.
+        del _mcp_ingest_jobs[job_id]
+        if result.get("status") == "error":
+            return {"job_id": job_id, **result}
+        return {"job_id": job_id, "status": "completed", **result}
+    return {"error": f"Job not found: {job_id}"}
+
+
+@mcp_server.tool()
+def ingest_preview(file_path: str, project_dir: str = "", tags: list[str] | None = None) -> dict:
+    """Preview how a file would be chunked without storing anything.
+
+    Returns chunk count and boundaries for the file.
+
+    file_path: Absolute path to the file to preview.
+    project_dir: directory_context that would be used.
+    tags: Tags that would be attached.
+    """
+    # ── Block remote file access ──
+    transport_info = transport_ctx.get()
+    if transport_info.is_remote:
+        return {"error": "File preview is not permitted via remote transport"}
+
+    import asyncio
+    import concurrent.futures
+
+    if _pipeline is None:
+        return {"error": "Ingestion pipeline not initialized"}
+    params = {"file_path": file_path, "project_dir": project_dir, "tags": tags or []}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, _pipeline.ingest_preview(params, ""))
+        return future.result()
+
+
+@mcp_server.tool()
 def seed_project(directory: str, dry_run: bool = False) -> dict:
     """Bootstrap Vaire memory for an existing project in one call.
 
@@ -1271,6 +1581,10 @@ def seed_project(directory: str, dry_run: bool = False) -> dict:
     directory: Project root directory to scan (absolute path).
     dry_run: If True, scan and show what would be stored without actually storing.
     """
+    # ── Block remote filesystem reads ──
+    if transport_ctx.get().is_remote:
+        return {"error": "Project seeding is not permitted via remote transport"}
+
     from vaire.seed import seed_project as _seed
 
     resolved = str(Path(directory).resolve())
@@ -1294,6 +1608,10 @@ def sync_instructions(claude_md_path: str = "") -> dict:
 
     claude_md_path: Path to CLAUDE.md. Defaults to ~/.claude/CLAUDE.md
     """
+    # ── Block remote filesystem writes ──
+    if transport_ctx.get().is_remote:
+        return {"status": "skipped", "reason": "Not permitted via remote transport"}
+
     md_path = Path(claude_md_path) if claude_md_path else Path.home() / ".claude" / "CLAUDE.md"
 
     if not md_path.parent.is_dir():
@@ -1534,6 +1852,9 @@ def build_groomer_dispatch() -> dict:
     async def groom_bulk_update_content(agent_id: str = "", **p):
         return g.bulk_update_content(**p)
 
+    async def groom_sanitize(agent_id: str = "", **p):
+        return g.sanitize(**p)
+
     return {
         "groom_audit": groom_audit,
         "groom_inspect": groom_inspect,
@@ -1557,6 +1878,7 @@ def build_groomer_dispatch() -> dict:
         "groom_content_scan": groom_content_scan,
         "groom_provenance": groom_provenance,
         "groom_bulk_update_content": groom_bulk_update_content,
+        "groom_sanitize": groom_sanitize,
     }
 
 
@@ -1608,12 +1930,16 @@ def build_ingest_dispatch(pipeline) -> dict:
         _dir_jobs[job_id] = None  # sentinel: job started, not yet done
 
         async def _run():
-            loop = _asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: _asyncio.run(pipeline.ingest_directory(params, agent_id)),
-            )
-            _dir_jobs[job_id] = result
+            try:
+                loop = _asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: _asyncio.run(pipeline.ingest_directory(params, agent_id)),
+                )
+                _dir_jobs[job_id] = result
+            except Exception as exc:
+                logger.exception("Background ingest_directory failed for job %s", job_id)
+                _dir_jobs[job_id] = {"status": "error", "error": str(exc)}
 
         _asyncio.create_task(_run())
         return {
@@ -1630,6 +1956,10 @@ def build_ingest_dispatch(pipeline) -> dict:
             result = _dir_jobs[job_id]
             if result is None:
                 return {"job_id": job_id, "status": "running"}
+            # Job is terminal — evict to prevent unbounded growth.
+            del _dir_jobs[job_id]
+            if result.get("status") == "error":
+                return {"job_id": job_id, **result}
             return {"job_id": job_id, "status": "completed", **result}
         return await pipeline.ingest_status(params, agent_id)
 
@@ -1801,6 +2131,87 @@ def shutdown():
     _write_queue = None
     _cache = None
     _pipeline = None
+
+
+# ── mTLS HTTPS Server ─────────────────────────────────────────────────
+
+
+class MTLSMiddleware:
+    """ASGI middleware that sets transport_ctx for HTTPS requests.
+
+    Two-layer authentication:
+      1. TLS layer (uvicorn + CERT_REQUIRED) rejects unauthenticated clients
+      2. Identity layer: client sends X-Vaire-CN header with their cert CN
+         — trusted because only valid cert holders can connect
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            from vaire.transport_context import TransportInfo
+
+            # Case-insensitive header lookup (ASGI headers are bytes tuples)
+            cn_bytes = b"unknown"
+            for key, val in scope.get("headers", []):
+                if key.lower() == b"x-vaire-cn":
+                    cn_bytes = val
+                    break
+            cn = cn_bytes.decode("utf-8", errors="replace")
+            client = scope.get("client", ("unknown", 0))
+            token = transport_ctx.set(TransportInfo(
+                is_remote=True, agent_cn=cn, client_ip=str(client[0]),
+            ))
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                transport_ctx.reset(token)
+        else:
+            # lifespan, websocket — pass through
+            await self.app(scope, receive, send)
+
+
+async def run_https(settings_override=None):
+    """Start the mTLS HTTPS server alongside the socket server.
+
+    Reuses the existing FastMCP Starlette app (same tool routes),
+    wrapping it with MTLSMiddleware and SSL.
+    """
+    import ssl as _ssl
+    import uvicorn
+
+    _settings = settings_override or settings
+
+    if not _settings.tls_enabled:
+        logger.info("HTTPS disabled (VAIRE_HTTPS_BIND not set)")
+        return
+
+    transport = _settings.HTTPS_TRANSPORT
+    if transport == "sse":
+        app = mcp_server.sse_app()
+    else:
+        app = mcp_server.streamable_http_app()
+
+    # Wrap with mTLS context middleware
+    app = MTLSMiddleware(app)
+
+    config = uvicorn.Config(
+        app,
+        host=_settings.https_host,
+        port=_settings.https_port,
+        ssl_certfile=str(_settings.tls_cert_resolved),
+        ssl_keyfile=str(_settings.tls_key_resolved),
+        ssl_ca_certs=str(_settings.tls_ca_resolved),
+        ssl_cert_reqs=_ssl.CERT_REQUIRED,
+        log_level="info",
+    )
+    server = uvicorn.Server(config)
+    logger.info(
+        "mTLS HTTPS server starting on %s:%d (transport=%s)",
+        _settings.https_host, _settings.https_port, transport,
+    )
+    await server.serve()
 
 
 def _signal_handler(signum, frame):

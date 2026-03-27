@@ -194,6 +194,7 @@ def cmd_server(args):
         build_groomer_dispatch,
         build_ingest_dispatch,
         init_engines,
+        run_https,
         shutdown,
     )
     import vaire.server as _server_mod
@@ -201,14 +202,20 @@ def cmd_server(args):
 
     settings = get_settings()
 
+    _shutdown_event = asyncio.Event()
+
     async def _run():
         # Engine initialisation happens inside the event loop so that
         # asyncio.create_task() in WriteQueue.start() has a running loop.
         init_engines(db_path=args.db_path, start_daemons=True)
 
-        # Register SIGTERM only after engines are fully initialised so the
-        # handler calls shutdown() on a consistent, fully-constructed state.
-        _signal.signal(_signal.SIGTERM, lambda sig, frame: (shutdown(), sys.exit(0)))
+        loop = asyncio.get_running_loop()
+
+        # Register SIGTERM/SIGINT after engines are fully initialised.
+        # Set an event flag so the event loop can shut down gracefully
+        # (drain write queue, stop server) instead of calling sys.exit().
+        for sig in (_signal.SIGTERM, _signal.SIGINT):
+            loop.add_signal_handler(sig, _shutdown_event.set)
 
         dispatch = build_dispatch_table()
         dispatch.update(build_ingest_dispatch(_server_mod._pipeline))
@@ -224,11 +231,30 @@ def cmd_server(args):
             groomer_methods=groomer,
             max_clients=settings.MAX_CLIENTS,
             approved_groomers=approved,
+            rate_limit_per_minute=settings.RATE_LIMIT_PER_MINUTE,
+            rate_limit_burst=settings.RATE_LIMIT_BURST,
         )
 
         await server.start()
         try:
-            await server.serve_forever()
+            tasks: set[asyncio.Task] = set()
+            serve_task = asyncio.create_task(server.serve_forever())
+            tasks.add(serve_task)
+
+            # Start mTLS HTTPS server alongside the socket server if configured
+            if settings.tls_enabled:
+                https_task = asyncio.create_task(run_https(settings))
+                tasks.add(https_task)
+
+            shutdown_task = asyncio.create_task(_shutdown_event.wait())
+            tasks.add(shutdown_task)
+
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
         finally:
             await server.stop()
             await async_shutdown()  # drain write queue before tearing down
