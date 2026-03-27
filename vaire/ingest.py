@@ -281,11 +281,29 @@ class IngestionPipeline:
         # consolidation tasks (one consolidated run happens at the end instead).
         self._bulk_ingest_active: bool = False
 
+    def _check_path_allowed(self, file_path: str) -> str | None:
+        """R12: Return error message if path is outside allowed directories."""
+        allowed = self._settings.ingest_allowed_dirs_list
+        if not allowed:
+            return None  # no restriction configured
+
+        resolved = str(Path(file_path).resolve())
+        for allowed_dir in allowed:
+            allowed_resolved = str(Path(allowed_dir).resolve())
+            if resolved.startswith(allowed_resolved + "/") or resolved == allowed_resolved:
+                return None
+        return f"Path {file_path} is outside allowed directories: {allowed}"
+
     async def ingest_file(self, params: dict, agent_id: str) -> dict:
         file_path = params.get("file_path", "")
         dry_run = params.get("dry_run", False)
         project_dir = params.get("project_dir", "")
         tags = params.get("tags", [])
+
+        # R12: Path traversal check
+        path_err = self._check_path_allowed(file_path)
+        if path_err:
+            return {"error": path_err}
 
         # S1: validate
         p = Path(file_path)
@@ -381,6 +399,12 @@ class IngestionPipeline:
 
     async def ingest_directory(self, params: dict, agent_id: str) -> dict:
         dir_path = params.get("directory_path", "")
+
+        # R12: Path traversal check
+        path_err = self._check_path_allowed(dir_path)
+        if path_err:
+            return {"error": path_err}
+
         p = Path(dir_path)
         if not p.exists() or not p.is_dir():
             return {"error": f"Directory not found: {dir_path}"}

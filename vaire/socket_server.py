@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -38,7 +39,7 @@ GROOMER_METHODS: frozenset[str] = frozenset({
     "groom_forget", "groom_search", "groom_bulk_retag",
     "groom_content_scan", "groom_provenance", "groom_bulk_update_content",
     "groom_update_content", "groom_promote", "groom_demote", "groom_bulk_delete",
-    "groom_auto",
+    "groom_auto", "groom_sanitize",
 })
 
 
@@ -51,6 +52,28 @@ class ConnectionState:
     agent_id: str = ""
     role: str = "agent"        # "agent" or "groomer"
     request_count: int = 0
+    is_remote: bool = False    # True for HTTPS connections
+
+    # ── Token bucket rate limiter (R2) ──
+    _rate_tokens: float = 20.0
+    _rate_last_refill: float = 0.0
+
+    def check_rate_limit(self, max_per_min: int, burst: int) -> bool:
+        """Return True if the request is allowed, False if rate-limited."""
+        now = time.monotonic()
+        if self._rate_last_refill == 0.0:
+            self._rate_last_refill = now
+            self._rate_tokens = float(burst)
+        elapsed = now - self._rate_last_refill
+        self._rate_tokens = min(
+            float(burst),
+            self._rate_tokens + elapsed * (max_per_min / 60.0),
+        )
+        self._rate_last_refill = now
+        if self._rate_tokens >= 1.0:
+            self._rate_tokens -= 1.0
+            return True
+        return False
 
 
 # ── Server ─────────────────────────────────────────────────────────────────────
@@ -68,6 +91,8 @@ class VaireSocketServer:
         crdt: CRDTMemorySync | None = None,
         groomer_methods: dict[str, Callable[..., Any]] | None = None,
         approved_groomers: frozenset[str] | None = None,
+        rate_limit_per_minute: int = 120,
+        rate_limit_burst: int = 20,
     ) -> None:
         self._socket_path = socket_path
         self._pid_file = pid_file
@@ -77,6 +102,8 @@ class VaireSocketServer:
         self._crdt = crdt
         self._groomer_methods: dict[str, Callable[..., Any]] = groomer_methods or {}
         self._approved_groomers: frozenset[str] = approved_groomers or frozenset()
+        self._rate_limit_per_minute = rate_limit_per_minute
+        self._rate_limit_burst = rate_limit_burst
 
         self._server: asyncio.Server | None = None
         # Fix #5 — every client task is tracked here; stop() cancels them all.
@@ -245,6 +272,14 @@ class VaireSocketServer:
         state: ConnectionState,
     ) -> dict[str, Any]:
         """Route *method* to the registered handler, enforcing role checks."""
+        # ── Rate limiting (R2) ──
+        if not state.check_rate_limit(
+            self._rate_limit_per_minute, self._rate_limit_burst
+        ):
+            return make_error_response(
+                request_id, "Rate limit exceeded", code="RATE_LIMITED"
+            )
+
         # ZK-W3: groomer-only methods are never exposed to regular agents.
         if method in GROOMER_METHODS and state.role != "groomer":
             return make_error_response(
@@ -272,26 +307,43 @@ class VaireSocketServer:
         safe_params = {k: v for k, v in params.items() if k != "agent_id"}
 
         try:
-            result = await handler(**safe_params, agent_id=state.agent_id)
+            result = await asyncio.wait_for(
+                handler(**safe_params, agent_id=state.agent_id),
+                timeout=300.0,  # 5-minute handler timeout
+            )
             if not isinstance(result, dict):
                 result = {"result": result}
             return make_ok_response(request_id, result)
+        except asyncio.TimeoutError:
+            logger.error("Handler %s timed out after 300s", method)
+            return make_error_response(
+                request_id, f"Handler {method} timed out", code="TIMEOUT"
+            )
         except Exception as exc:
             logger.exception("Handler %s raised: %s", method, exc)
+            # R5: Sanitize error messages — don't expose internals to remote clients
+            if state.is_remote:
+                error_msg = f"Internal error in {method}"
+            else:
+                error_msg = str(exc)
             return make_error_response(
-                request_id, str(exc), code="HANDLER_ERROR"
+                request_id, error_msg, code="HANDLER_ERROR"
             )
 
     # ── Role resolution ────────────────────────────────────────────────────────
 
     def _resolve_role(self, agent_id: str) -> str:
-        """Return 'groomer' if agent_id is in the approved groomers list or
-        carries the groomer prefix (when no allowlist is configured)."""
+        """Return 'groomer' if agent_id is in the approved groomers list.
+
+        R10 hardening: when no allowlist is configured, groomer role is
+        DENIED entirely.  The old prefix-based fallback was too permissive
+        — any agent could self-assign groomer by choosing an agent_id
+        starting with 'groomer-'.
+        """
         if self._approved_groomers:
             if agent_id in self._approved_groomers:
                 return "groomer"
-        elif agent_id.startswith(self._groomer_id_prefix):
-            return "groomer"
+        # No prefix fallback — require explicit allowlist
         return "agent"
 
     # ── PID file helpers ───────────────────────────────────────────────────────

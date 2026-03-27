@@ -49,6 +49,10 @@ def _load_ini() -> dict[str, str]:
 
 _INI_VALUES = _load_ini()
 
+# Cache for _parse_remap results, keyed by PATH_REMAP string value.
+_REMAP_NONE = object()  # sentinel for "parsed but result is None"
+_remap_cache: dict = {}
+
 
 class IniSettingsSource(PydanticBaseSettingsSource):
     """Pydantic-settings source that reads from vaire.ini.
@@ -192,6 +196,7 @@ class Settings(BaseSettings):
     GRAPH_SPREADING_DECAY: float = 0.5
     GRAPH_SPREADING_MAX_DEPTH: int = 2
     GRAPH_ENTITY_MIN_LENGTH: int = 3
+    GRAPH_ENTITY_EXTRA_STOPWORDS: str = ""  # comma-separated additional stopwords
 
     # v13: Adversarial protection settings
     ADVERSARIAL_DETECTION_ENABLED: bool = True
@@ -297,6 +302,23 @@ class Settings(BaseSettings):
     # e.g. "/workspace:/home/alice/workspace" rewrites /workspace/foo → /home/alice/workspace/foo
     PATH_REMAP: str = ""
 
+    # ── mTLS remote access ────────────────────────────────────────────────────
+    TLS_CERT: str = ""              # Server certificate PEM path
+    TLS_KEY: str = ""               # Server private key PEM path
+    TLS_CA: str = ""                # CA cert PEM (verifies client certs)
+    HTTPS_BIND: str = ""            # "host:port" — empty = disabled
+    HTTPS_TRANSPORT: str = "streamable-http"  # "sse" or "streamable-http"
+
+    # ── Security limits ───────────────────────────────────────────────────────
+    MAX_CONTENT_LENGTH: int = 50000   # max chars for memory content
+    MAX_TAG_COUNT: int = 50           # max tags per memory
+    MAX_TAG_LENGTH: int = 100         # max chars per individual tag
+    RATE_LIMIT_PER_MINUTE: int = 120  # per-connection request rate limit
+    RATE_LIMIT_BURST: int = 20        # burst allowance above steady rate
+    INGEST_ALLOWED_DIRS: str = ""     # comma-separated allowed dir prefixes for ingest
+    REGEX_TIMEOUT_MATCHES: int = 100  # max matches per regex scan in groomer
+    PROMPT_INJECTION_DETECTION: bool = True  # flag suspicious content on write
+
     model_config = {"env_prefix": "VAIRE_"}
 
     @classmethod
@@ -335,6 +357,59 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_tls_settings(self) -> "Settings":
+        tls_fields = [self.TLS_CERT, self.TLS_KEY, self.TLS_CA]
+        set_count = sum(1 for f in tls_fields if f)
+        if 0 < set_count < 3:
+            raise ValueError(
+                "TLS_CERT, TLS_KEY, and TLS_CA must all be set together "
+                f"(got {set_count}/3)"
+            )
+        if self.HTTPS_BIND and not all(tls_fields):
+            raise ValueError(
+                "HTTPS_BIND requires TLS_CERT, TLS_KEY, and TLS_CA to be set"
+            )
+        if self.HTTPS_BIND and ":" not in self.HTTPS_BIND:
+            raise ValueError(
+                f"HTTPS_BIND must be 'host:port', got '{self.HTTPS_BIND}'"
+            )
+        return self
+
+    @property
+    def tls_enabled(self) -> bool:
+        return bool(self.TLS_CERT and self.TLS_KEY and self.TLS_CA and self.HTTPS_BIND)
+
+    @property
+    def https_host(self) -> str:
+        if not self.HTTPS_BIND:
+            return ""
+        return self.HTTPS_BIND.rsplit(":", 1)[0]
+
+    @property
+    def https_port(self) -> int:
+        if not self.HTTPS_BIND:
+            return 0
+        return int(self.HTTPS_BIND.rsplit(":", 1)[1])
+
+    @property
+    def tls_cert_resolved(self) -> Path:
+        return Path(self.TLS_CERT).expanduser()
+
+    @property
+    def tls_key_resolved(self) -> Path:
+        return Path(self.TLS_KEY).expanduser()
+
+    @property
+    def tls_ca_resolved(self) -> Path:
+        return Path(self.TLS_CA).expanduser()
+
+    @property
+    def ingest_allowed_dirs_list(self) -> list[str]:
+        if not self.INGEST_ALLOWED_DIRS:
+            return []
+        return [d.strip() for d in self.INGEST_ALLOWED_DIRS.split(",") if d.strip()]
+
     @property
     def db_path_resolved(self) -> Path:
         return Path(self.DB_PATH).expanduser()
@@ -347,16 +422,61 @@ class Settings(BaseSettings):
     def pid_file_resolved(self) -> Path:
         return Path(self.PID_FILE).expanduser()
 
+    @staticmethod
+    def _prefix_matches(path: str, prefix: str) -> bool:
+        """Check if path starts with prefix at a directory boundary.
+
+        Prevents '/workspace' from matching '/workspace2/foo'.
+        Only matches if the prefix is followed by '/' or is the entire path.
+        """
+        if not path.startswith(prefix):
+            return False
+        return len(path) == len(prefix) or path[len(prefix)] == "/"
+
+    def _parse_remap(self) -> tuple[str, str] | None:
+        """Parse PATH_REMAP into (container_prefix, host_prefix).
+
+        Returns None if unset, malformed, or either prefix is empty.
+        Result is cached in module-level dict keyed by PATH_REMAP value.
+        """
+        cached = _remap_cache.get(self.PATH_REMAP)
+        if cached is not None:
+            return cached if cached != _REMAP_NONE else None
+        if not self.PATH_REMAP or ":" not in self.PATH_REMAP:
+            _remap_cache[self.PATH_REMAP] = _REMAP_NONE
+            return None
+        container_prefix, host_prefix = self.PATH_REMAP.split(":", 1)
+        if not container_prefix or not host_prefix:
+            _remap_cache[self.PATH_REMAP] = _REMAP_NONE
+            return None
+        result = (container_prefix, host_prefix)
+        _remap_cache[self.PATH_REMAP] = result
+        return result
+
     def remap_path(self, path: str) -> str:
         """Rewrite a container-side path to its host equivalent.
 
         Reads PATH_REMAP ("container_prefix:host_prefix").  No-op if unset.
         """
-        if not self.PATH_REMAP or ":" not in self.PATH_REMAP:
+        parsed = self._parse_remap()
+        if parsed is None:
             return path
-        container_prefix, host_prefix = self.PATH_REMAP.split(":", 1)
-        if path.startswith(container_prefix):
+        container_prefix, host_prefix = parsed
+        if self._prefix_matches(path, container_prefix):
             return host_prefix + path[len(container_prefix):]
+        return path
+
+    def reverse_remap_path(self, path: str) -> str:
+        """Rewrite a host-side path back to its container equivalent.
+
+        Inverse of remap_path().  No-op if PATH_REMAP is unset.
+        """
+        parsed = self._parse_remap()
+        if parsed is None:
+            return path
+        container_prefix, host_prefix = parsed
+        if self._prefix_matches(path, host_prefix):
+            return container_prefix + path[len(host_prefix):]
         return path
 
 
