@@ -396,33 +396,24 @@ class FractalMemoryTree:
 
         if level == 2:
             # Return level 1 sub-clusters that have this as parent
-            rows = self._storage._conn.execute(
-                "SELECT * FROM memory_clusters WHERE parent_cluster_id = ? "
-                "ORDER BY heat DESC",
-                (cluster_id,),
-            ).fetchall()
+            clusters = self._storage.get_child_clusters(cluster_id)
             return [
                 {
                     "level": 1,
                     "type": "cluster",
-                    "id": dict(r)["id"],
-                    "name": dict(r)["name"],
-                    "summary": dict(r)["summary"],
-                    "member_count": dict(r)["member_count"],
+                    "id": c["id"],
+                    "name": c["name"],
+                    "summary": c["summary"],
+                    "member_count": c["member_count"],
                 }
-                for r in rows
+                for c in clusters
             ]
 
         elif level == 1:
             # Return individual memories assigned to this cluster
-            rows = self._storage._conn.execute(
-                "SELECT * FROM memories WHERE cluster_id = ? AND heat > 0 "
-                "ORDER BY heat DESC",
-                (cluster_id,),
-            ).fetchall()
+            memories = self._storage.get_memories_in_cluster(cluster_id, min_heat=0.0)
             results = []
-            for r in rows:
-                mem = self._storage._row_to_dict(r)
+            for mem in memories:
                 for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
                     mem.pop(_bf, None)
                 results.append({
@@ -531,13 +522,9 @@ class FractalMemoryTree:
                 continue
 
             # Boost all member memories by cluster similarity score
-            rows = self._storage._conn.execute(
-                "SELECT id FROM memories WHERE cluster_id = ? AND heat > 0",
-                (cl["id"],),
-            ).fetchall()
+            member_ids = self._storage.get_cluster_member_ids(cl["id"], min_heat=0.0)
 
-            for row in rows:
-                mid = row[0]
+            for mid in member_ids:
                 memory_scores[mid] = max(memory_scores.get(mid, 0.0), sim)
 
         ranked = sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)

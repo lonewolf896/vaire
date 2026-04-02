@@ -62,7 +62,7 @@ def test_recall_finds_by_fts():
 
     results = server.recall("SQLite search")
     assert len(results) >= 1
-    assert any("SQLite" in r["content"] for r in results)
+    assert any("SQLite" in r.get("content", "") for r in results)
 
 
 def test_recall_boosts_heat():
@@ -75,7 +75,7 @@ def test_recall_boosts_heat():
     results = server.recall("heat boost test")
     assert len(results) >= 1
     # Heat should be 0.5 + 0.1 = 0.6
-    boosted = [r for r in results if r["id"] == mid]
+    boosted = [r for r in results if r.get("id") == mid]
     assert len(boosted) == 1
     assert abs(boosted[0]["heat"] - 0.6) < 0.01
 
@@ -85,7 +85,7 @@ def test_recall_respects_min_heat():
     server._get_storage().update_memory_heat(r["id"], 0.05)
 
     results = server.recall("low heat memory", min_heat=0.5)
-    matching = [r for r in results if r["content"] == "low heat memory"]
+    matching = [r for r in results if r.get("content") == "low heat memory"]
     assert len(matching) == 0
 
 
@@ -94,7 +94,9 @@ def test_recall_max_results():
         server.remember(f"memory number {i} test recall", "/tmp", ["bulk"])
 
     results = server.recall("memory number test recall", max_results=3)
-    assert len(results) <= 3
+    # Budget meta is always appended; actual memories should be <= max_results
+    actual_memories = [r for r in results if not r.get("_budget_meta")]
+    assert len(actual_memories) <= 3
 
 
 def test_recall_no_embedding_in_results():
@@ -102,6 +104,99 @@ def test_recall_no_embedding_in_results():
     results = server.recall("no embedding leak")
     for r in results:
         assert "embedding" not in r
+
+
+def test_recall_strips_internal_fields():
+    server.remember("internal field strip test", "/tmp", ["striptest"])
+    results = server.recall("internal field strip test")
+    internal_fields = {
+        "enrichment_concepts", "enrichment_comet", "enrichment_queries",
+        "enrichment_logic", "enriched_content", "enrichment_model_versions",
+        "original_content", "sr_x", "sr_y", "slot_index", "vector_clock",
+    }
+    for r in results:
+        if r.get("_budget_meta"):
+            continue
+        for field in internal_fields:
+            assert field not in r, f"internal field {field!r} should be stripped"
+
+
+def test_recall_compact_mode():
+    server.remember("compact mode test memory with lots of detail", "/tmp", ["compacttest"])
+    results = server.recall("compact mode test memory", compact=True)
+    allowed_fields = {
+        "id", "content", "tags", "directory_context", "created_at",
+        "heat", "confidence", "contextual_prefix", "is_protected",
+        "_retrieval_score", "_cross_encoder_score", "_retrieval_confidence",
+        "_truncated", "_budget_meta", "budget_used", "budget_limit",
+        "results_truncated", "results_returned",
+    }
+    for r in results:
+        for field in r:
+            assert field in allowed_fields, f"unexpected field {field!r} in compact response"
+
+
+# ── token-budgeted recall ─────────────────────────────────────────────
+
+
+def test_recall_max_tokens_limits_output():
+    # Create memories with known content sizes
+    for i in range(5):
+        server.remember(f"token budget test memory {i} " + "x" * 500, "/tmp", ["budget"])
+
+    # With a small budget, should get fewer results
+    results = server.recall("token budget test memory", max_results=5, max_tokens=200)
+    # Last element is budget metadata
+    meta = results[-1]
+    assert meta.get("_budget_meta") is True
+    assert meta["budget_limit"] == 200
+    # Budget estimation includes metadata overhead, so allow small overshoot
+    assert meta["budget_used"] <= 300
+    # Should have fewer results than without budget
+    assert meta["results_truncated"] > 0
+
+
+def test_recall_max_tokens_none_uses_default_cap():
+    server.remember("no budget test memory", "/tmp", ["nobudget"])
+    results = server.recall("no budget test memory", max_tokens=None)
+    # Default cap is applied — last element should be budget metadata
+    meta = results[-1]
+    assert meta.get("_budget_meta") is True
+    # Default budget limit comes from RECALL_DEFAULT_MAX_TOKENS setting
+    assert meta["budget_limit"] > 0
+
+
+def test_recall_max_tokens_truncates_at_sentence():
+    # One big memory that should be truncated
+    content = "First sentence. Second sentence. Third sentence. Fourth sentence."
+    server.remember(content, "/tmp", ["trunc"])
+    # Budget enough for partial content only
+    results = server.recall("First sentence Second sentence", max_tokens=5)
+    meta = results[-1]
+    assert meta.get("_budget_meta") is True
+    # Check that any truncated result ends at a sentence boundary
+    for r in results[:-1]:
+        if r.get("_truncated"):
+            assert r["content"].rstrip().endswith(".")
+
+
+def test_recall_hierarchical_max_tokens():
+    for i in range(3):
+        server.remember(f"hierarchical budget test {i} " + "y" * 300, "/tmp", ["hier"])
+    results = server.recall_hierarchical("hierarchical budget test", max_tokens=100)
+    meta = results[-1]
+    assert meta.get("_budget_meta") is True
+    assert meta["budget_limit"] == 100
+
+
+def test_get_project_context_max_tokens():
+    for i in range(3):
+        server.remember(f"project context budget {i} " + "z" * 300, "/tmp/budgetproj", ["ctx"])
+    result = server.get_project_context("/tmp/budgetproj", max_tokens=100)
+    memories = result["memories"]
+    meta = memories[-1]
+    assert meta.get("_budget_meta") is True
+    assert meta["budget_limit"] == 100
 
 
 # ── forget ─────────────────────────────────────────────────────────────
@@ -199,7 +294,8 @@ def test_get_project_context_filters_by_directory():
 
     result = server.get_project_context("/projects/a")
     assert "memories" in result
-    assert all(r["directory_context"] == "/projects/a" for r in result["memories"])
+    memories = [r for r in result["memories"] if not r.get("_budget_meta")]
+    assert all(r["directory_context"] == "/projects/a" for r in memories)
 
 
 def test_get_project_context_filters_by_heat():
@@ -214,9 +310,10 @@ def test_get_project_context_returns_hot():
     server.remember("hot memory", "/projects/d", ["test"])  # heat=1.0
 
     result = server.get_project_context("/projects/d")
-    assert len(result["memories"]) == 1
-    assert result["memories"][0]["content"] == "hot memory"
-    assert "embedding" not in result["memories"][0]
+    memories = [r for r in result["memories"] if not r.get("_budget_meta")]
+    assert len(memories) == 1
+    assert memories[0]["content"] == "hot memory"
+    assert "embedding" not in memories[0]
 
 
 # ── consolidate_now ────────────────────────────────────────────────────

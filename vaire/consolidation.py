@@ -95,6 +95,7 @@ class AstrocyteEngine:
         self._last_light_cycle: datetime | None = None
         self._last_medium_cycle: datetime | None = None
         self._last_full_activity: datetime | None = None  # activity stamp when full cycle last ran
+        self._last_decay_time: datetime | None = None  # prevents double decay per iteration
 
         self.last_activity: datetime = datetime.now(timezone.utc)
         self.is_running: bool = False
@@ -151,11 +152,9 @@ class AstrocyteEngine:
     def _load_last_sleep_cycle(self) -> datetime | None:
         """Load last sleep cycle timestamp from DB to survive restarts."""
         try:
-            row = self._storage._conn.execute(
-                "SELECT value FROM metadata WHERE key = 'last_sleep_cycle'"
-            ).fetchone()
-            if row:
-                dt = datetime.fromisoformat(row[0])
+            val = self._storage.get_metadata_value("last_sleep_cycle")
+            if val:
+                dt = datetime.fromisoformat(val)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return dt
@@ -424,12 +423,24 @@ class AstrocyteEngine:
 
     def _apply_decay(self, stats: dict) -> None:
         now = datetime.now(timezone.utc)
+
+        # Prevent double decay when light cycle and full cycle fire in the
+        # same daemon loop iteration (Phase 4 fix for M14)
+        min_gap = self._settings.ACTION_LOG_INTERVAL * 0.9
+        if self._last_decay_time is not None:
+            since_last = (now - self._last_decay_time).total_seconds()
+            if since_last < min_gap:
+                return
+        self._last_decay_time = now
+
         decay = self._settings.DECAY_FACTOR
         cold = self._settings.COLD_THRESHOLD
 
         heat_updates: list[tuple[int, float]] = []
         for mem in self._storage.get_all_memories_for_decay():
             if mem.get("is_protected"):
+                continue
+            if mem.get("store_type") == "reference":
                 continue
             try:
                 last = datetime.fromisoformat(mem["last_accessed"])
@@ -751,15 +762,11 @@ class AstrocyteEngine:
         stats = {"processed": 0, "memories_created": 0, "skipped_no_outcome": 0}
 
         try:
-            rows = self._storage._conn.execute(
-                "SELECT id, tool_name, tool_input_summary, directory, timestamp "
-                "FROM action_log WHERE processed = 0 "
-                "ORDER BY timestamp ASC LIMIT 200"
-            ).fetchall()
+            entries = self._storage.get_unprocessed_action_log(limit=200)
         except Exception:
             return stats
 
-        if not rows:
+        if not entries:
             return stats
 
         # Current time bucket — skip it since the window is still open
@@ -768,9 +775,9 @@ class AstrocyteEngine:
 
         # Group by directory + 30-min windows
         groups: dict[str, list] = {}
-        for row in rows:
-            directory = row[3] or "unknown"
-            timestamp = row[4]
+        for entry in entries:
+            directory = entry["directory"] or "unknown"
+            timestamp = entry["timestamp"]
             try:
                 dt = datetime.fromisoformat(timestamp)
                 bucket = dt.strftime("%Y-%m-%d-%H") + f"-{dt.minute // 30}"
@@ -780,9 +787,9 @@ class AstrocyteEngine:
             if key not in groups:
                 groups[key] = []
             groups[key].append({
-                "id": row[0],
-                "tool": row[1],
-                "summary": row[2],
+                "id": entry["id"],
+                "tool": entry["tool_name"],
+                "summary": entry["tool_input_summary"],
                 "directory": directory,
                 "bucket": bucket,
             })

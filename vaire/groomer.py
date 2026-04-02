@@ -787,16 +787,93 @@ class GroomerEngine:
                 )
                 replaced += 1
 
+        # TASK-023: Also scan enriched_content for matches
+        enriched_matches: list[dict] = []
+        for mem in all_mems:
+            enriched = mem.get("enriched_content")
+            if not enriched or not isinstance(enriched, str):
+                continue
+            found = list(itertools.islice(regex.finditer(enriched), max_matches))
+            if not found:
+                continue
+            enriched_matches.append({
+                "memory_id": mem["id"],
+                "field": "enriched_content",
+                "matches": [{"text": m.group(), "start": m.start(), "end": m.end()} for m in found[:5]],
+                "match_count": len(found),
+            })
+            if replacement is not None and not dry_run:
+                new_enriched = regex.sub(replacement, enriched)
+                self._storage.execute_write(
+                    "UPDATE memories SET enriched_content = ? WHERE id = ?",
+                    (new_enriched, mem["id"]),
+                )
+
+        # TASK-023: Also scan archive_history for matches
+        archive_matches: list[dict] = []
+        all_archives = self._storage.get_all_archives(limit=5000)
+        for arc in all_archives:
+            arc_content = arc.get("content", "")
+            found = list(itertools.islice(regex.finditer(arc_content), max_matches))
+            if not found:
+                continue
+            archive_matches.append({
+                "archive_id": arc["id"],
+                "original_memory_id": arc.get("original_memory_id"),
+                "field": "archive_history",
+                "matches": [{"text": m.group(), "start": m.start(), "end": m.end()} for m in found[:5]],
+                "match_count": len(found),
+            })
+            if replacement is not None and not dry_run:
+                new_arc_content = regex.sub(replacement, arc_content)
+                self._storage.update_archive_content(arc["id"], new_arc_content)
+
         result: dict = {
             "pattern": pattern,
             "total_matches": len(matches),
+            "enriched_matches": len(enriched_matches),
+            "archive_matches": len(archive_matches),
             "dry_run": dry_run,
             "matches": matches[:100],
+            "enriched_match_details": enriched_matches[:50],
+            "archive_match_details": archive_matches[:50],
         }
         if replacement is not None:
             result["replacement"] = replacement
             result["replaced"] = replaced
         return result
+
+    def sanitize_archives(self, dry_run: bool = True) -> dict:
+        """Scan all archive entries for credential patterns and redact them.
+
+        Uses the same redact_credentials() function from enrichment.py
+        that protects enriched_content at write time.
+        """
+        from .enrichment import redact_credentials
+
+        all_archives = self._storage.get_all_archives(limit=10000)
+        found: list[dict] = []
+        redacted = 0
+
+        for arc in all_archives:
+            content = arc.get("content", "")
+            cleaned = redact_credentials(content)
+            if cleaned != content:
+                found.append({
+                    "archive_id": arc["id"],
+                    "original_memory_id": arc.get("original_memory_id"),
+                })
+                if not dry_run:
+                    self._storage.update_archive_content(arc["id"], cleaned)
+                    redacted += 1
+
+        return {
+            "total_archives_scanned": len(all_archives),
+            "archives_with_credentials": len(found),
+            "redacted": redacted,
+            "dry_run": dry_run,
+            "details": found[:100],
+        }
 
     def bulk_update_content(
         self,

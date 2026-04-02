@@ -61,12 +61,17 @@ class MemoryCompressor:
         Returns:
             0 = full fidelity, 1 = gist, 2 = tag
         """
-        # Protected memories: never compress
-        if memory.get("is_protected", False):
+        # Full-fidelity memories: never compress (anchored reference docs, roles)
+        fidelity = memory.get("content_fidelity", "auto")
+        if fidelity == "full":
             return 0
 
         # Semantic store memories: never compress (schemas should stay intact)
         if memory.get("store_type", "episodic") == "semantic":
+            return 0
+
+        # Reference store memories: never compress (static reference data)
+        if memory.get("store_type", "episodic") == "reference":
             return 0
 
         created_at_str = memory.get("created_at", "")
@@ -147,6 +152,21 @@ class MemoryCompressor:
             original_content=original_content,
         )
 
+        # Embedding tiering: level 1 → drop float32 vector, keep int8 only
+        try:
+            self._storage.delete_vector(memory_id)
+            # Update int8 vector with gist embedding
+            from vaire.embeddings import EmbeddingEngine
+            if new_embedding is not None:
+                int8_vec = EmbeddingEngine.quantize_int8(new_embedding)
+                try:
+                    self._storage.delete_vector_int8(memory_id)
+                except Exception:
+                    pass
+                self._storage.insert_vector_int8(memory_id, int8_vec)
+        except Exception:
+            logger.debug("Embedding tier change failed for memory %d", memory_id)
+
         return gist
 
     def compress_to_tag(self, memory_id: int) -> str:
@@ -197,6 +217,16 @@ class MemoryCompressor:
             compression_level=2,
         )
 
+        # Embedding tiering: level 2 → drop ALL vectors (FTS5 only)
+        try:
+            self._storage.delete_vector(memory_id)
+        except Exception:
+            pass
+        try:
+            self._storage.delete_vector_int8(memory_id)
+        except Exception:
+            pass
+
         return tag_repr
 
     def compression_cycle(self) -> dict:
@@ -220,6 +250,10 @@ class MemoryCompressor:
 
             if mem.get("store_type", "episodic") == "semantic":
                 stats["semantic_skipped"] += 1
+                continue
+
+            if mem.get("store_type", "episodic") == "reference":
+                stats["protected_skipped"] += 1
                 continue
 
             current_level = mem.get("compression_level", 0)

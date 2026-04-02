@@ -66,6 +66,8 @@ class PredictiveCodingGate:
         )
         # Rejection counter for memory_stats reporting
         self._rejection_count: int = 0
+        # Dedup suppression counter
+        self._dedup_suppression_count: int = 0
 
     # ── Task Continuity ──────────────────────────────────────────────────
 
@@ -265,16 +267,10 @@ class PredictiveCodingGate:
         for name in entity_names_to_check:
             # Find memories mentioning this entity
             try:
-                rows = self._storage._conn.execute(
-                    "SELECT m.created_at FROM memories m "
-                    "WHERE m.content LIKE ? AND m.heat > 0 "
-                    "ORDER BY m.created_at DESC LIMIT 1",
-                    (f"%{name}%",),
-                ).fetchall()
-                if rows:
-                    mem_time_str = rows[0][0]
+                last_seen = self._storage.get_latest_memory_date_mentioning(name)
+                if last_seen:
                     try:
-                        mem_dt = datetime.fromisoformat(mem_time_str)
+                        mem_dt = datetime.fromisoformat(last_seen)
                         if mem_dt.tzinfo is None:
                             mem_dt = mem_dt.replace(tzinfo=timezone.utc)
                         if most_recent_dt is None or mem_dt > most_recent_dt:
@@ -320,12 +316,7 @@ class PredictiveCodingGate:
             return 0.2  # No relationship signals
 
         # Check which relationship types already exist in the directory's subgraph
-        existing_rel_types = set()
-        rows = self._storage._conn.execute(
-            "SELECT DISTINCT r.relationship_type FROM relationships r"
-        ).fetchall()
-        for row in rows:
-            existing_rel_types.add(row[0])
+        existing_rel_types = set(self._storage.get_distinct_relationship_types())
 
         # Check if any extracted relationship contexts are truly new
         has_new = False
@@ -335,6 +326,70 @@ class PredictiveCodingGate:
                 break
 
         return 0.8 if has_new else 0.2
+
+    # ── Dedup Check ───────────────────────────────────────────────────────
+
+    def is_duplicate(
+        self, content: str, directory: str, tags: list[str]
+    ) -> tuple[bool, float]:
+        """Check if content is a near-duplicate of a recent memory in the same directory.
+
+        Returns (is_dup, max_similarity). Checks memories created within
+        DEDUP_WINDOW_HOURS in the same directory_context. Anchored memories
+        (via anchor()) bypass this check — they are intentional.
+        """
+        threshold = self._settings.DEDUP_THRESHOLD
+        window_hours = self._settings.DEDUP_WINDOW_HOURS
+
+        if threshold >= 1.0:
+            return (False, 0.0)  # dedup disabled
+
+        # Anchored content bypasses dedup
+        if "_anchor" in tags:
+            return (False, 0.0)
+
+        query_embedding = self._embeddings.encode(content)
+        if query_embedding is None:
+            return (False, 0.0)
+
+        # Get recent memories for this directory within the time window
+        now = datetime.now(timezone.utc)
+        recent_memories = self._storage.get_memories_for_directory(
+            directory, min_heat=0.0
+        )
+
+        max_sim = 0.0
+        for mem in recent_memories:
+            # Check time window
+            created_str = mem.get("created_at", "")
+            if created_str:
+                try:
+                    created_dt = datetime.fromisoformat(created_str)
+                    if created_dt.tzinfo is None:
+                        created_dt = created_dt.replace(tzinfo=timezone.utc)
+                    hours_ago = (now - created_dt).total_seconds() / 3600.0
+                    if hours_ago > window_hours:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+            else:
+                continue
+
+            # Compare embeddings
+            mem_embedding = mem.get("embedding")
+            if mem_embedding is not None:
+                sim = self._embeddings.similarity(query_embedding, mem_embedding)
+                max_sim = max(max_sim, sim)
+                if sim >= threshold:
+                    logger.debug(
+                        "Dedup SUPPRESSED: similarity=%.3f >= threshold=%.3f "
+                        "dir=%s existing_id=%s",
+                        sim, threshold, directory, mem.get("id"),
+                    )
+                    self._dedup_suppression_count += 1
+                    return (True, sim)
+
+        return (False, max_sim)
 
     # ── Write Gate Decision ──────────────────────────────────────────────
 

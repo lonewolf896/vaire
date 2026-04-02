@@ -51,36 +51,42 @@ def _insert_mem(db: StorageEngine, content: str = "content",
                 embedding: bytes | None = None, is_stale: int = 0,
                 last_accessed: str | None = None) -> int:
     now = _now_minus(0)
-    cur = db._conn.execute(
+    cur = db._test_conn.execute(
         "INSERT INTO memories(content, embedding, tags, directory_context, "
         "created_at, last_accessed, heat, is_stale) VALUES (?,?,?,?,?,?,?,?)",
         (content, embedding, "[]", project_dir, now,
          last_accessed or now, heat, is_stale),
     )
-    db._conn.commit()
-    return cur.lastrowid
+    mid = cur.lastrowid
+    # Explicit FTS sync (triggers removed in Phase 2)
+    db._test_conn.execute(
+        "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+        (mid, content),
+    )
+    db._test_conn.commit()
+    return mid
 
 
 def _insert_entity(db: StorageEngine, name: str, entity_type: str = "concept") -> int:
     now = _now_minus(0)
-    cur = db._conn.execute(
+    cur = db._test_conn.execute(
         "INSERT INTO entities(name, type, created_at, last_accessed, heat, archived) "
         "VALUES (?,?,?,?,?,0)",
         (name, entity_type, now, now, 1.0),
     )
-    db._conn.commit()
+    db._test_conn.commit()
     return cur.lastrowid
 
 
 def _insert_rel(db: StorageEngine, src_id: int, tgt_id: int,
                 rel_type: str = "relates") -> int:
     now = _now_minus(0)
-    cur = db._conn.execute(
+    cur = db._test_conn.execute(
         "INSERT INTO relationships(source_entity_id, target_entity_id, "
         "relationship_type, weight, created_at, last_reinforced) VALUES (?,?,?,1,?,?)",
         (src_id, tgt_id, rel_type, now, now),
     )
-    db._conn.commit()
+    db._test_conn.commit()
     return cur.lastrowid
 
 
@@ -258,8 +264,8 @@ class TestUpsertEntity:
 
     def test_unarchives_existing(self, db):
         eid = db.upsert_entity("Java", "language", "a1")
-        db._conn.execute("UPDATE entities SET archived=1 WHERE id=?", (eid,))
-        db._conn.commit()
+        db._test_conn.execute("UPDATE entities SET archived=1 WHERE id=?", (eid,))
+        db._test_conn.commit()
         db.upsert_entity("Java", "language", "a1")
         entity = db.get_entity_by_name("Java")
         assert entity["archived"] == 0
@@ -284,7 +290,7 @@ class TestUpsertRelationship:
     def test_weight_increases_on_reinforce(self, db):
         rid = db.upsert_relationship("X", "Y", "linked")
         db.upsert_relationship("X", "Y", "linked")
-        row = db._conn.execute(
+        row = db._test_conn.execute(
             "SELECT weight FROM relationships WHERE id=?", (rid,)
         ).fetchone()
         assert row[0] >= 2.0
@@ -304,26 +310,26 @@ class TestGetMemoryById:
 class TestTransactionMethods:
     def test_begin_commit(self, db):
         db.begin_transaction()
-        db._conn.execute(
+        db._test_conn.execute(
             "INSERT INTO memories(content, tags, directory_context, "
             "created_at, last_accessed, heat) VALUES (?,?,?,?,?,?)",
             ("tx mem", "[]", "/p", "2026-01-01", "2026-01-01", 1.0),
         )
         db.commit()
-        rows = db._conn.execute(
+        rows = db._test_conn.execute(
             "SELECT * FROM memories WHERE content='tx mem'"
         ).fetchall()
         assert len(rows) == 1
 
     def test_begin_rollback(self, db):
         db.begin_transaction()
-        db._conn.execute(
+        db._test_conn.execute(
             "INSERT INTO memories(content, tags, directory_context, "
             "created_at, last_accessed, heat) VALUES (?,?,?,?,?,?)",
             ("rollback mem", "[]", "/p", "2026-01-01", "2026-01-01", 1.0),
         )
         db.rollback()
-        rows = db._conn.execute(
+        rows = db._test_conn.execute(
             "SELECT * FROM memories WHERE content='rollback mem'"
         ).fetchall()
         assert len(rows) == 0
@@ -413,8 +419,8 @@ class TestGetOrphanedEntities:
 
     def test_excludes_archived(self, db):
         eid = _insert_entity(db, "Archived")
-        db._conn.execute("UPDATE entities SET archived=1 WHERE id=?", (eid,))
-        db._conn.commit()
+        db._test_conn.execute("UPDATE entities SET archived=1 WHERE id=?", (eid,))
+        db._test_conn.commit()
         orphans = db.get_orphaned_entities()
         assert all(r["id"] != eid for r in orphans)
 
@@ -461,19 +467,19 @@ class TestMarkMemoryArchived:
 
 class TestGetEpisodesForMemory:
     def test_returns_sourcing_episode(self, db):
-        ep_id = db._conn.execute(
+        ep_id = db._test_conn.execute(
             "INSERT INTO episodes(session_id, timestamp, directory, raw_content) "
             "VALUES (?,?,?,?)",
             ("sess1", "2026-01-01", "/proj", "raw content"),
         ).lastrowid
-        db._conn.commit()
-        mid = db._conn.execute(
+        db._test_conn.commit()
+        mid = db._test_conn.execute(
             "INSERT INTO memories(content, tags, directory_context, "
             "created_at, last_accessed, heat, source_episode_id) "
             "VALUES (?,?,?,?,?,?,?)",
             ("sourced", "[]", "/proj", "2026-01-01", "2026-01-01", 1.0, ep_id),
         ).lastrowid
-        db._conn.commit()
+        db._test_conn.commit()
         eps = db.get_episodes_for_memory(mid)
         assert len(eps) == 1
         assert eps[0]["id"] == ep_id
@@ -486,17 +492,17 @@ class TestGetEpisodesForMemory:
 class TestUpsertCrdtEntry:
     def test_inserts_entry(self, db):
         db.upsert_crdt_entry(1, "agent-1", "upsert", '{"agent-1": 1}', "2026-01-01T00:00:00")
-        rows = db._conn.execute("SELECT * FROM crdt_entries").fetchall()
+        rows = db._test_conn.execute("SELECT * FROM crdt_entries").fetchall()
         assert len(rows) == 1
 
     def test_creates_table_lazily(self, db):
         # Table should not exist yet
-        tables = db._conn.execute(
+        tables = db._test_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='crdt_entries'"
         ).fetchall()
         assert len(tables) == 0
         db.upsert_crdt_entry(1, "agent-1", "upsert", "{}", "2026-01-01T00:00:00")
-        tables = db._conn.execute(
+        tables = db._test_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='crdt_entries'"
         ).fetchall()
         assert len(tables) == 1
@@ -504,5 +510,5 @@ class TestUpsertCrdtEntry:
     def test_multiple_entries(self, db):
         for i in range(5):
             db.upsert_crdt_entry(i, f"agent-{i}", "upsert", "{}", "2026-01-01")
-        count = db._conn.execute("SELECT COUNT(*) FROM crdt_entries").fetchone()[0]
+        count = db._test_conn.execute("SELECT COUNT(*) FROM crdt_entries").fetchone()[0]
         assert count == 5

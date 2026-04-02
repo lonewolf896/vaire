@@ -577,6 +577,57 @@ class TestStructuralNovelty:
         assert novelty >= 0.2  # At minimum
 
 
+class TestDedupCheck:
+    def test_exact_duplicate_is_suppressed(self, gate, storage, embeddings):
+        """Exact same content within dedup window is caught."""
+        content = "Elasticsearch returned 401 Unauthorized for defender check"
+        _make_memory(storage, embeddings, content, directory="/tmp/turgon")
+
+        is_dup, sim = gate.is_duplicate(content, "/tmp/turgon", ["defender"])
+        assert is_dup is True
+        assert sim >= 0.85
+
+    def test_novel_content_not_duplicate(self, gate, storage, embeddings):
+        """Different content should not be flagged as duplicate."""
+        _make_memory(
+            storage, embeddings,
+            "Elasticsearch returned 401 Unauthorized",
+            directory="/tmp/turgon",
+        )
+
+        is_dup, sim = gate.is_duplicate(
+            "Wazuh agent deployed to halcyon with active response enabled",
+            "/tmp/turgon",
+            ["builder"],
+        )
+        assert is_dup is False
+
+    def test_anchor_tag_bypasses_dedup(self, gate, storage, embeddings):
+        """Anchored content bypasses dedup check."""
+        content = "Critical: socket auth must be implemented before prod"
+        _make_memory(storage, embeddings, content, directory="/tmp/vaire")
+
+        is_dup, _ = gate.is_duplicate(content, "/tmp/vaire", ["_anchor"])
+        assert is_dup is False
+
+    def test_different_directory_not_duplicate(self, gate, storage, embeddings):
+        """Same content in a different directory is NOT a duplicate."""
+        content = "Build failed due to missing dependency"
+        _make_memory(storage, embeddings, content, directory="/tmp/project-a")
+
+        is_dup, _ = gate.is_duplicate(content, "/tmp/project-b", ["test"])
+        assert is_dup is False
+
+    def test_dedup_suppression_counter(self, gate, storage, embeddings):
+        """Suppression counter increments on duplicate detection."""
+        content = "KEV check found 0 new vulnerabilities"
+        _make_memory(storage, embeddings, content, directory="/tmp/turgon")
+
+        initial = gate._dedup_suppression_count
+        gate.is_duplicate(content, "/tmp/turgon", ["defender"])
+        assert gate._dedup_suppression_count == initial + 1
+
+
 class TestEmbeddingNovelty:
     def test_no_vectors_high_novelty(self, gate):
         """No existing vectors should yield high embedding novelty."""

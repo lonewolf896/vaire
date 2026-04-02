@@ -238,12 +238,12 @@ class TestDrillDown:
                 "directory_context": "/proj",
                 "heat": 0.8,
             })
-            storage._conn.execute(
+            storage._test_conn.execute(
                 "UPDATE memories SET cluster_id = ? WHERE id = ?",
                 (cluster_id, mid),
             )
             mem_ids.append(mid)
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         results = fractal.drill_down(cluster_id)
 
@@ -284,11 +284,11 @@ class TestRollUp:
             "directory_context": "/proj",
             "heat": 0.9,
         })
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET cluster_id = ? WHERE id = ?",
             (child_id, mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         result = fractal.roll_up(mid)
 

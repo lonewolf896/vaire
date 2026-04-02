@@ -60,35 +60,35 @@ def _insert_memory(engine: StorageEngine, content: str, project_dir: str = "/pro
     """Insert a memory row directly and return its id."""
     emb_blob = _make_embedding(embedding_values) if embedding_values else None
     now = "2026-01-01T00:00:00"
-    cur = engine._conn.execute(
+    cur = engine._test_conn.execute(
         "INSERT INTO memories(content, embedding, tags, directory_context, "
         "created_at, last_accessed, heat, is_stale) VALUES (?,?,?,?,?,?,?,?)",
         (content, emb_blob, "[]", project_dir, now, now, heat, is_stale),
     )
-    engine._conn.commit()
+    engine._test_conn.commit()
     return cur.lastrowid
 
 
 def _insert_entity(engine: StorageEngine, name: str, entity_type: str = "concept") -> int:
     now = "2026-01-01T00:00:00"
-    cur = engine._conn.execute(
+    cur = engine._test_conn.execute(
         "INSERT INTO entities(name, type, created_at, last_accessed, heat) "
         "VALUES (?,?,?,?,?)",
         (name, entity_type, now, now, 1.0),
     )
-    engine._conn.commit()
+    engine._test_conn.commit()
     return cur.lastrowid
 
 
 def _insert_rule(engine: StorageEngine, rule_type: str = "protect",
                  priority: int = 0, is_active: int = 1) -> int:
     now = "2026-01-01T00:00:00"
-    cur = engine._conn.execute(
+    cur = engine._test_conn.execute(
         "INSERT INTO memory_rules(rule_type, scope, scope_value, condition, "
         "action, priority, created_at, is_active) VALUES (?,?,?,?,?,?,?,?)",
         (rule_type, "global", None, "always", "protect", priority, now, is_active),
     )
-    engine._conn.commit()
+    engine._test_conn.commit()
     return cur.lastrowid
 
 

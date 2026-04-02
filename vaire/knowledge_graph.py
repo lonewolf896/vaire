@@ -155,18 +155,7 @@ class KnowledgeGraph:
             return []
         eid = entity["id"]
         event_iso = event_time.isoformat()
-        rows = self._storage._conn.execute(
-            "SELECT r.*, "
-            "  e1.name AS source_name, e2.name AS target_name "
-            "FROM relationships r "
-            "JOIN entities e1 ON e1.id = r.source_entity_id "
-            "JOIN entities e2 ON e2.id = r.target_entity_id "
-            "WHERE (r.source_entity_id = ? OR r.target_entity_id = ?) "
-            "  AND r.event_time <= ? "
-            "ORDER BY r.event_time DESC",
-            (eid, eid, event_iso),
-        ).fetchall()
-        return self._storage._rows_to_dicts(rows)
+        return self._storage.get_relationships_at_time(eid, event_iso)
 
     def get_relationship_history(
         self, source: str, target: str
@@ -176,18 +165,7 @@ class KnowledgeGraph:
         if not source_entity or not target_entity:
             return []
         sid, tid = source_entity["id"], target_entity["id"]
-        rows = self._storage._conn.execute(
-            "SELECT r.*, "
-            "  e1.name AS source_name, e2.name AS target_name "
-            "FROM relationships r "
-            "JOIN entities e1 ON e1.id = r.source_entity_id "
-            "JOIN entities e2 ON e2.id = r.target_entity_id "
-            "WHERE (r.source_entity_id = ? AND r.target_entity_id = ?) "
-            "   OR (r.source_entity_id = ? AND r.target_entity_id = ?) "
-            "ORDER BY r.created_at ASC",
-            (sid, tid, tid, sid),
-        ).fetchall()
-        return self._storage._rows_to_dicts(rows)
+        return self._storage.get_relationship_history(sid, tid)
 
     # -- c. Causal Edge Detection --
 
@@ -203,12 +181,9 @@ class KnowledgeGraph:
             if not e.get("name", "").startswith("memory:")
         }
 
-        co_rels = self._storage._conn.execute(
-            "SELECT * FROM relationships WHERE relationship_type = 'co_occurrence' "
-            "AND weight >= ?",
-            (threshold,),
-        ).fetchall()
-        co_rels = self._storage._rows_to_dicts(co_rels)
+        co_rels = self._storage.get_relationships_by_weight(
+            min_weight=threshold, relationship_type="co_occurrence"
+        )
 
         for rel in co_rels:
             sid, tid = rel["source_entity_id"], rel["target_entity_id"]
@@ -403,11 +378,8 @@ class KnowledgeGraph:
             for neighbor in neighbors:
                 nid = neighbor["entity_id"]
                 if nid not in nodes:
-                    nent = self._storage._conn.execute(
-                        "SELECT * FROM entities WHERE id = ?", (nid,)
-                    ).fetchone()
+                    nent = self._storage.get_entity_by_id(nid)
                     if nent:
-                        nent = self._storage._row_to_dict(nent)
                         nodes[nid] = {
                             "id": nid,
                             "name": nent["name"],
@@ -442,21 +414,13 @@ class KnowledgeGraph:
         if existing:
             return existing
         eid = self._storage.insert_entity({"name": name, "type": "variable"})
-        row = self._storage._conn.execute(
-            "SELECT * FROM entities WHERE id = ?", (eid,)
-        ).fetchone()
-        return self._storage._row_to_dict(row) if row else {"id": eid, "name": name}
+        entity = self._storage.get_entity_by_id(eid)
+        return entity if entity else {"id": eid, "name": name}
 
     def _get_typed_relationship(
         self, source_id: int, target_id: int, rel_type: str
     ) -> dict | None:
-        row = self._storage._conn.execute(
-            "SELECT * FROM relationships "
-            "WHERE source_entity_id = ? AND target_entity_id = ? "
-            "AND relationship_type = ?",
-            (source_id, target_id, rel_type),
-        ).fetchone()
-        return self._storage._row_to_dict(row)
+        return self._storage.get_typed_relationship(source_id, target_id, rel_type)
 
     def _get_typed_relationship_by_name(
         self, source_name: str, target_name: str, rel_type: str
@@ -499,30 +463,12 @@ class KnowledgeGraph:
     def _get_adjacent(
         self, entity_id: int, rel_types: list[str] | None
     ) -> list[dict]:
-        if rel_types:
-            placeholders = ",".join("?" for _ in rel_types)
-            rows = self._storage._conn.execute(
-                f"SELECT r.*, e1.name AS source_name, e2.name AS target_name "
-                f"FROM relationships r "
-                f"JOIN entities e1 ON e1.id = r.source_entity_id "
-                f"JOIN entities e2 ON e2.id = r.target_entity_id "
-                f"WHERE (r.source_entity_id = ? OR r.target_entity_id = ?) "
-                f"AND r.relationship_type IN ({placeholders})",
-                (entity_id, entity_id, *rel_types),
-            ).fetchall()
-        else:
-            rows = self._storage._conn.execute(
-                "SELECT r.*, e1.name AS source_name, e2.name AS target_name "
-                "FROM relationships r "
-                "JOIN entities e1 ON e1.id = r.source_entity_id "
-                "JOIN entities e2 ON e2.id = r.target_entity_id "
-                "WHERE r.source_entity_id = ? OR r.target_entity_id = ?",
-                (entity_id, entity_id),
-            ).fetchall()
+        rows = self._storage.get_adjacent_relationships(
+            entity_id, relationship_types=rel_types
+        )
 
         result = []
-        for row in rows:
-            row_d = self._storage._row_to_dict(row)
+        for row_d in rows:
             other_id = (
                 row_d["target_entity_id"]
                 if row_d["source_entity_id"] == entity_id
@@ -553,10 +499,9 @@ class KnowledgeGraph:
         b_before_a = 0
 
         # Search episodes (live session content)
-        episodes = self._storage._conn.execute(
-            "SELECT raw_content FROM episodes ORDER BY timestamp ASC"
-        ).fetchall()
-        for (content,) in episodes:
+        episodes = self._storage.get_all_episode_contents()
+        for ep in episodes:
+            content = ep["raw_content"]
             pos_a = content.find(entity_a)
             pos_b = content.find(entity_b)
             if pos_a >= 0 and pos_b >= 0:
@@ -566,11 +511,10 @@ class KnowledgeGraph:
                     b_before_a += 1
 
         # Also search memory content (covers bulk-ingested memories)
-        memories = self._storage._conn.execute(
-            "SELECT content FROM memories "
-            "WHERE heat > 0 ORDER BY created_at ASC"
-        ).fetchall()
-        for (content,) in memories:
+        memories = self._storage.get_hot_memories_all()
+        memories.sort(key=lambda m: m.get("created_at", ""))
+        for mem in memories:
+            content = mem.get("content")
             if content is None:
                 continue
             pos_a = content.find(entity_a)

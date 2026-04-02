@@ -50,13 +50,13 @@ def _make_memory(content="test memory", directory="/tmp/project", **kwargs):
 class TestSqliteVecLoaded:
     def test_extension_loaded(self, storage):
         """Verify the sqlite-vec extension is loaded and functional."""
-        version = storage._conn.execute("SELECT vec_version()").fetchone()[0]
+        version = storage._test_conn.execute("SELECT vec_version()").fetchone()[0]
         assert version is not None
         assert version.startswith("v")
 
     def test_memory_vectors_table_exists(self, storage):
         """The memory_vectors virtual table should exist."""
-        tables = storage._conn.execute(
+        tables = storage._test_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_vectors'"
         ).fetchall()
         assert len(tables) == 1
@@ -263,8 +263,9 @@ class TestEmbeddingEngineDimensions:
 
 class TestQuantization:
     def test_quantize_dequantize_roundtrip(self):
-        """Quantize then dequantize should produce approximate original."""
+        """Quantize then dequantize should produce approximate original (L2-normalized)."""
         original = np.random.randn(384).astype(np.float32)
+        original = original / np.linalg.norm(original)  # L2 normalize — TurboQuant assumes unit vectors
         original_bytes = original.tobytes()
 
         quantized = EmbeddingEngine.quantize(original_bytes, bits=8)
@@ -275,7 +276,7 @@ class TestQuantization:
 
         # Should be close but not exact due to quantization loss
         assert len(result) == 384
-        # Correlation should be high (>0.95)
+        # Correlation should be high (>0.95) for L2-normalized vectors
         corr = np.corrcoef(original, result)[0, 1]
         assert corr > 0.95
 
@@ -293,3 +294,73 @@ class TestQuantization:
             EmbeddingEngine.quantize(emb, bits=16)
         with pytest.raises(ValueError):
             EmbeddingEngine.dequantize(emb, bits=16)
+
+    def test_turbo_quant_unit_vector_roundtrip(self):
+        """TurboQuant on L2-normalized vectors should preserve ranking."""
+        rng = np.random.RandomState(42)
+        vecs = []
+        for _ in range(10):
+            v = rng.randn(384).astype(np.float32)
+            v = v / np.linalg.norm(v)  # L2 normalize
+            vecs.append(v)
+
+        query = vecs[0]
+        # Compute float32 distances
+        f32_dists = [np.linalg.norm(query - v) for v in vecs[1:]]
+        f32_order = np.argsort(f32_dists)
+
+        # Compute int8 distances (via dequantize)
+        q_query = np.frombuffer(
+            EmbeddingEngine.dequantize_int8(EmbeddingEngine.quantize_int8(query.tobytes())),
+            dtype=np.float32
+        )
+        q_vecs = [
+            np.frombuffer(
+                EmbeddingEngine.dequantize_int8(EmbeddingEngine.quantize_int8(v.tobytes())),
+                dtype=np.float32
+            )
+            for v in vecs[1:]
+        ]
+        int8_dists = [np.linalg.norm(q_query - v) for v in q_vecs]
+        int8_order = np.argsort(int8_dists)
+
+        # Top-5 overlap should be >= 80% (4 out of 5)
+        top5_overlap = len(set(f32_order[:5]) & set(int8_order[:5]))
+        assert top5_overlap >= 4, f"Only {top5_overlap}/5 overlap in top-5 ranking"
+
+
+class TestInt8VecTable:
+    def test_int8_table_exists(self, storage):
+        """memory_vectors_int8 table should exist."""
+        tables = storage._test_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_vectors_int8'"
+        ).fetchall()
+        assert len(tables) == 1
+
+    def test_insert_memory_populates_int8(self, storage):
+        """Inserting a memory should also populate the int8 vec table."""
+        emb = _make_embedding(seed=500)
+        mid = storage.insert_memory(
+            _make_memory(content="int8 test", embedding=emb)
+        )
+        # Check int8 table has an entry
+        row = storage._test_conn.execute(
+            "SELECT rowid FROM memory_vectors_int8 WHERE rowid = ?", (mid,)
+        ).fetchone()
+        assert row is not None
+
+    def test_int8_search_finds_similar(self, storage):
+        """Int8 vector search should return correct results."""
+        ref = np.ones(384, dtype=np.float32)
+        ref = ref / np.linalg.norm(ref)
+        ref_bytes = ref.tobytes()
+
+        mid = storage.insert_memory(
+            _make_memory(content="int8 search test", embedding=ref_bytes)
+        )
+
+        # Search with int8 quantized query
+        query_int8 = EmbeddingEngine.quantize_int8(ref_bytes)
+        results = storage.search_vectors_int8(query_int8, top_k=1)
+        assert len(results) >= 1
+        assert results[0][0] == mid

@@ -494,7 +494,7 @@ class TestHDCRetrievalIntegration:
             directory="/proj", tags=["bug", "auth"],
         )
         hdc_vec1 = hdc.encode_memory("/proj", ["bug", "auth"], ["auth.py", "login"])
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET hdc_vector = ? WHERE id = ?",
             (hdc.to_bytes(hdc_vec1), mid1),
         )
@@ -505,11 +505,11 @@ class TestHDCRetrievalIntegration:
             directory="/proj", tags=["database", "migration"],
         )
         hdc_vec2 = hdc.encode_memory("/proj", ["database", "migration"], ["models.py", "schema"])
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET hdc_vector = ? WHERE id = ?",
             (hdc.to_bytes(hdc_vec2), mid2),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         # Recall should work and include results
         results = retriever.recall("auth.py login bug", max_results=5)
@@ -552,14 +552,14 @@ class TestHDCRetrievalIntegration:
         })
 
         # Store HDC vector
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET hdc_vector = ? WHERE id = ?",
             (blob, mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         # Read it back
-        row = storage._conn.execute(
+        row = storage._test_conn.execute(
             "SELECT hdc_vector FROM memories WHERE id = ?", (mid,)
         ).fetchone()
         assert row[0] is not None

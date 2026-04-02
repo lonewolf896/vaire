@@ -108,8 +108,9 @@ class TestBatching:
         queue._execute_batch(ops)
 
         # BEGIN executed exactly once for all 3 ops.
+        conn_mock = mock_storage.get_write_connection()
         begin_calls = [
-            c for c in mock_storage._conn.execute.call_args_list
+            c for c in conn_mock.execute.call_args_list
             if c.args and c.args[0] == "BEGIN"
         ]
         assert len(begin_calls) == 1

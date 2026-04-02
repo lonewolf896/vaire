@@ -192,14 +192,15 @@ class WriteQueue:
         with self._storage._write_lock:
             try:
                 self._storage._in_batch = True
-                self._storage._conn.execute("BEGIN")
+                conn = self._storage.get_write_connection()
+                conn.execute("BEGIN")
                 for op in batch:
                     result = getattr(self._storage, op.method)(**op.kwargs)
                     results.append((op, result))
-                self._storage._conn.commit()
+                conn.commit()
             except Exception as exc:
                 try:
-                    self._storage._conn.rollback()
+                    conn.rollback()
                 except Exception:
                     pass
                 self._storage._in_batch = False

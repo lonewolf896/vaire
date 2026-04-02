@@ -82,10 +82,12 @@ class VaireClient:
         socket_path: str,
         agent_id: str | None = None,
         call_timeout: float = _DEFAULT_CALL_TIMEOUT,
+        auth_token: str | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._agent_id = agent_id or generate_agent_id()
         self._call_timeout = call_timeout
+        self._auth_token = auth_token
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -174,12 +176,14 @@ class VaireClient:
         await self._ensure_connected()
 
         request_id = secrets.token_hex(8)
-        payload = {
+        payload: dict[str, Any] = {
             "id": request_id,
             "method": method,
             "agent_id": self._agent_id,
             "params": params,
         }
+        if self._auth_token:
+            payload["auth_token"] = self._auth_token
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -278,14 +282,50 @@ def _get_client_lock() -> asyncio.Lock:
     return _client_lock
 
 
+def _load_auth_token(settings) -> str | None:
+    """Load the first available auth token from the tokens directory.
+
+    Returns the token secret string, or None if auth is disabled or no
+    token files exist.
+    """
+    if not settings.SOCKET_AUTH_ENABLED:
+        return None
+
+    tokens_dir = settings.socket_auth_tokens_dir_resolved
+    if not tokens_dir.is_dir():
+        return None
+
+    # Look for a token file matching this host, then fall back to any token
+    hostname = socket.gethostname() or "unknown"
+    host_token = tokens_dir / f"{hostname}.token"
+    if host_token.is_file():
+        try:
+            return host_token.read_text().strip()
+        except OSError:
+            pass
+
+    # Fall back to first available token
+    for path in sorted(tokens_dir.glob("*.token")):
+        try:
+            secret = path.read_text().strip()
+            if secret:
+                return secret
+        except OSError:
+            continue
+
+    return None
+
+
 def _build_client() -> VaireClient:
     from .config import get_settings
 
     settings = get_settings()
+    auth_token = _load_auth_token(settings)
     return VaireClient(
         socket_path=str(settings.socket_path_resolved),
         agent_id=generate_agent_id(),
         call_timeout=float(settings.CALL_TIMEOUT_SECONDS),
+        auth_token=auth_token,
     )
 
 
@@ -328,12 +368,16 @@ async def remember(
     content: str,
     context: str,
     tags: list[str] | None = None,
+    force: bool = False,
 ) -> dict:
-    """Store a memory in Vaire."""
-    return await _client_call(
-        "remember",
-        {"content": content, "context": context, "tags": tags or []},
-    )
+    """Store a memory in Vaire.
+
+    force: bypass the write gate and store regardless of surprisal score.
+    """
+    params: dict = {"content": content, "context": context, "tags": tags or []}
+    if force:
+        params["force"] = True
+    return await _client_call("remember", params)
 
 
 @mcp.tool()
@@ -341,12 +385,26 @@ async def recall(
     query: str,
     context: str | None = None,
     max_results: int = 10,
+    min_heat: float = 0.1,
+    max_tokens: int | None = None,
+    compact: bool = False,
+    fast: bool = True,
 ) -> dict:
-    """Retrieve memories matching a query."""
-    return await _client_call(
-        "recall",
-        {"query": query, "context": context, "max_results": max_results},
-    )
+    """Retrieve memories matching a query.
+
+    fast: if True (default), skip cross-encoder for ~130ms response.
+          if False, run full deep reranking for highest quality (~6s).
+    """
+    params: dict = {
+        "query": query, "context": context,
+        "max_results": max_results, "min_heat": min_heat,
+        "fast": fast,
+    }
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    if compact:
+        params["compact"] = True
+    return await _client_call("recall", params)
 
 
 @mcp.tool()
@@ -356,11 +414,14 @@ async def forget(memory_id: int) -> dict:
 
 
 @mcp.tool()
-async def get_project_context(directory: str) -> dict:
+async def get_project_context(directory: str, max_tokens: int | None = None, compact: bool = False) -> dict:
     """Return all hot memories for a directory."""
-    return await _client_call(
-        "get_project_context", {"directory": directory}
-    )
+    params: dict = {"directory": directory}
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    if compact:
+        params["compact"] = True
+    return await _client_call("get_project_context", params)
 
 
 @mcp.tool()
@@ -376,11 +437,12 @@ async def consolidate_now() -> dict:
 
 
 @mcp.tool()
-async def rate_memory(memory_id: int, rating: float) -> dict:
+async def rate_memory(memory_id: int, rating: float = 1.0, was_useful: bool | None = None) -> dict:
     """Rate a memory's usefulness."""
-    return await _client_call(
-        "rate_memory", {"memory_id": memory_id, "rating": rating}
-    )
+    params: dict = {"memory_id": memory_id, "rating": rating}
+    if was_useful is not None:
+        params["was_useful"] = was_useful
+    return await _client_call("rate_memory", params)
 
 
 @mcp.tool()
@@ -394,12 +456,16 @@ async def recall_hierarchical(
     query: str,
     level: int | None = None,
     max_results: int = 10,
+    max_tokens: int | None = None,
+    compact: bool = False,
 ) -> list:
     """Retrieve memories from the fractal hierarchy."""
-    return await _client_call(
-        "recall_hierarchical",
-        {"query": query, "level": level, "max_results": max_results},
-    )
+    params: dict = {"query": query, "level": level, "max_results": max_results}
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    if compact:
+        params["compact"] = True
+    return await _client_call("recall_hierarchical", params)
 
 
 @mcp.tool()
@@ -621,10 +687,25 @@ def _build_groomer_client() -> VaireClient:
             groomer_agent_id = ids[0]
     if not groomer_agent_id:
         groomer_agent_id = f"groomer-{_SESSION_TOKEN[:8]}"
+
+    # Load auth token — prefer a token matching the groomer agent_id
+    auth_token = None
+    if settings.SOCKET_AUTH_ENABLED:
+        tokens_dir = settings.socket_auth_tokens_dir_resolved
+        groomer_token_path = tokens_dir / f"{groomer_agent_id}.token"
+        if groomer_token_path.is_file():
+            try:
+                auth_token = groomer_token_path.read_text().strip()
+            except OSError:
+                pass
+        if not auth_token:
+            auth_token = _load_auth_token(settings)
+
     return VaireClient(
         socket_path=str(settings.socket_path_resolved),
         agent_id=groomer_agent_id,
         call_timeout=float(settings.CALL_TIMEOUT_SECONDS),
+        auth_token=auth_token,
     )
 
 
@@ -950,6 +1031,18 @@ async def groom_bulk_update_content(
     return await _groomer_call(
         "groom_bulk_update_content",
         {"memory_ids": memory_ids, "find": find, "replace": replace},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_sanitize_archives(dry_run: bool = True) -> dict:
+    """Scan all archive entries for credential patterns and redact them.
+
+    Args:
+        dry_run: If True (default), only reports matches without modifying anything.
+    """
+    return await _groomer_call(
+        "groom_sanitize_archives", {"dry_run": dry_run},
     )
 
 

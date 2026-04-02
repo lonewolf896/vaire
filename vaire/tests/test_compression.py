@@ -80,7 +80,8 @@ def _make_memory(storage, content="test memory", hours_old=0, **kwargs):
     # Set additional fields that insert_memory doesn't handle
     extra_fields = {}
     for field in ("importance", "surprise_score", "confidence", "access_count",
-                  "store_type", "is_protected", "compression_level", "original_content"):
+                  "store_type", "is_protected", "compression_level", "original_content",
+                  "content_fidelity"):
         if field in kwargs:
             extra_fields[field] = kwargs[field]
 
@@ -94,11 +95,11 @@ def _make_memory(storage, content="test memory", hours_old=0, **kwargs):
             else:
                 values.append(v)
         values.append(mid)
-        storage._conn.execute(
+        storage._test_conn.execute(
             f"UPDATE memories SET {', '.join(set_parts)} WHERE id = ?",
             values,
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
     return mid
 
@@ -160,11 +161,18 @@ class TestCompressionSchedule:
         mem = storage.get_memory(mid)
         assert compressor.get_compression_schedule(mem) == 0
 
-    def test_protected_never_compresses(self, compressor, storage):
-        """Protected memory should always return level 0."""
-        mid = _make_memory(storage, hours_old=2000, is_protected=True)
+    def test_full_fidelity_never_compresses(self, compressor, storage):
+        """Full-fidelity memory should always return level 0."""
+        mid = _make_memory(storage, hours_old=2000, content_fidelity="full")
         mem = storage.get_memory(mid)
         assert compressor.get_compression_schedule(mem) == 0
+
+    def test_protected_auto_fidelity_can_compress(self, compressor, storage):
+        """Protected memory with auto fidelity CAN compress (decoupled)."""
+        mid = _make_memory(storage, hours_old=2000, is_protected=True, content_fidelity="auto")
+        mem = storage.get_memory(mid)
+        # Protected + auto = compressible (fidelity controls compression, not protection)
+        assert compressor.get_compression_schedule(mem) > 0
 
     def test_semantic_never_compresses(self, compressor, storage):
         """Semantic store memories should always return level 0."""

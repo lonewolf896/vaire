@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .crdt_sync import CRDTMemorySync
+    from .token_manager import TokenManager
 
 from .protocol import (
     ProtocolError,
@@ -39,7 +40,7 @@ GROOMER_METHODS: frozenset[str] = frozenset({
     "groom_forget", "groom_search", "groom_bulk_retag",
     "groom_content_scan", "groom_provenance", "groom_bulk_update_content",
     "groom_update_content", "groom_promote", "groom_demote", "groom_bulk_delete",
-    "groom_auto", "groom_sanitize",
+    "groom_auto", "groom_sanitize", "groom_sanitize_archives",
 })
 
 
@@ -53,6 +54,7 @@ class ConnectionState:
     role: str = "agent"        # "agent" or "groomer"
     request_count: int = 0
     is_remote: bool = False    # True for HTTPS connections
+    authenticated: bool = False  # True after successful token auth
 
     # ── Token bucket rate limiter (R2) ──
     _rate_tokens: float = 20.0
@@ -93,6 +95,8 @@ class VaireSocketServer:
         approved_groomers: frozenset[str] | None = None,
         rate_limit_per_minute: int = 120,
         rate_limit_burst: int = 20,
+        token_manager: TokenManager | None = None,
+        auth_enabled: bool = True,
     ) -> None:
         self._socket_path = socket_path
         self._pid_file = pid_file
@@ -104,6 +108,11 @@ class VaireSocketServer:
         self._approved_groomers: frozenset[str] = approved_groomers or frozenset()
         self._rate_limit_per_minute = rate_limit_per_minute
         self._rate_limit_burst = rate_limit_burst
+        self._token_manager = token_manager
+        self._auth_enabled = auth_enabled
+
+        # Track whether we've warned about missing tokens (log once, not per connection)
+        self._warned_no_tokens = False
 
         self._server: asyncio.Server | None = None
         # Fix #5 — every client task is tracked here; stop() cancels them all.
@@ -229,8 +238,28 @@ class VaireSocketServer:
                         break
                     continue
 
-                # Latch agent identity on the first valid request.
-                if not state.agent_id:
+                # ── Socket auth: validate token on first request ──────────
+                if not state.authenticated:
+                    auth_result = self._authenticate(msg)
+                    if auth_result is None:
+                        # Auth failed — reject and close connection
+                        err = make_error_response(
+                            request_id,
+                            "Authentication failed: invalid or missing token",
+                            code="AUTH_FAILED",
+                        )
+                        try:
+                            await write_message(writer, err)
+                        except (OSError, ConnectionResetError):
+                            pass
+                        break  # close connection on auth failure
+
+                    state.authenticated = True
+                    state.agent_id = auth_result
+                    state.role = self._resolve_role(state.agent_id)
+                elif not state.agent_id:
+                    # Fallback: latch agent identity on first valid request
+                    # (only reached when auth is disabled)
                     state.agent_id = msg["agent_id"]
                     state.role = self._resolve_role(state.agent_id)
 
@@ -261,6 +290,63 @@ class VaireSocketServer:
                 await writer.wait_closed()
             except Exception:
                 pass  # Connection may already be dead; nothing more we can do.
+
+    # ── Authentication ────────────────────────────────────────────────────────
+
+    def _authenticate(self, msg: dict[str, Any]) -> str | None:
+        """Validate the auth_token in *msg* and return the verified agent_name.
+
+        Returns:
+            The agent_name (from the token file) if auth succeeds.
+            None if auth fails (invalid token, missing token when required).
+
+        When auth is disabled or no tokens exist yet (migration path),
+        falls back to accepting the self-reported agent_id.
+        """
+        # Auth disabled entirely — accept the self-reported agent_id
+        if not self._auth_enabled:
+            return msg.get("agent_id", "")
+
+        # Auth enabled but no token manager configured — accept (defensive)
+        if self._token_manager is None:
+            return msg.get("agent_id", "")
+
+        # Auth enabled but no tokens exist yet — migration grace period
+        if not self._token_manager.has_tokens():
+            if not self._warned_no_tokens:
+                logger.warning(
+                    "Socket auth is enabled but no tokens exist in %s. "
+                    "Allowing unauthenticated connections until tokens are created. "
+                    "Run 'python -m vaire token create <agent-name>' to create one.",
+                    self._token_manager.tokens_dir,
+                )
+                self._warned_no_tokens = True
+            return msg.get("agent_id", "")
+
+        # Token required — extract and validate
+        auth_token = msg.get("auth_token", "")
+        if not auth_token:
+            logger.warning(
+                "Auth failed: no auth_token in request from self-reported "
+                "agent_id=%r",
+                msg.get("agent_id", "<missing>"),
+            )
+            return None
+
+        agent_name = self._token_manager.validate(auth_token)
+        if agent_name is None:
+            logger.warning(
+                "Auth failed: invalid token from self-reported agent_id=%r",
+                msg.get("agent_id", "<missing>"),
+            )
+            return None
+
+        logger.info(
+            "Auth success: agent_name=%r (self-reported=%r)",
+            agent_name,
+            msg.get("agent_id", "<missing>"),
+        )
+        return agent_name
 
     # ── Dispatch ───────────────────────────────────────────────────────────────
 

@@ -199,6 +199,7 @@ def cmd_server(args):
     )
     import vaire.server as _server_mod
     from vaire.socket_server import VaireSocketServer
+    from vaire.token_manager import TokenManager
 
     settings = get_settings()
 
@@ -224,6 +225,11 @@ def cmd_server(args):
         # Load approved groomers from ini file (not in code — runtime config)
         approved = _load_approved_groomers(settings)
 
+        # Initialise token manager for socket authentication
+        token_manager = TokenManager(
+            str(settings.socket_auth_tokens_dir_resolved)
+        )
+
         server = VaireSocketServer(
             socket_path=str(settings.socket_path_resolved),
             pid_file=str(settings.pid_file_resolved),
@@ -233,6 +239,8 @@ def cmd_server(args):
             approved_groomers=approved,
             rate_limit_per_minute=settings.RATE_LIMIT_PER_MINUTE,
             rate_limit_burst=settings.RATE_LIMIT_BURST,
+            token_manager=token_manager,
+            auth_enabled=settings.SOCKET_AUTH_ENABLED,
         )
 
         await server.start()
@@ -302,6 +310,55 @@ def cmd_health(args):
 
     ok = asyncio.run(_check())
     sys.exit(0 if ok else 1)
+
+
+def cmd_token(args):
+    """Manage socket authentication tokens."""
+    from vaire.config import get_settings
+    from vaire.token_manager import TokenManager
+
+    settings = get_settings()
+    tokens_dir = args.tokens_dir or str(settings.socket_auth_tokens_dir_resolved)
+    manager = TokenManager(tokens_dir)
+
+    action = args.token_action
+    if action == "create":
+        agent_name = args.agent_name
+        try:
+            secret = manager.create(agent_name)
+            print(f"Token created for agent: {agent_name}")
+            print(f"Secret: {secret}")
+            print(f"Token file: {manager.tokens_dir / f'{agent_name}.token'}")
+            print()
+            print("The client will auto-detect this token if the tokens")
+            print("directory is the default (~/.vaire/tokens/).")
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    elif action == "revoke":
+        agent_name = args.agent_name
+        if manager.revoke(agent_name):
+            print(f"Token revoked for agent: {agent_name}")
+        else:
+            print(f"No token found for agent: {agent_name}", file=sys.stderr)
+            sys.exit(1)
+
+    elif action == "list":
+        tokens = manager.list_tokens()
+        if not tokens:
+            print("No tokens found.")
+            return
+        print(f"{'Agent Name':<30} {'Created':<25} {'Path'}")
+        print("-" * 90)
+        from datetime import datetime, timezone
+        for t in tokens:
+            created = datetime.fromtimestamp(t.created_at, tz=timezone.utc)
+            print(f"{t.agent_name:<30} {created.isoformat():<25} {t.token_path}")
+
+    else:
+        print(f"Unknown token action: {action}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_context(args):
@@ -408,6 +465,17 @@ def cli():
                                 help="Read tool_name/session_id/tool_input from Claude Code JSON on stdin")
     capture_parser.add_argument("--db-path", type=str, default=None, help="SQLite database path")
 
+    # token subcommand — manage socket auth tokens
+    token_parser = subparsers.add_parser("token", help="Manage socket auth tokens")
+    token_parser.add_argument("--tokens-dir", type=str, default=None,
+                              help="Tokens directory (default: VAIRE_SOCKET_AUTH_TOKENS_DIR)")
+    token_sub = token_parser.add_subparsers(dest="token_action")
+    token_create = token_sub.add_parser("create", help="Create a new agent token")
+    token_create.add_argument("agent_name", help="Agent name (becomes the file stem)")
+    token_revoke = token_sub.add_parser("revoke", help="Revoke an agent token")
+    token_revoke.add_argument("agent_name", help="Agent name to revoke")
+    token_sub.add_parser("list", help="List all agent tokens")
+
     # health subcommand (used by Docker HEALTHCHECK)
     subparsers.add_parser("health", help="Ping the socket server; exits 0 if healthy")
 
@@ -434,6 +502,11 @@ def cli():
         cmd_context(args)
     elif args.command == "health":
         cmd_health(args)
+    elif args.command == "token":
+        if not getattr(args, "token_action", None):
+            print("Usage: python -m vaire token {create|revoke|list}", file=sys.stderr)
+            sys.exit(1)
+        cmd_token(args)
     else:
         # Default: run MCP server
         if not args.quiet and args.transport != "stdio":

@@ -217,11 +217,7 @@ class MetaCognition:
                 directory, min_heat=0.0
             )
         else:
-            dir_memories = self._storage._rows_to_dicts(
-                self._storage._conn.execute(
-                    "SELECT * FROM memories WHERE heat > 0"
-                ).fetchall()
-            )
+            dir_memories = self._storage.get_hot_memories_all()
 
         stale_memories = [m for m in dir_memories if m.get("heat", 1.0) < 0.3]
         if len(stale_memories) >= 2:
@@ -291,31 +287,21 @@ class MetaCognition:
             if len(mem_ids) < 2:
                 continue
             # Check if relationship exists
-            existing = self._storage._conn.execute(
-                "SELECT id FROM relationships "
-                "WHERE (source_entity_id = ? AND target_entity_id = ?) "
-                "OR (source_entity_id = ? AND target_entity_id = ?)",
-                (eid_a, eid_b, eid_b, eid_a),
-            ).fetchone()
-            if existing is None:
-                name_a = self._storage._conn.execute(
-                    "SELECT name FROM entities WHERE id = ?", (eid_a,)
-                ).fetchone()
-                name_b = self._storage._conn.execute(
-                    "SELECT name FROM entities WHERE id = ?", (eid_b,)
-                ).fetchone()
+            if not self._storage.relationship_exists(eid_a, eid_b):
+                name_a = self._storage.get_entity_name(eid_a)
+                name_b = self._storage.get_entity_name(eid_b)
                 if name_a and name_b:
                     gaps.append({
                         "type": "missing_connection",
                         "description": (
-                            f"'{name_a[0]}' and '{name_b[0]}' co-occur in "
+                            f"'{name_a}' and '{name_b}' co-occur in "
                             f"{len(mem_ids)} memories but have no relationship."
                         ),
                         "severity": min(0.7, 0.2 + len(mem_ids) * 0.1),
-                        "entities": [name_a[0], name_b[0]],
+                        "entities": [name_a, name_b],
                         "suggestion": (
-                            f"Add a relationship between '{name_a[0]}' and "
-                            f"'{name_b[0]}' to capture their connection."
+                            f"Add a relationship between '{name_a}' and "
+                            f"'{name_b}' to capture their connection."
                         ),
                     })
 
@@ -331,12 +317,10 @@ class MetaCognition:
 
         # Check for "resolved_by" relationships from error entities
         for err_entity in error_entities:
-            has_resolution = self._storage._conn.execute(
-                "SELECT id FROM relationships "
-                "WHERE source_entity_id = ? AND relationship_type = 'resolved_by'",
-                (err_entity["id"],),
-            ).fetchone()
-            if has_resolution is None:
+            resolutions = self._storage.get_relationships_by_type_for_entity(
+                err_entity["id"], "resolved_by"
+            )
+            if not resolutions:
                 gaps.append({
                     "type": "one_sided_knowledge",
                     "description": (

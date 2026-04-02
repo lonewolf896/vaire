@@ -24,7 +24,7 @@ from vaire.socket_client import VaireClient, VaireError
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
-SOCKET_PATH = Path.home() / ".vaire" / "vaire.sock"
+SOCKET_PATH = Path(os.environ.get("VAIRE_SOCKET_PATH", Path.home() / ".vaire" / "vaire.sock"))
 TEST_DIR = "/tmp/vaire-live-test"
 TEST_TAG = "live-test"
 
@@ -444,6 +444,8 @@ class TestAdvancedRetrieval:
         })
         memories = resp["result"] if "result" in resp else resp
         assert isinstance(memories, list)
+        # Filter out budget metadata entry
+        memories = [m for m in memories if not m.get("_budget_meta")]
         assert len(memories) > 0, "recall returned no results"
         for mem in memories:
             assert "score" in mem or "heat" in mem, (

@@ -14,6 +14,7 @@ from pathlib import Path
 from vaire import __version__
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -106,6 +107,15 @@ mcp_server = FastMCP(
     instructions="Biologically-inspired persistent memory engine for Claude Code.",
     host="127.0.0.1",
     port=settings.PORT,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "127.0.0.1:*", "localhost:*", "[::1]:*",
+            # Allow remote mTLS connections via mesh/LAN IPs
+            "100.64.0.1:*", "10.0.0.15:*",
+        ],
+        allowed_origins=[],
+    ) if settings.tls_enabled else None,
 )
 
 
@@ -325,6 +335,105 @@ def _normalize_for_injection_scan(text: str) -> str:
     return text
 
 
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count using chars/3.5 heuristic."""
+    return int(len(text) / 3.5)
+
+
+# Fields stripped from recall responses to reduce bloat.
+# These are internal/enrichment fields that callers never need.
+_INTERNAL_FIELDS = frozenset({
+    "embedding", "hdc_vector", "implicit_embedding",
+    "enrichment_concepts", "enrichment_comet", "enrichment_queries",
+    "enrichment_logic", "enriched_content", "enrichment_model_versions",
+    "implicit_embedding_model", "original_content",
+    "sr_x", "sr_y", "slot_index", "vector_clock",
+    "compression_level", "reconsolidation_count", "last_reconsolidated",
+    "last_excitability_update", "source_episode_id", "file_hash",
+})
+
+
+def _strip_response_fields(mem: dict) -> dict:
+    """Remove internal fields from a memory dict before returning to caller."""
+    return {k: v for k, v in mem.items() if k not in _INTERNAL_FIELDS}
+
+
+# Minimal fields returned in compact mode — optimized for small-context agents.
+_COMPACT_FIELDS = frozenset({
+    "id", "content", "tags", "directory_context", "created_at",
+    "heat", "confidence", "contextual_prefix", "is_protected",
+    "_retrieval_score", "_cross_encoder_score", "_retrieval_confidence",
+    "_truncated",
+})
+
+
+def _compact_response(mem: dict) -> dict:
+    """Return only essential fields for compact mode."""
+    return {k: v for k, v in mem.items() if k in _COMPACT_FIELDS}
+
+
+def _estimate_mem_tokens(mem: dict) -> int:
+    """Estimate token count for an entire memory dict, not just content.
+
+    Accounts for content + tags + contextual_prefix + key metadata fields
+    that contribute to the serialized response size.
+    """
+    size = len(mem.get("content", ""))
+    tags = mem.get("tags")
+    if tags:
+        size += sum(len(t) for t in tags) + len(tags) * 4  # commas, quotes, brackets
+    prefix = mem.get("contextual_prefix")
+    if prefix:
+        size += len(prefix)
+    # Fixed overhead for other fields (id, dates, scores, etc.) ~200 chars
+    size += 200
+    return int(size / 3.5)
+
+
+def _apply_token_budget(results: list[dict], max_tokens: int) -> list[dict]:
+    """Truncate a list of memory dicts to fit within a token budget.
+
+    Returns the truncated list with a metadata dict appended containing
+    budget_used, budget_limit, and results_truncated counts.
+    """
+    budget_used = 0
+    truncated_count = 0
+    output: list[dict] = []
+
+    for mem in results:
+        tokens = _estimate_mem_tokens(mem)
+
+        if budget_used + tokens <= max_tokens:
+            output.append(mem)
+            budget_used += tokens
+        elif budget_used < max_tokens:
+            # Partially fit: truncate content at sentence boundary
+            content = mem.get("content", "")
+            remaining_chars = int((max_tokens - budget_used) * 3.5)
+            truncated_content = content[:remaining_chars]
+            # Find last sentence boundary
+            for sep in (". ", ".\n", "\n\n", "\n"):
+                last = truncated_content.rfind(sep)
+                if last > len(truncated_content) // 2:
+                    truncated_content = truncated_content[: last + len(sep)]
+                    break
+            trimmed = {**mem, "content": truncated_content, "_truncated": True}
+            output.append(trimmed)
+            budget_used += _estimate_mem_tokens(trimmed)
+            truncated_count += 1
+        else:
+            truncated_count += 1
+
+    output.append({
+        "_budget_meta": True,
+        "budget_used": budget_used,
+        "budget_limit": max_tokens,
+        "results_truncated": truncated_count,
+        "results_returned": len(output),
+    })
+    return output
+
+
 def _detect_injection(content: str) -> tuple[bool, list[str]]:
     """Check content for prompt injection patterns.
 
@@ -411,6 +520,21 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
             "surprisal": round(surprisal, 4),
             "gate_reason": f"forced (was: {reason})",
         }
+
+    # Dedup check — runs AFTER surprisal gate passes, before storage
+    if _write_gate is not None and not force:
+        is_dup, dup_sim = _write_gate.is_duplicate(content, context, tags)
+        if is_dup:
+            logger.info(
+                "Dedup suppressed write: similarity=%.3f dir=%s",
+                dup_sim, context,
+            )
+            return {
+                "stored": False,
+                "similarity": round(dup_sim, 4),
+                "reason": "duplicate_suppressed",
+                "message": f"Near-duplicate of existing memory (similarity={dup_sim:.2f})",
+            }
 
     # Generate contextual prefix for richer embedding semantics
     contextual_prefix = None
@@ -687,8 +811,16 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
 
 
 @mcp_server.tool()
-def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str | None = None) -> list[dict]:
-    """Semantic + keyword search filtered by heat. Boosts accessed memories."""
+def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str | None = None, max_tokens: int | None = None, compact: bool = False, fast: bool = True) -> list[dict]:
+    """Semantic + keyword search filtered by heat. Boosts accessed memories.
+
+    fast: if True (default), skip cross-encoder reranking for ~130ms response.
+          if False, run full deep reranking pipeline for highest quality (~6s).
+
+    If max_tokens is set, results are truncated to fit within the token budget.
+    Returns a list of dicts. When budget is active, the last element is a metadata
+    dict with keys: budget_used, budget_limit, results_truncated.
+    """
     # ── Input validation (R1) — cap query length to prevent embedding OOM ──
     if len(query) > settings.MAX_CONTENT_LENGTH:
         query = query[:settings.MAX_CONTENT_LENGTH]
@@ -701,7 +833,7 @@ def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str
     # Use HippoRetriever for unified 4-signal recall
     retriever = _retriever
     if retriever is not None:
-        merged = retriever.recall(query, max_results=max_results, min_heat=min_heat)
+        merged = retriever.recall(query, max_results=max_results, min_heat=min_heat, fast=fast)
     else:
         # Fallback to basic FTS + vector if retriever not initialized
         embeddings = _get_embeddings()
@@ -785,10 +917,20 @@ def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str
     if _replay is not None:
         _replay.record_tool_call()
 
-    # Strip binary fields from response (not JSON-serializable)
-    for m in merged:
-        m.pop("embedding", None)
-        m.pop("hdc_vector", None)
+    # Strip fields from response — compact mode is more aggressive
+    if compact:
+        merged = [_compact_response(m) for m in merged]
+    elif settings.RECALL_STRIP_INTERNAL_FIELDS:
+        merged = [_strip_response_fields(m) for m in merged]
+    else:
+        for m in merged:
+            m.pop("embedding", None)
+            m.pop("hdc_vector", None)
+
+    # Apply token budget — use default cap when caller omits max_tokens
+    effective_max_tokens = max_tokens if max_tokens is not None else settings.RECALL_DEFAULT_MAX_TOKENS
+    if effective_max_tokens > 0 and merged:
+        merged = _apply_token_budget(merged, effective_max_tokens)
 
     return merged
 
@@ -841,11 +983,13 @@ def validate_memory(memory_id: int) -> dict:
 
 
 @mcp_server.tool()
-def get_project_context(directory: str) -> dict:
+def get_project_context(directory: str, max_tokens: int | None = None, compact: bool = False) -> dict:
     """Return all hot memories for a directory, sorted by heat descending.
 
     Also checks if Hippocampal Replay hooks are installed for this project
     and includes a suggestion if they're missing.
+
+    If max_tokens is set, the memories list is truncated to fit within the token budget.
     """
     storage = _get_storage()
     # Try the directory as given, then try remapping in both directions so
@@ -860,9 +1004,15 @@ def get_project_context(directory: str) -> dict:
         reversed_path = settings.reverse_remap_path(directory)
         if reversed_path != directory:
             memories = storage.get_memories_for_directory(reversed_path, min_heat=settings.HOT_THRESHOLD)
-    for m in memories:
-        m.pop("embedding", None)
-        m.pop("hdc_vector", None)
+    # Strip fields from response — compact mode is more aggressive
+    if compact:
+        memories = [_compact_response(m) for m in memories]
+    elif settings.RECALL_STRIP_INTERNAL_FIELDS:
+        memories = [_strip_response_fields(m) for m in memories]
+    else:
+        for m in memories:
+            m.pop("embedding", None)
+            m.pop("hdc_vector", None)
 
     # Check if hooks are installed for this project
     hooks_installed = False
@@ -883,6 +1033,10 @@ def get_project_context(directory: str) -> dict:
             except Exception:
                 pass
             break
+
+    effective_max_tokens = max_tokens if max_tokens is not None else settings.RECALL_DEFAULT_MAX_TOKENS
+    if effective_max_tokens > 0 and memories:
+        memories = _apply_token_budget(memories, effective_max_tokens)
 
     result = {"memories": memories}
     if not hooks_installed:
@@ -922,14 +1076,13 @@ def memory_stats() -> dict:
         stats["hopfield_patterns"] = _hopfield.get_pattern_count()
 
     if _reconsolidation is not None:
-        recon_count = storage._conn.execute(
-            "SELECT COALESCE(SUM(reconsolidation_count), 0) FROM memories"
-        ).fetchone()[0]
+        recon_count = storage.sum_reconsolidation_count()
         stats["reconsolidation_count"] = recon_count
 
     if _write_gate is not None:
         # Track rejections via memories with surprisal below threshold
         stats["write_gate_rejections"] = getattr(_write_gate, "_rejection_count", 0)
+        stats["dedup_suppressions"] = getattr(_write_gate, "_dedup_suppression_count", 0)
 
     if _engram is not None:
         try:
@@ -945,21 +1098,14 @@ def memory_stats() -> dict:
         stats["active_rules"] = len(active_rules)
 
     if _cls is not None:
-        ep_count = storage._conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE store_type = 'episodic' AND heat > 0"
-        ).fetchone()[0]
-        sem_count = storage._conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE store_type = 'semantic' AND heat > 0"
-        ).fetchone()[0]
+        ep_count = storage.count_memories(store_type="episodic", min_heat=0.0)
+        sem_count = storage.count_memories(store_type="semantic", min_heat=0.0)
         stats["episodic_count"] = ep_count
         stats["semantic_count"] = sem_count
 
     if _compressor is not None:
         for level in (0, 1, 2):
-            count = storage._conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE compression_level = ? AND heat > 0",
-                (level,),
-            ).fetchone()[0]
+            count = storage.count_memories(compression_level=level, min_heat=0.0)
             stats[f"compressed_level_{level}"] = count
 
     if _cognitive_map is not None:
@@ -969,9 +1115,7 @@ def memory_stats() -> dict:
     # - causal_dag_edges: formal PC-algorithm DAG (populated every 50 memories)
     # - relationships WHERE is_causal=1: from detect_causality() (runs every cycle)
     dag_edges = storage.get_all_causal_edges() if _causal is not None else []
-    rel_causal = storage._conn.execute(
-        "SELECT COUNT(*) FROM relationships WHERE is_causal = 1"
-    ).fetchone()[0]
+    rel_causal = storage.count_causal_relationships()
     stats["causal_edges"] = len(dag_edges) + rel_causal
 
     if _metacognition is not None:
@@ -1026,11 +1170,24 @@ def rate_memory(memory_id: int, rating: float = 1.0, was_useful: bool | None = N
 
 @mcp_server.tool()
 def recall_hierarchical(
-    query: str, level: int = None, max_results: int = 10
+    query: str, level: int = None, max_results: int = 10, max_tokens: int | None = None, compact: bool = False
 ) -> list[dict]:
-    """Retrieve memories from the fractal hierarchy at a specific level or adaptively."""
+    """Retrieve memories from the fractal hierarchy at a specific level or adaptively.
+
+    If max_tokens is set, results are truncated to fit within the token budget.
+    """
     retriever = _get_retriever()
-    return retriever.recall_hierarchical(query, level=level, max_results=max_results)
+    results = retriever.recall_hierarchical(query, level=level, max_results=max_results)
+
+    if compact:
+        results = [_compact_response(m) for m in results]
+    elif settings.RECALL_STRIP_INTERNAL_FIELDS:
+        results = [_strip_response_fields(m) for m in results]
+
+    effective_max_tokens = max_tokens if max_tokens is not None else settings.RECALL_DEFAULT_MAX_TOKENS
+    if effective_max_tokens > 0 and results:
+        results = _apply_token_budget(results, effective_max_tokens)
+    return results
 
 
 @mcp_server.tool()
@@ -1855,6 +2012,9 @@ def build_groomer_dispatch() -> dict:
     async def groom_sanitize(agent_id: str = "", **p):
         return g.sanitize(**p)
 
+    async def groom_sanitize_archives(agent_id: str = "", **p):
+        return g.sanitize_archives(**p)
+
     return {
         "groom_audit": groom_audit,
         "groom_inspect": groom_inspect,
@@ -1879,6 +2039,7 @@ def build_groomer_dispatch() -> dict:
         "groom_provenance": groom_provenance,
         "groom_bulk_update_content": groom_bulk_update_content,
         "groom_sanitize": groom_sanitize,
+        "groom_sanitize_archives": groom_sanitize_archives,
     }
 
 
@@ -2059,6 +2220,52 @@ def init_engines(
             _staleness.start(watch_directory)
         _write_queue.start()
 
+    # Pre-warm ML models so first client request doesn't pay load cost.
+    # Embedding model: ~5-9s cold load, <20ms after warmup.
+    # Cross-encoder (GTE): ~1.5s cold load + ~1.7s first inference.
+    try:
+        logger.info("Pre-warming ML models...")
+        _prewarm_start = time.time()
+
+        # 1. Embedding model — loads SentenceTransformer into class-level cache
+        _embeddings.encode("model warmup")
+        logger.info("  Embedding model loaded (%.1fs)", time.time() - _prewarm_start)
+
+        # 2. Cross-encoder (GTE reranker) — instance-level on retriever
+        if getattr(_settings, "CROSS_ENCODER_ENABLED", False) and _retriever is not None:
+            _ce_start = time.time()
+            try:
+                from sentence_transformers import CrossEncoder as _STCrossEncoder
+                if _retriever._gte_reranker is None:
+                    _retriever._gte_reranker = _STCrossEncoder(
+                        "Alibaba-NLP/gte-reranker-modernbert-base",
+                        trust_remote_code=True,
+                    )
+                # Force first inference to trigger JIT/compilation warmup
+                _retriever._gte_reranker.predict([["warmup query", "warmup document"]])
+                logger.info("  Cross-encoder loaded (%.1fs)", time.time() - _ce_start)
+            except Exception:
+                logger.debug("  Cross-encoder pre-warm failed (non-fatal)")
+
+        # 3. Doc2Query T5 model — ~15s cold load, used at write time
+        if getattr(_settings, "INDEX_ENRICHMENT_ENABLED", False) and getattr(_settings, "DOC2QUERY_ENRICHMENT_ENABLED", False):
+            _d2q_start = time.time()
+            try:
+                from vaire.storage import _get_enrichment_pipeline
+                pipeline = _get_enrichment_pipeline(_settings, _embeddings)
+                d2q = pipeline._get_doc2query()
+                d2q._ensure_model(_settings.DOC2QUERY_MODEL)
+                logger.info("  Doc2Query model loaded (%.1fs)", time.time() - _d2q_start)
+            except Exception:
+                logger.debug("  Doc2Query pre-warm failed (non-fatal)")
+
+        logger.info(
+            "ML models pre-warmed in %.1fs",
+            time.time() - _prewarm_start,
+        )
+    except Exception:
+        logger.debug("Model pre-warm failed (non-fatal)", exc_info=True)
+
     return _storage, _embeddings, _buffer, _consolidation, _staleness
 
 
@@ -2136,13 +2343,23 @@ def shutdown():
 # ── mTLS HTTPS Server ─────────────────────────────────────────────────
 
 
+def _cn_from_peercert(peercert: dict) -> str | None:
+    """Extract the Common Name from an ssl.getpeercert() dict."""
+    subject = peercert.get("subject", ())
+    for rdn in subject:
+        for attr_type, attr_value in rdn:
+            if attr_type == "commonName":
+                return attr_value
+    return None
+
+
 class MTLSMiddleware:
     """ASGI middleware that sets transport_ctx for HTTPS requests.
 
-    Two-layer authentication:
-      1. TLS layer (uvicorn + CERT_REQUIRED) rejects unauthenticated clients
-      2. Identity layer: client sends X-Vaire-CN header with their cert CN
-         — trusted because only valid cert holders can connect
+    Identity extraction priority:
+      1. TLS client certificate CN (from ASGI extensions or transport)
+      2. X-Vaire-CN header (fallback, logged as warning)
+      3. "unknown" (no identity available)
     """
 
     def __init__(self, app):
@@ -2152,13 +2369,7 @@ class MTLSMiddleware:
         if scope["type"] == "http":
             from vaire.transport_context import TransportInfo
 
-            # Case-insensitive header lookup (ASGI headers are bytes tuples)
-            cn_bytes = b"unknown"
-            for key, val in scope.get("headers", []):
-                if key.lower() == b"x-vaire-cn":
-                    cn_bytes = val
-                    break
-            cn = cn_bytes.decode("utf-8", errors="replace")
+            cn = self._extract_cert_cn(scope)
             client = scope.get("client", ("unknown", 0))
             token = transport_ctx.set(TransportInfo(
                 is_remote=True, agent_cn=cn, client_ip=str(client[0]),
@@ -2170,6 +2381,51 @@ class MTLSMiddleware:
         else:
             # lifespan, websocket — pass through
             await self.app(scope, receive, send)
+
+    @staticmethod
+    def _extract_cert_cn(scope: dict) -> str:
+        """Extract Common Name from TLS client certificate.
+
+        Tries ASGI-standard TLS extensions first, then uvicorn transport
+        fallback, then X-Vaire-CN header as last resort (with warning).
+        """
+        # Strategy 1: ASGI extensions (future-proof)
+        tls_info = scope.get("extensions", {}).get("tls", {})
+        peercert = tls_info.get("peercert")
+        if peercert:
+            cn = _cn_from_peercert(peercert)
+            if cn:
+                return cn
+
+        # Strategy 2: uvicorn transport fallback
+        try:
+            transport = scope.get("_transport")
+            if transport is None:
+                transport = scope.get("extensions", {}).get("transport")
+            if transport is not None:
+                ssl_object = transport.get_extra_info("ssl_object")
+                if ssl_object:
+                    peercert = ssl_object.getpeercert()
+                    if peercert:
+                        cn = _cn_from_peercert(peercert)
+                        if cn:
+                            return cn
+        except Exception:
+            pass
+
+        # Strategy 3: Fall back to X-Vaire-CN header (log warning)
+        cn_bytes = b"unknown"
+        for key, val in scope.get("headers", []):
+            if key.lower() == b"x-vaire-cn":
+                cn_bytes = val
+                break
+        cn = cn_bytes.decode("utf-8", errors="replace")
+        if cn != "unknown":
+            logger.warning(
+                "Using X-Vaire-CN header for identity (cert CN extraction "
+                "unavailable). Client claims: %s", cn
+            )
+        return cn
 
 
 async def run_https(settings_override=None):
@@ -2188,10 +2444,32 @@ async def run_https(settings_override=None):
         return
 
     transport = _settings.HTTPS_TRANSPORT
-    if transport == "sse":
-        app = mcp_server.sse_app()
+
+    # Override DNS rebinding protection for HTTPS — mTLS is the auth boundary.
+    # VAIRE_HTTPS_ALLOWED_HOSTS="*" (default) disables the check entirely;
+    # a comma-separated list restricts to those hosts.
+    allowed = _settings.HTTPS_ALLOWED_HOSTS.strip()
+    if allowed == "*":
+        https_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     else:
-        app = mcp_server.streamable_http_app()
+        hosts = [
+            h.strip() + ":*" if ":" not in h.strip() else h.strip()
+            for h in allowed.split(",") if h.strip()
+        ]
+        https_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=hosts,
+        )
+
+    original_security = mcp_server.settings.transport_security
+    mcp_server.settings.transport_security = https_security
+    try:
+        if transport == "sse":
+            app = mcp_server.sse_app()
+        else:
+            app = mcp_server.streamable_http_app()
+    finally:
+        mcp_server.settings.transport_security = original_security
 
     # Wrap with mTLS context middleware
     app = MTLSMiddleware(app)

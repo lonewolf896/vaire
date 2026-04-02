@@ -117,9 +117,9 @@ class HippocampalReplay:
             "file_hash": None,
             "embedding_model": self._embeddings.get_model_name(),
         })
-        # Set protection and importance flags
+        # Set protection, importance, and full fidelity flags
         stmts = [
-            ("UPDATE memories SET is_protected = 1, importance = 1.0 WHERE id = ?",
+            ("UPDATE memories SET is_protected = 1, importance = 1.0, content_fidelity = 'full' WHERE id = ?",
              (memory_id,)),
         ]
         if reason:
@@ -229,14 +229,7 @@ class HippocampalReplay:
         checkpoint = self._storage.get_active_checkpoint()
 
         # 2. Get anchored memories (always included)
-        anchored = self._storage._conn.execute(
-            """SELECT * FROM memories
-               WHERE is_protected = 1 AND heat > 0
-               AND tags LIKE '%_anchor%'
-               ORDER BY created_at DESC LIMIT ?""",
-            (max_memories,),
-        ).fetchall()
-        anchored = [dict(r) for r in anchored]
+        anchored = self._storage.get_anchored_memories(min_heat=0.0, limit=max_memories)
         for m in anchored:
             m.pop("embedding", None)
             m.pop("hdc_vector", None)
@@ -251,15 +244,10 @@ class HippocampalReplay:
         # the user's active train of thought before compaction
         recent_memories = []
         try:
-            recent_rows = self._storage._conn.execute(
-                """SELECT * FROM memories
-                   WHERE heat > 0 AND is_protected = 0
-                   AND tags NOT LIKE '%_anchor%'
-                   ORDER BY created_at DESC LIMIT ?""",
-                (max_memories,),
-            ).fetchall()
-            for r in recent_rows:
-                m = dict(r)
+            recent_rows = self._storage.get_recent_memories(
+                exclude_anchored=True, min_heat=0.0, limit=max_memories
+            )
+            for m in recent_rows:
                 m.pop("embedding", None)
                 m.pop("hdc_vector", None)
                 if isinstance(m.get("tags"), str):

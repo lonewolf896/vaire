@@ -61,12 +61,7 @@ class CausalDiscovery:
         )
 
         # Collect episodes within the time range
-        episodes = self._storage._conn.execute(
-            "SELECT id, timestamp, directory, raw_content FROM episodes "
-            "WHERE timestamp >= ? ORDER BY timestamp ASC",
-            (cutoff_iso,),
-        ).fetchall()
-        episodes = self._storage._rows_to_dicts(episodes)
+        episodes = self._storage.get_episodes_since_time(cutoff_iso)
 
         if directory:
             episodes = [e for e in episodes if e["directory"] == directory]
@@ -483,14 +478,7 @@ class CausalDiscovery:
                 continue
 
             # Find edges where current entity is the TARGET (upstream causes)
-            edges = self._storage._conn.execute(
-                "SELECT cde.*, e.name AS source_name "
-                "FROM causal_dag_edges cde "
-                "JOIN entities e ON e.id = cde.source_entity_id "
-                "WHERE cde.target_entity_id = ?",
-                (current_id,),
-            ).fetchall()
-            edges = self._storage._rows_to_dicts(edges)
+            edges = self._storage.get_causal_causes(current_id)
 
             for edge in edges:
                 src_id = edge["source_entity_id"]
@@ -533,14 +521,7 @@ class CausalDiscovery:
                 continue
 
             # Find edges where current entity is the SOURCE (downstream effects)
-            edges = self._storage._conn.execute(
-                "SELECT cde.*, e.name AS target_name "
-                "FROM causal_dag_edges cde "
-                "JOIN entities e ON e.id = cde.target_entity_id "
-                "WHERE cde.source_entity_id = ?",
-                (current_id,),
-            ).fetchall()
-            edges = self._storage._rows_to_dicts(edges)
+            edges = self._storage.get_causal_effects(current_id)
 
             for edge in edges:
                 tgt_id = edge["target_entity_id"]

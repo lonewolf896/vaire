@@ -219,8 +219,4 @@ class NarrativeEngine:
 
     def _get_active_directories(self, min_heat: float = 0.3) -> list[str]:
         """Get directories that have memories above the heat threshold."""
-        rows = self._storage._conn.execute(
-            "SELECT DISTINCT directory_context FROM memories WHERE heat >= ?",
-            (min_heat,),
-        ).fetchall()
-        return [row[0] for row in rows]
+        return self._storage.get_active_directories(min_heat)

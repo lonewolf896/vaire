@@ -32,7 +32,7 @@ class CRDTMemorySync:
         self._storage = storage
         self._settings = settings
         self._agent_id: str = settings.CRDT_AGENT_ID
-        self._vector_clock: dict[str, int] = {self._agent_id: 0}
+        self._vector_clock: dict[str, int] = self._load_vector_clock()
         # Threading contract: single asyncio write task serialises all writes —
         # only one agent_id is active at a time; no lock required.
         self._active_agent_id: str = ""
@@ -40,10 +40,39 @@ class CRDTMemorySync:
     def get_agent_id(self) -> str:
         return self._agent_id
 
+    def _load_vector_clock(self) -> dict[str, int]:
+        """Load persisted vector clock from metadata table.
+
+        Falls back to {agent_id: 0} if no clock is stored (fresh DB).
+        """
+        try:
+            val = self._storage.get_metadata_value("crdt_vector_clock")
+            if val:
+                clock = json.loads(val)
+                if isinstance(clock, dict):
+                    if self._agent_id not in clock:
+                        clock[self._agent_id] = 0
+                    return clock
+        except (ValueError, TypeError):
+            pass
+        return {self._agent_id: 0}
+
+    def _save_vector_clock(self) -> None:
+        """Persist the current vector clock to the metadata table."""
+        try:
+            self._storage.set_metadata_value(
+                "crdt_vector_clock",
+                json.dumps(self._vector_clock),
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug("Could not persist CRDT vector clock")
+
     def increment_clock(self) -> dict[str, int]:
         self._vector_clock[self._agent_id] = (
             self._vector_clock.get(self._agent_id, 0) + 1
         )
+        self._save_vector_clock()
         return dict(self._vector_clock)
 
     def tag_provenance(self, memory_dict: dict) -> dict:
@@ -74,6 +103,7 @@ class CRDTMemorySync:
 
     def _increment_clock_for_agent(self, agent_id: str) -> dict[str, int]:
         self._vector_clock[agent_id] = self._vector_clock.get(agent_id, 0) + 1
+        self._save_vector_clock()
         return dict(self._vector_clock)
 
     def compare_clocks(self, clock_a: dict, clock_b: dict) -> str:
@@ -277,9 +307,7 @@ class CRDTMemorySync:
 
         # Snapshot the clock before mutation; roll back on storage failure.
         clock_snapshot = dict(self._vector_clock)
-        self._vector_clock[self._agent_id] = (
-            self._vector_clock.get(self._agent_id, 0) + 1
-        )
+        self.increment_clock()  # increments AND persists
         new_clock = json.dumps(dict(self._vector_clock))
         try:
             self._storage.update_memory_full(
@@ -289,6 +317,7 @@ class CRDTMemorySync:
             )
         except Exception:
             self._vector_clock = clock_snapshot
+            self._save_vector_clock()  # persist the rollback too
             raise
 
         updated = self._storage.get_memory(memory_id)
@@ -378,6 +407,17 @@ class CRDTMemorySync:
                     if merged.get("_conflict"):
                         stats["conflicted"] += 1
                     stats["merged"] += 1
+
+        # Update instance clock with any new agents seen from remotes
+        for remote in remote_memories:
+            try:
+                remote_clock = json.loads(remote.get("vector_clock", "{}"))
+            except (ValueError, TypeError):
+                continue
+            for agent, count in remote_clock.items():
+                if count > self._vector_clock.get(agent, 0):
+                    self._vector_clock[agent] = count
+        self._save_vector_clock()
 
         return stats
 

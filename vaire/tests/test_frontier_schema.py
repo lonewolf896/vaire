@@ -267,7 +267,7 @@ class TestFrontierConfig:
 
 class TestFrontierSchema:
     def test_new_tables_exist(self, storage):
-        tables = storage._conn.execute(
+        tables = storage._test_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
         table_names = [t["name"] for t in tables]
@@ -277,7 +277,7 @@ class TestFrontierSchema:
     def test_memory_rules_columns(self, storage):
         cols = {
             row["name"]
-            for row in storage._conn.execute("PRAGMA table_info(memory_rules)").fetchall()
+            for row in storage._test_conn.execute("PRAGMA table_info(memory_rules)").fetchall()
         }
         expected = {"id", "rule_type", "scope", "scope_value", "condition", "action", "priority", "created_at", "is_active"}
         assert expected.issubset(cols)
@@ -285,7 +285,7 @@ class TestFrontierSchema:
     def test_memory_archives_columns(self, storage):
         cols = {
             row["name"]
-            for row in storage._conn.execute("PRAGMA table_info(memory_archives)").fetchall()
+            for row in storage._test_conn.execute("PRAGMA table_info(memory_archives)").fetchall()
         }
         expected = {"id", "original_memory_id", "content", "embedding", "archived_at", "mismatch_score", "archive_reason"}
         assert expected.issubset(cols)
@@ -293,7 +293,7 @@ class TestFrontierSchema:
     def test_memory_transitions_columns(self, storage):
         cols = {
             row["name"]
-            for row in storage._conn.execute("PRAGMA table_info(memory_transitions)").fetchall()
+            for row in storage._test_conn.execute("PRAGMA table_info(memory_transitions)").fetchall()
         }
         expected = {"id", "from_memory_id", "to_memory_id", "count", "last_transition", "session_id"}
         assert expected.issubset(cols)
@@ -301,7 +301,7 @@ class TestFrontierSchema:
     def test_causal_dag_edges_columns(self, storage):
         cols = {
             row["name"]
-            for row in storage._conn.execute("PRAGMA table_info(causal_dag_edges)").fetchall()
+            for row in storage._test_conn.execute("PRAGMA table_info(causal_dag_edges)").fetchall()
         }
         expected = {"id", "source_entity_id", "target_entity_id", "algorithm", "confidence", "discovered_at", "is_validated"}
         assert expected.issubset(cols)
@@ -309,7 +309,7 @@ class TestFrontierSchema:
     def test_frontier_memory_columns_exist(self, storage):
         cols = {
             row["name"]
-            for row in storage._conn.execute("PRAGMA table_info(memories)").fetchall()
+            for row in storage._test_conn.execute("PRAGMA table_info(memories)").fetchall()
         }
         frontier_cols = [
             "plasticity", "stability", "excitability", "last_excitability_update",
@@ -329,7 +329,7 @@ class TestFrontierSchema:
             "memory_rules": ["idx_rules_scope"],
         }
         for table, expected_indexes in indexes_to_check.items():
-            rows = storage._conn.execute(f"PRAGMA index_list({table})").fetchall()
+            rows = storage._test_conn.execute(f"PRAGMA index_list({table})").fetchall()
             index_names = [r["name"] for r in rows]
             for idx in expected_indexes:
                 assert idx in index_names, f"Index {idx} missing from {table}"
@@ -342,7 +342,7 @@ class TestFrontierSchema:
         # Open again — migration runs again on same DB
         engine2 = StorageEngine(db_path)
         # Verify tables still exist
-        tables = engine2._conn.execute(
+        tables = engine2._test_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
         table_names = [t["name"] for t in tables]
@@ -585,12 +585,12 @@ class TestFrontierMemoryPersistence:
 
     def test_update_frontier_fields(self, storage):
         mem_id = storage.insert_memory(_make_memory())
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET plasticity = ?, stability = ?, store_type = ?, "
             "compression_level = ?, sr_x = ?, sr_y = ?, is_protected = ? WHERE id = ?",
             (0.7, 0.5, "semantic", 1, 2.5, -1.3, 1, mem_id),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
         mem = storage.get_memory(mem_id)
         assert mem["plasticity"] == pytest.approx(0.7)
         assert mem["stability"] == pytest.approx(0.5)
@@ -603,19 +603,19 @@ class TestFrontierMemoryPersistence:
     def test_hdc_vector_blob_persists(self, storage):
         mem_id = storage.insert_memory(_make_memory())
         blob = b"\xab\xcd\xef" * 100
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET hdc_vector = ? WHERE id = ?", (blob, mem_id)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
         mem = storage.get_memory(mem_id)
         assert mem["hdc_vector"] == blob
 
     def test_vector_clock_json_persists(self, storage):
         mem_id = storage.insert_memory(_make_memory())
         vc = json.dumps({"agent1": 3, "agent2": 1})
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET vector_clock = ? WHERE id = ?", (vc, mem_id)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
         mem = storage.get_memory(mem_id)
         assert json.loads(mem["vector_clock"]) == {"agent1": 3, "agent2": 1}

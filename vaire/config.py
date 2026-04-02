@@ -120,6 +120,8 @@ class Settings(BaseSettings):
     EXCITABILITY_HALF_LIFE_HOURS: float = 6.0  # Engram excitability decay half-life
     EXCITABILITY_BOOST: float = 0.5  # Excitability increase on slot activation
     WRITE_GATE_THRESHOLD: float = 0.4  # Min surprisal to pass write gate
+    DEDUP_THRESHOLD: float = 0.85         # Cosine similarity above which = duplicate
+    DEDUP_WINDOW_HOURS: int = 24          # Time window for dedup check
     COMPRESSION_GIST_AGE_HOURS: float = 168.0  # 7 days before gist compression
     COMPRESSION_TAG_AGE_HOURS: float = 720.0  # 30 days before tag compression
     HDC_DIMENSIONS: int = 10000  # Hyperdimensional vector size
@@ -140,7 +142,7 @@ class Settings(BaseSettings):
     MICRO_CHECKPOINT_COOLDOWN: int = 5  # Min tool calls between micro-checkpoints
     SESSION_COHERENCE_BONUS: float = 0.2  # Heat bonus for current-session memories
     SESSION_COHERENCE_WINDOW_HOURS: float = 4.0  # How long the session coherence lasts
-    REINJECTION_ENABLED: bool = True  # Auto-surface related context on remember
+    REINJECTION_ENABLED: bool = False  # Disabled: 10s+ per write. Agents call recall() when needed.
     REINJECTION_MAX_RESULTS: int = 3  # Max related memories to reinject
     DECISION_AUTO_PROTECT: bool = True  # Auto-protect detected decisions from decay
     ACTION_STREAM_ENABLED: bool = True  # Capture tool actions in sensory buffer
@@ -278,6 +280,14 @@ class Settings(BaseSettings):
     IMPLICIT_EMBEDDING_MODEL: str = ""
     IMPLICIT_VECTOR_WEIGHT: float = 0.5
 
+    # ── Response size control ────────────────────────────────────────────────
+    RECALL_DEFAULT_MAX_TOKENS: int = 8000   # Applied when caller omits max_tokens (≈28K chars)
+    RECALL_STRIP_INTERNAL_FIELDS: bool = True  # Strip enrichment/internal fields from responses
+
+    # ── Socket authentication ────────────────────────────────────────────────
+    SOCKET_AUTH_ENABLED: bool = True
+    SOCKET_AUTH_TOKENS_DIR: str = "~/.vaire/tokens"
+
     # Phase 1: Unix domain socket server settings
     SOCKET_PATH: str = "~/.vaire/vaire.sock"
     PID_FILE: str = "~/.vaire/vaire.pid"
@@ -308,6 +318,7 @@ class Settings(BaseSettings):
     TLS_CA: str = ""                # CA cert PEM (verifies client certs)
     HTTPS_BIND: str = ""            # "host:port" — empty = disabled
     HTTPS_TRANSPORT: str = "streamable-http"  # "sse" or "streamable-http"
+    HTTPS_ALLOWED_HOSTS: str = "*"  # comma-separated allowed Host headers; "*" disables check (mTLS is auth boundary)
 
     # ── Security limits ───────────────────────────────────────────────────────
     MAX_CONTENT_LENGTH: int = 50000   # max chars for memory content
@@ -409,6 +420,10 @@ class Settings(BaseSettings):
         if not self.INGEST_ALLOWED_DIRS:
             return []
         return [d.strip() for d in self.INGEST_ALLOWED_DIRS.split(",") if d.strip()]
+
+    @property
+    def socket_auth_tokens_dir_resolved(self) -> Path:
+        return Path(self.SOCKET_AUTH_TOKENS_DIR).expanduser()
 
     @property
     def db_path_resolved(self) -> Path:

@@ -82,7 +82,7 @@ class TestTagWrite:
         mid = _insert_memory(storage)
         crdt.tag_write(mid, "upsert")
 
-        rows = storage._conn.execute(
+        rows = storage._test_conn.execute(
             "SELECT * FROM crdt_entries WHERE memory_id = ?", (mid,)
         ).fetchall()
         assert len(rows) == 1
@@ -95,7 +95,7 @@ class TestTagWrite:
         crdt.tag_write(mid, "upsert")
         crdt.tag_write(mid, "update")
 
-        rows = storage._conn.execute(
+        rows = storage._test_conn.execute(
             "SELECT vector_clock FROM crdt_entries ORDER BY id"
         ).fetchall()
         clock1 = json.loads(rows[0]["vector_clock"])
@@ -111,7 +111,7 @@ class TestTagWrite:
         crdt.set_active_agent("agent-B")
         crdt.tag_write(mid, "write")
 
-        rows = storage._conn.execute("SELECT agent_id FROM crdt_entries").fetchall()
+        rows = storage._test_conn.execute("SELECT agent_id FROM crdt_entries").fetchall()
         agents = [r["agent_id"] for r in rows]
         assert "agent-A" in agents
         assert "agent-B" in agents

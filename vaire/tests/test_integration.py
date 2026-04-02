@@ -879,7 +879,6 @@ class TestFullSleepCycle:
         assert "communities" in stats
         assert "cluster_summaries_generated" in stats
         assert "reembedded" in stats
-        assert "compressed" in stats
         assert "narrative" in stats
 
 
