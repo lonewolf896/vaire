@@ -31,6 +31,8 @@ python -m pytest vaire/tests/ -x -q --ignore=vaire/tests/test_stress.py --ignore
 - Schema migrations use the `schema_migrations` table — never modify an existing migration, append a new one
 - Single-item lookups return `dict | None`; multi-item queries return `list[dict]`; inserts return `int`
 - Embeddings are stored as `bytes` (numpy float32 `.tobytes()`)
+- Reference files are immutable at runtime — updates require git commit + Docker rebuild
+- Task state is mutable, stored in `/data/tasks.json`, optionally synced to GitLab
 
 ## Architecture
 
@@ -116,9 +118,10 @@ Remote agents have restricted permissions compared to local agents:
 | `anchor` (auto-tagged "unprocessed") | `ingest_file`, `ingest_directory`, `ingest_preview` |
 | `checkpoint`, `restore` | `install_hooks`, `sync_instructions` |
 | `get_project_story`, `get_rules` | `seed_project` |
-| `navigate_memory`, `get_causal_chain` | |
-| `assess_coverage`, `detect_gaps` | |
+| `navigate_memory`, `get_causal_chain` | `task_create`, `task_claim`, `task_update` |
+| `assess_coverage`, `detect_gaps` | `task_complete`, `task_release` |
 | `consolidate_now`, `drill_down` | |
+| `load_reference`, `task_list`, `task_get` | |
 
 All remote `remember()` and `anchor()` calls are automatically:
 - Tagged with `"unprocessed"` for groomer review
@@ -149,6 +152,14 @@ Validation per memory: content length, injection pattern scan, tag validation, s
 | Ingest allowed dirs | `VAIRE_INGEST_ALLOWED_DIRS` | "" (unrestricted for local) |
 | Regex match cap | `VAIRE_REGEX_TIMEOUT_MATCHES` | 100 per scan |
 | Injection detection | `VAIRE_PROMPT_INJECTION_DETECTION` | true |
+| Reference path | `VAIRE_REFERENCE_PATH` | /app/reference |
+| Task data path | `VAIRE_TASK_DATA_PATH` | /data/tasks.json |
+| Task create allowed | `VAIRE_TASK_CREATE_ALLOWED` | "" (unrestricted) |
+| Task heartbeat TTL | `VAIRE_TASK_HEARTBEAT_TTL` | 30 min |
+| Task sync interval | `VAIRE_TASK_SYNC_INTERVAL` | 30 sec |
+| GitLab API URL | `VAIRE_GITLAB_API_URL` | "" (disabled) |
+| GitLab project ID | `VAIRE_GITLAB_PROJECT_ID` | "" |
+| GitLab token | `VAIRE_GITLAB_TOKEN` | "" (env var only) |
 
 Groomer role requires an explicit allowlist in `~/.vaire/vaire.ini`:
 ```ini
@@ -166,6 +177,42 @@ approved = vale-groomer
 | `get_project_context` | Hot memories for a directory |
 | `consolidate_now` | Force a full consolidation cycle (rarely needed — 3-tier daemon handles this) |
 | `memory_stats` | System health check |
+| `load_reference` | Load NIST standards, directives, or operational reference docs from the static library |
+
+## Reference system
+
+Static reference content (NIST 800-53, CSF, NICE, AI 100-2, OSINT sources) is served from manifest-driven files baked into the Docker image at `/app/reference/`. This keeps ~300 reference documents out of the memory DB, eliminating false positive duplicates in grooming and reducing consolidation overhead.
+
+```bash
+# List all available references
+load_reference(show_index=True)
+
+# Load a specific NIST control
+load_reference(topic="800-53:AC", section="AC-17")
+
+# List references in a category
+load_reference(show_index=True, category="nist")
+```
+
+Reference files live in `reference/` at the repo root. The manifest (`reference/manifest.json`) maps topic keys to file paths, SHA256 hashes, and section indexes. Directive-category files are hash-verified on every load.
+
+To add or update a reference: edit the file, recompute the hash, update the manifest, rebuild the Docker image.
+
+## Task engine
+
+Local-first mutable task system with 7 MCP tools. Tasks are stored in `/data/tasks.json` (container volume). Optional GitLab sync pushes state every 30s for durable backup.
+
+| Tool | When to use |
+|---|---|
+| `task_list` | List tasks, filter by status/role |
+| `task_get` | Get full task details + history |
+| `task_create` | Create a new task (restricted by `TASK_CREATE_ALLOWED`) |
+| `task_claim` | Claim an open task (one-at-a-time enforcement) |
+| `task_update` | Update progress, heartbeat, criteria (owner-only) |
+| `task_complete` | Mark task done (owner-only) |
+| `task_release` | Release task back to open (owner-only) |
+
+Task mutations are blocked for remote agents. `task_list` and `task_get` are read-only and allowed remotely.
 
 ## Consolidation tiers
 

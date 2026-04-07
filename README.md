@@ -3,7 +3,7 @@
 <!-- mcp-name: io.github.lonewolf896/vaire -->
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-1215%20passed-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-1571%20passed-brightgreen)](#testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
 *Named after Vairë the Weaver, who weaves the story of the world in the halls of Mandos.*
@@ -14,11 +14,11 @@ Your AI forgets you every time you close the tab. Every architecture decision yo
 
 Vaire is a persistent memory engine for Claude Code built on computational neuroscience. It remembers what you worked on, how you think, what you decided and why. Not as a dumb text dump that gets shoved into context, but as a living memory system that consolidates, forgets intelligently, and reconstructs the right context at the right time.
 
-26 subsystems. 27 MCP tools. Runs entirely on your machine. One SQLite file.
+26 subsystems. 36 MCP tools. Runs entirely on your machine. One SQLite file.
 
 ## Executive Summary
 
-Vaire is a persistent memory engine for Claude Code, grounded in computational neuroscience. Where conventional AI context management relies on flat text dumps, Vaire operates as a living memory system — one that consolidates, forgets intelligently, and reconstructs the right context at the right time. It runs entirely on your machine, backed by a single SQLite file, and exposes 27 MCP tools across 26 subsystems.
+Vaire is a persistent memory engine for Claude Code, grounded in computational neuroscience. Where conventional AI context management relies on flat text dumps, Vaire operates as a living memory system — one that consolidates, forgets intelligently, and reconstructs the right context at the right time. It runs entirely on your machine, backed by a single SQLite file, and exposes 36 MCP tools across 26 subsystems.
 
 At its core, Vaire models human memory biology rather than mimicking a database. A predictive write gate filters incoming information against what the system already knows, blocking redundant writes — the same mechanism the neocortex uses to suppress predictable sensory input. Memories carry heat: frequently accessed memories stay hot; unused ones cool, compress from full content to gist to tags, and eventually fade. Retrieval is equally principled: a multi-signal WRRF fusion of vector similarity (all-MiniLM-L6-v2), BM25 full-text search, knowledge graph personalized PageRank, spreading activation, Hopfield, HDC, fractal, and SR signals — reranked by GTE-Reranker (gte-reranker-modernbert-base) — surfaces what matters, not just what matches.
 
@@ -27,6 +27,8 @@ At write time, Doc2Query (msmarco-t5-small-v1) generates synthetic search querie
 Two capabilities set Vaire apart from simpler context systems. Hippocampal Replay guards against context compaction: hooks drain working state into a checkpoint before the window fills, then reconstruct context afterward from checkpoints, anchored facts, hot memories, and successor-representation predictions — rebuilding the cognitive map, not just replaying a transcript. Reconsolidation updates retrieved memories in place when context has shifted, and archives the prior version on severe mismatch, mirroring how biological memory rewrites on recall.
 
 Version 1.3.0 adds zero-gap capture: PostToolUse hooks record every tool action automatically, and SessionStart hooks inject project context on every new session — eliminating the manual overhead of memory maintenance.
+
+Version 1.4.0 adds a static reference system and task engine. ~300 NIST reference documents are served from manifest-driven files via `load_reference`, eliminating memory DB bloat. A thread-safe task engine with 7 MCP tools enables agent-driven task management with heartbeat-based ownership and optional GitLab sync for durable backup.
 
 On established benchmarks, Vaire scores 87.9% Recall@10 and MRR 0.686 on LoCoMo, and 96.7% Recall@10 with MRR 0.945 on LongMemEval — where the prior published best is 78.4% Recall@10. Knowledge Update MRR reaches 1.000, a direct consequence of the reconsolidation mechanism.
 
@@ -191,7 +193,7 @@ Vaire doesn't store memories the way a database stores rows. It treats them more
 
 **A cognitive map organizes everything.** Successor representations build a 2D map of concept space where memories that get accessed in similar contexts cluster together, even if their content is completely different. Debugging memories cluster near other debugging memories. Architecture decisions cluster together. Navigate this map, and you find related knowledge that keyword search would never surface.
 
-## All 27 tools
+## All 36 tools
 
 | Tool | Purpose |
 |------|---------|
@@ -222,6 +224,15 @@ Vaire doesn't store memories the way a database stores rows. It treats them more
 | `ingest_directory` | Recursively ingest a directory tree; skips already-ingested content |
 | `ingest_preview` | Dry-run chunking preview — see what would be stored before committing |
 | `ingest_status` | Poll background ingest job status by job ID |
+| `load_reference` | Load static reference documents (NIST 800-53, CSF, NICE, OSINT) with section extraction |
+| `task_list` | List tasks, filter by status and role |
+| `task_get` | Get full task details including acceptance criteria and history |
+| `task_create` | Create a new task with role, priority, and acceptance criteria |
+| `task_claim` | Claim an open task with one-at-a-time enforcement |
+| `task_update` | Update progress, heartbeat, and criteria on a claimed task |
+| `task_complete` | Mark a claimed task as done with result summary |
+| `task_release` | Release a claimed task back to open status |
+| `seed_project` | Seed project context from directory structure |
 
 ## Architecture
 
@@ -295,6 +306,17 @@ Everything runs locally. A single SQLite database with WAL mode, FTS5 full-text 
 | `prospective.py` | Future-oriented triggers on directory, keyword, entity, or time |
 | `sensory_buffer.py` | Episodic capture buffer for raw session content |
 | `restoration.py` | Hippocampal Replay engine for context compaction resilience |
+
+</details>
+
+<details>
+<summary><strong>Reference & Task Systems</strong></summary>
+
+| Module | Role |
+|--------|------|
+| `reference.py` | Manifest-driven static reference loader with path security and hash verification |
+| `task_engine.py` | Thread-safe local-first task cache with heartbeat-based ownership and GitLab sync |
+| `gitlab_client.py` | Token-safe GitLab Repository Files API client with optimistic locking |
 
 </details>
 
@@ -389,6 +411,14 @@ All settings use the `VAIRE_` environment variable prefix:
 | `VAIRE_MEDIUM_CYCLE_INTERVAL` | `900` | Seconds between medium cycles (entity extraction + merge) |
 | `VAIRE_SLEEP_CYCLE_MIN_GAP_HOURS` | `6.0` | Minimum hours between full sleep cycles |
 | `VAIRE_PATH_REMAP` | `` | Container→host path rewrite (`/container:/host`) for correct `directory_context` in Docker |
+| `VAIRE_REFERENCE_PATH` | `/app/reference` | Static reference files root (baked into Docker image) |
+| `VAIRE_TASK_DATA_PATH` | `/data/tasks.json` | Runtime task state file |
+| `VAIRE_TASK_HEARTBEAT_TTL` | `30` | Minutes before unclaimed task is considered abandoned |
+| `VAIRE_TASK_CREATE_ALLOWED` | `` | Comma-separated agent_id prefixes allowed to create tasks; empty = unrestricted |
+| `VAIRE_GITLAB_API_URL` | `` | GitLab API URL for task sync (empty = disabled) |
+| `VAIRE_GITLAB_PROJECT_ID` | `` | GitLab project ID for task sync |
+| `VAIRE_GITLAB_TOKEN` | `` | GitLab project access token (env var only, never logged) |
+| `VAIRE_TASK_SYNC_INTERVAL` | `30` | Seconds between GitLab sync cycles |
 
 Full list in `vaire/config.py`.
 
@@ -403,7 +433,7 @@ Full list in `vaire/config.py`.
 python -m pytest vaire/tests/ -x -q
 ```
 
-1215 tests across 47 test files covering every subsystem.
+1571 tests across 57 test files covering every subsystem.
 
 ## References
 

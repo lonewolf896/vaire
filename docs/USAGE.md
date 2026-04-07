@@ -171,6 +171,42 @@ Ingested chunks use `importance=0.8`, keeping them warm for ~59 days without acc
 | `get_rules` | List active rules |
 | `create_trigger` | Set prospective triggers that fire when matching context appears |
 
+### Reference documents
+
+| Tool | What it does |
+|---|---|
+| `load_reference` | Load NIST standards, directives, or operational reference docs from the static library |
+
+```
+# List all available references
+load_reference(show_index=True)
+
+# Load a specific NIST control family
+load_reference(topic="800-53:AC")
+
+# Load a specific control
+load_reference(topic="800-53:AC", section="AC-17")
+
+# Filter by category
+load_reference(show_index=True, category="nist")
+```
+
+Available categories: `nist` (800-53 families, CSF, NICE, AI 100-2, baselines), `operational` (OSINT sources), `directives` (governance documents).
+
+### Task management
+
+| Tool | What it does |
+|---|---|
+| `task_list` | List tasks, filter by status (`open`, `in_progress`, `done`, `on_hold`) and/or role |
+| `task_get` | Full task details including acceptance criteria and history |
+| `task_create` | Create a task with title, role, priority, acceptance criteria |
+| `task_claim` | Claim an open task — one-at-a-time enforcement, starts heartbeat |
+| `task_update` | Update progress, mark criteria done, add files/blockers (owner-only) |
+| `task_complete` | Mark done with result summary (owner-only) |
+| `task_release` | Release back to open pool (owner-only) |
+
+Tasks are local-first (`/data/tasks.json`). Optional GitLab sync pushes every 30s when `VAIRE_GITLAB_API_URL`, `VAIRE_GITLAB_PROJECT_ID`, and `VAIRE_GITLAB_TOKEN` are set.
+
 ### Maintenance
 
 | Tool | What it does |

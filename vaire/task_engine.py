@@ -75,10 +75,12 @@ class TaskEngine:
                     self._data_path, exc,
                 )
 
-        # Empty skeleton
+        # Empty skeleton — lock is not held here because __init__ runs
+        # before the engine is shared with any other thread.
         self._task_cache = dict(_EMPTY_STORE)
         self._task_cache["tasks"] = {}  # fresh dict
-        self._flush_local()
+        with self._task_lock:
+            self._flush_local()
         logger.info("TaskEngine initialized with empty store")
 
     def _flush_local(self) -> None:
@@ -592,10 +594,14 @@ class TaskEngine:
         with self._task_lock:
             return json.loads(json.dumps(self._task_cache))
 
-    def merge_remote(self, remote_data: dict) -> None:
-        """Merge remotely-updated task data. Used by TaskSyncThread."""
+    def replace_cache(self, new_data: dict) -> None:
+        """Replace the entire task cache with new data. Used by TaskSyncThread.
+
+        This is a full replacement, not a merge — caller is responsible for
+        merging before calling this.
+        """
         with self._task_lock:
-            self._task_cache.update(remote_data)
+            self._task_cache = new_data
             self._flush_local()
 
 
@@ -694,8 +700,8 @@ class TaskSyncThread:
                 )
                 remote = json.loads(content)
                 self._validate_schema(remote)
+                self._engine.replace_cache(remote)
                 with self._lock:
-                    self._engine._task_cache.update(remote)
                     self._dirty[0] = False
                 self._last_commit_id = commit_id
                 self._logger.info("Startup: seeded from GitLab")
