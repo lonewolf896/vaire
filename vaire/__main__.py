@@ -193,6 +193,7 @@ def cmd_server(args):
         build_dispatch_table,
         build_groomer_dispatch,
         build_ingest_dispatch,
+        build_task_dispatch,
         init_engines,
         run_https,
         shutdown,
@@ -220,6 +221,7 @@ def cmd_server(args):
 
         dispatch = build_dispatch_table()
         dispatch.update(build_ingest_dispatch(_server_mod._pipeline))
+        dispatch.update(build_task_dispatch())
         groomer = build_groomer_dispatch()
 
         # Load approved groomers from ini file (not in code — runtime config)
@@ -287,6 +289,8 @@ def cmd_health(args):
     """Health check — ping the socket server and exit 0 (healthy) or 1 (unhealthy).
 
     Designed for use as a Docker HEALTHCHECK. Imports no ML models.
+    Verifies the socket accepts a fresh connection AND the response has
+    expected structure (not just that the process is alive).
     """
     import asyncio
     import logging
@@ -302,11 +306,18 @@ def cmd_health(args):
     async def _check() -> bool:
         client = VaireClient(socket_path, call_timeout=4.0)
         try:
-            await client.call("memory_stats", {})
+            result = await client.call("memory_stats", {})
             await client.disconnect()
-            return True
         except Exception:
             return False
+
+        # Validate response structure — not just "no exception"
+        if not isinstance(result, dict):
+            return False
+        if "total_memories" not in result:
+            return False
+
+        return True
 
     ok = asyncio.run(_check())
     sys.exit(0 if ok else 1)

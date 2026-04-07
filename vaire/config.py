@@ -320,6 +320,21 @@ class Settings(BaseSettings):
     HTTPS_TRANSPORT: str = "streamable-http"  # "sse" or "streamable-http"
     HTTPS_ALLOWED_HOSTS: str = "*"  # comma-separated allowed Host headers; "*" disables check (mTLS is auth boundary)
 
+    # ── Reference system ────────────────────────────────────────────────────
+    REFERENCE_PATH: str = "/app/reference"       # container path (baked into image)
+    REFERENCE_MANIFEST: str = "manifest.json"    # filename within REFERENCE_PATH
+
+    # ── GitLab task sync ─────────────────────────────────────────────────────
+    GITLAB_API_URL: str = ""                     # e.g. "https://gitlab.example.com/api/v4"
+    GITLAB_PROJECT_ID: str = ""                  # e.g. "42"
+    GITLAB_TOKEN: str = ""                       # project access token — env var ONLY
+    GITLAB_TASKS_FILE: str = "tasks.json"        # path within repo
+    GITLAB_TASKS_BRANCH: str = "main"
+    TASK_SYNC_INTERVAL: int = 30                 # seconds between GitLab syncs
+    TASK_HEARTBEAT_TTL: int = 30                 # minutes before task considered abandoned
+    TASK_DATA_PATH: str = "/data/tasks.json"     # runtime writable task file
+    TASK_CREATE_ALLOWED: str = ""                # comma-separated agent_id prefixes; empty = unrestricted
+
     # ── Security limits ───────────────────────────────────────────────────────
     MAX_CONTENT_LENGTH: int = 50000   # max chars for memory content
     MAX_TAG_COUNT: int = 50           # max tags per memory
@@ -387,6 +402,13 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_gitlab_settings(self) -> "Settings":
+        gitlab_fields = [self.GITLAB_API_URL, self.GITLAB_PROJECT_ID]
+        if any(gitlab_fields) and not all(gitlab_fields):
+            raise ValueError("GITLAB_API_URL and GITLAB_PROJECT_ID must both be set")
+        return self
+
     @property
     def tls_enabled(self) -> bool:
         return bool(self.TLS_CERT and self.TLS_KEY and self.TLS_CA and self.HTTPS_BIND)
@@ -436,6 +458,28 @@ class Settings(BaseSettings):
     @property
     def pid_file_resolved(self) -> Path:
         return Path(self.PID_FILE).expanduser()
+
+    @property
+    def reference_path_resolved(self) -> Path:
+        return Path(self.REFERENCE_PATH)
+
+    @property
+    def reference_manifest_resolved(self) -> Path:
+        return self.reference_path_resolved / self.REFERENCE_MANIFEST
+
+    @property
+    def task_data_path_resolved(self) -> Path:
+        return Path(self.TASK_DATA_PATH).expanduser()
+
+    @property
+    def gitlab_enabled(self) -> bool:
+        return bool(self.GITLAB_API_URL and self.GITLAB_PROJECT_ID and self.GITLAB_TOKEN)
+
+    @property
+    def task_create_allowed_list(self) -> list[str]:
+        if not self.TASK_CREATE_ALLOWED:
+            return []
+        return [p.strip() for p in self.TASK_CREATE_ALLOWED.split(",") if p.strip()]
 
     @staticmethod
     def _prefix_matches(path: str, prefix: str) -> bool:

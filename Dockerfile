@@ -45,6 +45,9 @@ RUN chown -R 1000:1000 /app/.cache
 COPY README.md LICENSE ./
 COPY vaire/ vaire/
 
+# Static reference library — immutable at runtime, versioned with code
+COPY reference/ /app/reference/
+
 # Install the package itself without re-downloading dependencies.
 RUN pip install --no-cache-dir --no-deps .
 
@@ -65,6 +68,8 @@ ENV VAIRE_PID_FILE=/data/vaire.pid
 
 RUN mkdir -p /data/replicas
 
-# litestream wraps the server process: streams WAL changes to /data/replicas/
-# then forwards all signals to the child so graceful shutdown still works.
-ENTRYPOINT ["litestream", "replicate", "-config", "/etc/litestream.yml", "-exec", "python -m vaire server"]
+# Entrypoint wrapper: litestream + vaire server with circuit breaker.
+# If the server crashes 3 times within 5 minutes, the wrapper halts
+# instead of restart-looping.
+COPY entrypoint.sh /app/entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]

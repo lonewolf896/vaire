@@ -90,6 +90,8 @@ _groomer = None   # GroomerEngine — imported lazily in init_engines
 _write_queue = None  # WriteQueue
 _cache = None        # MemoryCache
 _pipeline = None     # IngestionPipeline — imported lazily in init_engines
+_reference_loader = None  # ReferenceLoader — loaded in init_engines
+_task_engine = None       # TaskEngine — loaded in init_engines
 
 # Session state for transition tracking
 _last_recalled_ids: dict[str, int] = {}  # session_id → last recalled memory_id
@@ -1851,6 +1853,235 @@ def sync_instructions(claude_md_path: str = "") -> dict:
     }
 
 
+# ── Reference & Task MCP tools ─────────────────────────────────────────
+
+
+@mcp_server.tool()
+def load_reference(
+    topic: str = "",
+    section: str | None = None,
+    show_index: bool = False,
+    category: str | None = None,
+) -> dict | str:
+    """Load a reference document from the static reference library.
+
+    Examples:
+        load_reference(show_index=True)                     # list all references
+        load_reference(show_index=True, category="nist")    # list NIST references
+        load_reference(topic="800-53:AC")                   # full AC family document
+        load_reference(topic="800-53:AC", section="AC-17")  # just AC-17
+        load_reference(topic="directive:all-agents")         # prime directive (hash-verified)
+    """
+    if _reference_loader is None:
+        return {"error": "Reference system not initialized"}
+
+    if show_index:
+        return _reference_loader.list_references(category=category)
+
+    if not topic:
+        return {"error": "Provide topic= or show_index=True"}
+
+    try:
+        from vaire.reference import PathSecurityError
+        content = _reference_loader.load(topic, section=section)
+        return {"topic": topic, "section": section, "content": content}
+    except KeyError as e:
+        return {"error": str(e)}
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+    except PathSecurityError:
+        return {"error": "Access denied"}
+
+
+@mcp_server.tool()
+def task_list(
+    status: str = "",
+    role: str = "",
+    include_history: bool = False,
+) -> dict:
+    """List tasks, optionally filtered by status and/or role.
+
+    Args:
+        status: Filter by status (open, in_progress, done, on_hold). Empty = all.
+        role: Filter by assigned role. Empty = all roles.
+        include_history: If True, include full task history in results.
+    """
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    return {
+        "tasks": _task_engine.list_tasks(
+            status=status or None,
+            role=role or None,
+            include_history=include_history,
+        )
+    }
+
+
+@mcp_server.tool()
+def task_get(task_id: str) -> dict:
+    """Get full details for a single task including acceptance criteria and history.
+
+    Args:
+        task_id: The task identifier (e.g. "TASK-044").
+    """
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    result = _task_engine.get_task(task_id)
+    if result is None:
+        return {"status": "error", "message": f"Task not found: {task_id}"}
+    return result
+
+
+@mcp_server.tool()
+def task_create(
+    title: str,
+    role: str,
+    priority: str = "medium",
+    directory: str = "",
+    description: str = "",
+    acceptance_criteria: list[str] | None = None,
+    depends_on: list[str] | None = None,
+    context_queries: list[str] | None = None,
+    on_completion: str = "",
+) -> dict:
+    """Create a new task. Restricted to allowed agent prefixes (TASK_CREATE_ALLOWED).
+
+    Args:
+        title: Short title for the task.
+        role: Target role (e.g. "builder", "defender", "architect").
+        priority: One of "low", "medium", "high", "critical". Default "medium".
+        directory: Project directory scope (optional).
+        description: Longer description of the task.
+        acceptance_criteria: List of criteria text strings.
+        depends_on: List of task IDs this task depends on.
+        context_queries: Vaire recall queries to run when claiming this task.
+        on_completion: Action to take on completion.
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task creation not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    # agent_id/host handled by dispatch wrapper for socket calls;
+    # MCP Starlette callers are local and trusted
+    try:
+        return _task_engine.create_task(
+            agent_id="local-mcp",
+            host="localhost",
+            title=title,
+            role=role,
+            priority=priority,
+            directory=directory,
+            description=description,
+            acceptance_criteria=[{"text": c} for c in (acceptance_criteria or [])],
+            depends_on=depends_on,
+            context_queries=context_queries,
+            on_completion=on_completion,
+        )
+    except (PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp_server.tool()
+def task_claim(task_id: str, model: str = "", pid: int = 0) -> dict:
+    """Claim an open task for this agent. Starts the heartbeat clock.
+
+    Args:
+        task_id: The task to claim.
+        model: Model identifier of the claiming agent (optional).
+        pid: Process ID of the claiming agent (optional).
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task claiming not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    try:
+        return _task_engine.claim_task(
+            task_id=task_id, agent_id="local-mcp",
+            host="localhost", model=model, pid=pid,
+        )
+    except (KeyError, PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp_server.tool()
+def task_update(
+    task_id: str,
+    notes: str = "",
+    phase: str | None = None,
+    action: str | None = None,
+    progress: int | None = None,
+    files: list[str] | None = None,
+    blockers: list[str] | None = None,
+    criteria_done: list[int] | None = None,
+) -> dict:
+    """Update progress on a claimed task. Only the claiming agent can update.
+
+    Args:
+        task_id: The task to update.
+        notes: Free-text progress notes.
+        phase: Current phase label (e.g. "pseudocode", "implement", "test").
+        action: Current action label (e.g. "editing server.py").
+        progress: Progress percentage (0-100). None means no change.
+        files: List of files modified in this update.
+        blockers: List of current blockers (replaces previous list).
+        criteria_done: IDs of acceptance criteria now satisfied.
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task updates not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    try:
+        return _task_engine.update_task(
+            task_id=task_id, agent_id="local-mcp", host="localhost",
+            notes=notes, phase=phase, action=action, progress=progress,
+            files=files, blockers=blockers, criteria_done=criteria_done,
+        )
+    except (KeyError, PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp_server.tool()
+def task_complete(task_id: str, result: str = "") -> dict:
+    """Mark a claimed task as complete. Only the claiming agent can complete.
+
+    Args:
+        task_id: The task to complete.
+        result: Summary of what was accomplished.
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task completion not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    try:
+        return _task_engine.complete_task(
+            task_id=task_id, agent_id="local-mcp",
+            host="localhost", result=result,
+        )
+    except (KeyError, PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp_server.tool()
+def task_release(task_id: str, reason: str = "") -> dict:
+    """Release a claimed task back to open status. Only the claiming agent can release.
+
+    Args:
+        task_id: The task to release.
+        reason: Why the task is being released.
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task release not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    try:
+        return _task_engine.release_task(
+            task_id=task_id, agent_id="local-mcp",
+            host="localhost", reason=reason,
+        )
+    except (KeyError, PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
 # ── MCP Resources ──────────────────────────────────────────────────────
 
 
@@ -1917,7 +2148,7 @@ def build_dispatch_table() -> dict:
         drill_down, create_trigger, get_project_story, add_rule, get_rules,
         navigate_memory, get_causal_chain, assess_coverage, detect_gaps,
         checkpoint, restore, anchor, install_hooks, sync_instructions,
-        seed_project,
+        seed_project, load_reference,
     ]
 
     # These tools do significant CPU/IO work and must not block the event loop.
@@ -2135,6 +2366,90 @@ def build_ingest_dispatch(pipeline) -> dict:
     }
 
 
+def build_task_dispatch() -> dict:
+    """Build task dispatch table — forwards agent_id to TaskEngine.
+
+    Read-only tools run directly; mutation tools run in executor.
+    """
+    import socket as _socket
+
+    if _task_engine is None:
+        return {}
+
+    engine = _task_engine
+    _host = _socket.gethostname()
+
+    async def task_list_handler(agent_id: str = "", **params):
+        status = params.get("status", "") or None
+        role = params.get("role", "") or None
+        include_history = params.get("include_history", False)
+        return {"tasks": engine.list_tasks(
+            status=status, role=role, include_history=include_history,
+        )}
+
+    async def task_get_handler(agent_id: str = "", **params):
+        result = engine.get_task(params.get("task_id", ""))
+        if result is None:
+            return {"status": "error", "message": f"Task not found: {params.get('task_id', '?')}"}
+        return result
+
+    async def task_create_handler(agent_id: str = "", **params):
+        allowed_prefixes = settings.task_create_allowed_list
+        if allowed_prefixes:
+            if not any(agent_id.startswith(p) for p in allowed_prefixes):
+                return {
+                    "status": "error",
+                    "message": f"Agent '{agent_id}' not authorized to create tasks",
+                }
+        # Convert acceptance_criteria strings to dicts if needed
+        ac = params.get("acceptance_criteria")
+        if ac and isinstance(ac, list) and ac and isinstance(ac[0], str):
+            params["acceptance_criteria"] = [{"text": c} for c in ac]
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.create_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    async def task_claim_handler(agent_id: str = "", **params):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.claim_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    async def task_update_handler(agent_id: str = "", **params):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.update_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    async def task_complete_handler(agent_id: str = "", **params):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.complete_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    async def task_release_handler(agent_id: str = "", **params):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.release_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    handlers = {
+        "task_list": task_list_handler,
+        "task_get": task_get_handler,
+        "task_create": task_create_handler,
+        "task_claim": task_claim_handler,
+        "task_update": task_update_handler,
+        "task_complete": task_complete_handler,
+        "task_release": task_release_handler,
+    }
+
+    for name, handler in handlers.items():
+        handler.__name__ = name
+
+    return handlers
+
+
 # ── Startup ────────────────────────────────────────────────────────────
 
 
@@ -2149,6 +2464,7 @@ def init_engines(
     global _prospective, _narrative, _sleep, _fractal, _pool, _kg, _reconsolidation, _write_gate, _engram
     global _rules_engine, _hopfield, _cls, _compressor, _hdc, _cognitive_map, _causal, _metacognition, _crdt
     global _replay, _groomer, _write_queue, _cache, _pipeline
+    global _reference_loader, _task_engine
 
     _settings = get_settings()
     _storage = StorageEngine(db_path or _settings.DB_PATH)
@@ -2213,6 +2529,48 @@ def init_engines(
         consolidation=_consolidation,
         settings=_settings,
     )
+
+    # ── Reference system (non-fatal) ────────────────────────────────────
+    try:
+        from vaire.reference import ReferenceLoader
+        _reference_loader = ReferenceLoader(_settings)
+        _reference_loader.load_manifest()
+    except Exception:
+        logger.warning("Reference system unavailable — manifest load failed", exc_info=True)
+        _reference_loader = None
+
+    # ── Task engine (non-fatal) ─────────────────────────────────────────
+    try:
+        from vaire.task_engine import TaskEngine
+        _task_engine = TaskEngine(_settings)
+        logger.info("TaskEngine initialized (data=%s)", _settings.task_data_path_resolved)
+    except Exception:
+        logger.warning("TaskEngine init failed — task tools will return errors", exc_info=True)
+        _task_engine = None
+
+    # ── GitLab task sync (requires TaskEngine + GitLab config) ──────────
+    global _task_sync, _gitlab_client
+    _task_sync = None
+    _gitlab_client = None
+    if _task_engine is not None and _settings.gitlab_enabled:
+        try:
+            from vaire.gitlab_client import GitLabClient
+            from vaire.task_engine import TaskSyncThread
+            _gitlab_client = GitLabClient(
+                _settings.GITLAB_API_URL,
+                _settings.GITLAB_PROJECT_ID,
+                _settings.GITLAB_TOKEN,
+            )
+            _task_sync = TaskSyncThread(_task_engine, _gitlab_client, _settings)
+            _task_sync.start()
+            logger.info(
+                "GitLab task sync enabled (interval=%ds)",
+                _settings.TASK_SYNC_INTERVAL,
+            )
+        except Exception:
+            logger.warning("GitLab task sync init failed (non-fatal)", exc_info=True)
+    elif _task_engine is not None:
+        logger.info("GitLab task sync disabled — running local-only")
 
     if start_daemons:
         _consolidation.start()
@@ -2286,6 +2644,15 @@ def shutdown():
     global _prospective, _narrative, _sleep, _fractal, _pool, _kg, _reconsolidation, _write_gate, _engram
     global _rules_engine, _hopfield, _cls, _compressor, _hdc, _cognitive_map, _causal, _metacognition, _crdt
     global _replay, _groomer, _write_queue, _cache, _pipeline
+    global _task_sync, _gitlab_client
+
+    # Stop task sync thread first (final push attempt)
+    if _task_sync is not None:
+        _task_sync.stop()
+        _task_sync = None
+    if _gitlab_client is not None:
+        _gitlab_client.close()
+        _gitlab_client = None
 
     if _write_queue is not None:
         # Sync path (signal handler): stop the loop and do a best-effort drain.

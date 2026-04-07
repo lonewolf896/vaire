@@ -194,24 +194,6 @@ class VaireClient:
             response = await asyncio.wait_for(
                 future, timeout=self._call_timeout
             )
-        except OSError:
-            # Broken pipe or connection reset — reset state and retry once.
-            self._pending.pop(request_id, None)
-            self._writer = None
-            self._reader = None
-            await self._ensure_connected()
-            request_id = secrets.token_hex(8)
-            payload["id"] = request_id
-            future = loop.create_future()
-            self._pending[request_id] = future
-            try:
-                await write_message(self._writer, payload)
-                response = await asyncio.wait_for(
-                    future, timeout=self._call_timeout
-                )
-            except (asyncio.TimeoutError, Exception):
-                self._pending.pop(request_id, None)
-                raise
         except (asyncio.TimeoutError, Exception):
             self._pending.pop(request_id, None)
             raise
@@ -355,9 +337,45 @@ def get_client() -> VaireClient:
 # All @mcp.tool() stubs are async and may run concurrently; use the async
 # client accessor so the singleton is created under a lock.
 
+_RETRY_BACKOFF = [0.5, 1.0, 2.0]
+
+
 async def _client_call(method: str, params: dict) -> Any:
-    """Fetch the client singleton (async-safe) and invoke method."""
-    return await (await get_client_async()).call(method, params)
+    """Fetch client singleton and invoke method with retry + backoff.
+
+    Retries on connection errors (OSError, TimeoutError, etc.).
+    Does NOT retry on VaireError (server returned a valid error —
+    the connection is fine, the request was rejected).
+    """
+    global _client
+    last_exc: Exception | None = None
+    max_retries = len(_RETRY_BACKOFF) + 1
+
+    for attempt in range(max_retries):
+        try:
+            client = await get_client_async()
+            return await client.call(method, params)
+        except VaireError:
+            raise  # server-side error — don't retry
+        except (OSError, ConnectionRefusedError, asyncio.TimeoutError,
+                ConnectionResetError, BrokenPipeError) as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                wait = _RETRY_BACKOFF[attempt]
+                logger.warning(
+                    "Vaire call %s failed (attempt %d/%d): %s. "
+                    "Retrying in %.1fs...",
+                    method, attempt + 1, max_retries, exc, wait,
+                )
+                # Force client recreation on next attempt (fresh socket)
+                _client = None
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    "Vaire call %s failed after %d attempts: %s",
+                    method, max_retries, exc,
+                )
+    raise last_exc  # type: ignore[misc]
 
 
 # ── MCP tool stubs ─────────────────────────────────────────────────────────────
@@ -652,6 +670,124 @@ async def ingest_status(job_id: str) -> dict:
 async def ingest_preview(file_path: str) -> dict:
     """Preview how a file would be chunked without writing to storage."""
     return await _client_call("ingest_preview", {"file_path": file_path})
+
+
+# ── Reference system ─────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def load_reference(
+    topic: str = "",
+    section: str | None = None,
+    show_index: bool = False,
+    category: str | None = None,
+) -> dict:
+    """Load a reference document from the static reference library.
+
+    Examples:
+        load_reference(show_index=True)                     # list all references
+        load_reference(show_index=True, category="nist")    # list NIST references
+        load_reference(topic="800-53:AC")                   # full AC family document
+        load_reference(topic="800-53:AC", section="AC-17")  # just AC-17
+        load_reference(topic="directive:all-agents")         # prime directive
+    """
+    return await _client_call(
+        "load_reference",
+        {"topic": topic, "section": section, "show_index": show_index, "category": category},
+    )
+
+
+# ── Task system ──────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def task_list(
+    status: str = "", role: str = "", include_history: bool = False,
+) -> dict:
+    """List tasks, optionally filtered by status and/or role."""
+    return await _client_call(
+        "task_list",
+        {"status": status, "role": role, "include_history": include_history},
+    )
+
+
+@mcp.tool()
+async def task_get(task_id: str) -> dict:
+    """Get full details for a single task including history."""
+    return await _client_call("task_get", {"task_id": task_id})
+
+
+@mcp.tool()
+async def task_create(
+    title: str,
+    role: str,
+    priority: str = "medium",
+    directory: str = "",
+    description: str = "",
+    acceptance_criteria: list[str] | None = None,
+    depends_on: list[str] | None = None,
+    context_queries: list[str] | None = None,
+    on_completion: str = "",
+) -> dict:
+    """Create a new task. Restricted to allowed agent prefixes."""
+    return await _client_call(
+        "task_create",
+        {
+            "title": title, "role": role, "priority": priority,
+            "directory": directory, "description": description,
+            "acceptance_criteria": acceptance_criteria,
+            "depends_on": depends_on, "context_queries": context_queries,
+            "on_completion": on_completion,
+        },
+    )
+
+
+@mcp.tool()
+async def task_claim(
+    task_id: str, model: str = "", pid: int = 0,
+) -> dict:
+    """Claim an open task for this agent."""
+    return await _client_call(
+        "task_claim", {"task_id": task_id, "model": model, "pid": pid},
+    )
+
+
+@mcp.tool()
+async def task_update(
+    task_id: str,
+    notes: str = "",
+    phase: str | None = None,
+    action: str | None = None,
+    progress: int | None = None,
+    files: list[str] | None = None,
+    blockers: list[str] | None = None,
+    criteria_done: list[int] | None = None,
+) -> dict:
+    """Update progress on a claimed task. Only the claiming agent can update."""
+    return await _client_call(
+        "task_update",
+        {
+            "task_id": task_id, "notes": notes, "phase": phase,
+            "action": action, "progress": progress, "files": files,
+            "blockers": blockers, "criteria_done": criteria_done,
+        },
+    )
+
+
+@mcp.tool()
+async def task_complete(task_id: str, result: str = "") -> dict:
+    """Mark a claimed task as complete."""
+    return await _client_call(
+        "task_complete", {"task_id": task_id, "result": result},
+    )
+
+
+@mcp.tool()
+async def task_release(task_id: str, reason: str = "") -> dict:
+    """Release a claimed task back to open status."""
+    return await _client_call(
+        "task_release", {"task_id": task_id, "reason": reason},
+    )
 
 
 # ── Groomer MCP instance ───────────────────────────────────────────────────────

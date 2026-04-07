@@ -1,0 +1,695 @@
+{
+  "schema_version": 1,
+  "categories": {
+    "directives": {
+      "description": "Agent governance \u2014 prime directives and operational boundaries",
+      "integrity": "required"
+    },
+    "nist": {
+      "description": "NIST standards and frameworks",
+      "integrity": "optional"
+    },
+    "operational": {
+      "description": "SIEM fields, OSINT sources, dev standards",
+      "integrity": "optional"
+    }
+  },
+  "references": {
+    "800-53:AC": {
+      "path": "nist/800-53/AC.md",
+      "category": "nist",
+      "description": "NIST 800-53 AC \u2014 Access Control (23 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "ac"
+      ],
+      "sections": [
+        "AC-1",
+        "AC-2",
+        "AC-3",
+        "AC-4",
+        "AC-5",
+        "AC-6",
+        "AC-7",
+        "AC-8",
+        "AC-9",
+        "AC-10",
+        "AC-11",
+        "AC-12",
+        "AC-14",
+        "AC-16",
+        "AC-17",
+        "AC-18",
+        "AC-19",
+        "AC-20",
+        "AC-21",
+        "AC-22",
+        "AC-23",
+        "AC-24",
+        "AC-25"
+      ],
+      "content_hash": "sha256:df0e0df7376dd3cab49c771baf3fc9127c1cc0aff441d404b6e6389eb00684b0",
+      "updated": "2026-04-07"
+    },
+    "800-53:AT": {
+      "path": "nist/800-53/AT.md",
+      "category": "nist",
+      "description": "NIST 800-53 AT \u2014 Awareness and Training (5 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "at"
+      ],
+      "sections": [
+        "AT-1",
+        "AT-2",
+        "AT-3",
+        "AT-4",
+        "AT-6"
+      ],
+      "content_hash": "sha256:90d4f6c9b1977ffefed578e3063d503acf070003db60238daa75176f1ed6cdf4",
+      "updated": "2026-04-07"
+    },
+    "800-53:AU": {
+      "path": "nist/800-53/AU.md",
+      "category": "nist",
+      "description": "NIST 800-53 AU \u2014 Audit and Accountability (15 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "au"
+      ],
+      "sections": [
+        "AU-1",
+        "AU-2",
+        "AU-3",
+        "AU-4",
+        "AU-5",
+        "AU-6",
+        "AU-7",
+        "AU-8",
+        "AU-9",
+        "AU-10",
+        "AU-11",
+        "AU-12",
+        "AU-13",
+        "AU-14",
+        "AU-16"
+      ],
+      "content_hash": "sha256:a79dd526252de296977fc9132bda8cde627c3c9141eb2e9afe6e3df7f868dfb1",
+      "updated": "2026-04-07"
+    },
+    "800-53:CA": {
+      "path": "nist/800-53/CA.md",
+      "category": "nist",
+      "description": "NIST 800-53 CA \u2014 Assessment, Authorization, and Monitoring (8 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "ca"
+      ],
+      "sections": [
+        "CA-1",
+        "CA-2",
+        "CA-3",
+        "CA-5",
+        "CA-6",
+        "CA-7",
+        "CA-8",
+        "CA-9"
+      ],
+      "content_hash": "sha256:42d53fc7bfd417a64efd744cadc7e8982842919dd45c81bd9ecd5e3ebe48b15f",
+      "updated": "2026-04-07"
+    },
+    "800-53:CM": {
+      "path": "nist/800-53/CM.md",
+      "category": "nist",
+      "description": "NIST 800-53 CM \u2014 Configuration Management (14 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "cm"
+      ],
+      "sections": [
+        "CM-1",
+        "CM-2",
+        "CM-3",
+        "CM-4",
+        "CM-5",
+        "CM-6",
+        "CM-7",
+        "CM-8",
+        "CM-9",
+        "CM-10",
+        "CM-11",
+        "CM-12",
+        "CM-13",
+        "CM-14"
+      ],
+      "content_hash": "sha256:cd76ba191070dff4b0f7aa54d0a4cc4c3f1f74fdd4ab664bf2dd46ddba865ab0",
+      "updated": "2026-04-07"
+    },
+    "800-53:CP": {
+      "path": "nist/800-53/CP.md",
+      "category": "nist",
+      "description": "NIST 800-53 CP \u2014 Contingency Planning (12 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "cp"
+      ],
+      "sections": [
+        "CP-1",
+        "CP-2",
+        "CP-3",
+        "CP-4",
+        "CP-6",
+        "CP-7",
+        "CP-8",
+        "CP-9",
+        "CP-10",
+        "CP-11",
+        "CP-12",
+        "CP-13"
+      ],
+      "content_hash": "sha256:2a235ec8a477ef8a6a653756ad3a2d31a4a488cc929e4444d162c6b49362d660",
+      "updated": "2026-04-07"
+    },
+    "800-53:IA": {
+      "path": "nist/800-53/IA.md",
+      "category": "nist",
+      "description": "NIST 800-53 IA \u2014 Identification and Authentication (13 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "ia"
+      ],
+      "sections": [
+        "IA-1",
+        "IA-2",
+        "IA-3",
+        "IA-4",
+        "IA-5",
+        "IA-6",
+        "IA-7",
+        "IA-8",
+        "IA-9",
+        "IA-10",
+        "IA-11",
+        "IA-12",
+        "IA-13"
+      ],
+      "content_hash": "sha256:301539237cdbfd535669652486f6faecf4b2c985f28dd83c85ea8a2b240dc1f7",
+      "updated": "2026-04-07"
+    },
+    "800-53:IR": {
+      "path": "nist/800-53/IR.md",
+      "category": "nist",
+      "description": "NIST 800-53 IR \u2014 Incident Response (9 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "ir"
+      ],
+      "sections": [
+        "IR-1",
+        "IR-2",
+        "IR-3",
+        "IR-4",
+        "IR-5",
+        "IR-6",
+        "IR-7",
+        "IR-8",
+        "IR-9"
+      ],
+      "content_hash": "sha256:4cea871a3494d3aada0be9c92d5e9a4ee5c2677ad7f2ce842cf033e6bc6eac92",
+      "updated": "2026-04-07"
+    },
+    "800-53:MA": {
+      "path": "nist/800-53/MA.md",
+      "category": "nist",
+      "description": "NIST 800-53 MA \u2014 Maintenance (7 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "ma"
+      ],
+      "sections": [
+        "MA-1",
+        "MA-2",
+        "MA-3",
+        "MA-4",
+        "MA-5",
+        "MA-6",
+        "MA-7"
+      ],
+      "content_hash": "sha256:218f0f2277232a5c404e4e96f370a128099e3478a851bee6531088bb3da22717",
+      "updated": "2026-04-07"
+    },
+    "800-53:MP": {
+      "path": "nist/800-53/MP.md",
+      "category": "nist",
+      "description": "NIST 800-53 MP \u2014 Media Protection (8 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "mp"
+      ],
+      "sections": [
+        "MP-1",
+        "MP-2",
+        "MP-3",
+        "MP-4",
+        "MP-5",
+        "MP-6",
+        "MP-7",
+        "MP-8"
+      ],
+      "content_hash": "sha256:f85557f80a764e93efb54b100aa916ced0166991afa3641d432958fe474877e1",
+      "updated": "2026-04-07"
+    },
+    "800-53:PE": {
+      "path": "nist/800-53/PE.md",
+      "category": "nist",
+      "description": "NIST 800-53 PE \u2014 Physical and Environmental Protection (22 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "pe"
+      ],
+      "sections": [
+        "PE-1",
+        "PE-2",
+        "PE-3",
+        "PE-4",
+        "PE-5",
+        "PE-6",
+        "PE-8",
+        "PE-9",
+        "PE-10",
+        "PE-11",
+        "PE-12",
+        "PE-13",
+        "PE-14",
+        "PE-15",
+        "PE-16",
+        "PE-17",
+        "PE-18",
+        "PE-19",
+        "PE-20",
+        "PE-21",
+        "PE-22",
+        "PE-23"
+      ],
+      "content_hash": "sha256:2f1389cdc7542027a2153881dfdd343f4e5f132f50155fa893137ad8a49cdf63",
+      "updated": "2026-04-07"
+    },
+    "800-53:PL": {
+      "path": "nist/800-53/PL.md",
+      "category": "nist",
+      "description": "NIST 800-53 PL \u2014 Planning (8 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "pl"
+      ],
+      "sections": [
+        "PL-1",
+        "PL-2",
+        "PL-4",
+        "PL-7",
+        "PL-8",
+        "PL-9",
+        "PL-10",
+        "PL-11"
+      ],
+      "content_hash": "sha256:f76d9bfb0ba9967511a32b125747fe0ef44985a372838ecfda5dfe1029c7e875",
+      "updated": "2026-04-07"
+    },
+    "800-53:PM": {
+      "path": "nist/800-53/PM.md",
+      "category": "nist",
+      "description": "NIST 800-53 PM \u2014 Program Management (32 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "pm"
+      ],
+      "sections": [
+        "PM-1",
+        "PM-2",
+        "PM-3",
+        "PM-4",
+        "PM-5",
+        "PM-6",
+        "PM-7",
+        "PM-8",
+        "PM-9",
+        "PM-10",
+        "PM-11",
+        "PM-12",
+        "PM-13",
+        "PM-14",
+        "PM-15",
+        "PM-16",
+        "PM-17",
+        "PM-18",
+        "PM-19",
+        "PM-20",
+        "PM-21",
+        "PM-22",
+        "PM-23",
+        "PM-24",
+        "PM-25",
+        "PM-26",
+        "PM-27",
+        "PM-28",
+        "PM-29",
+        "PM-30",
+        "PM-31",
+        "PM-32"
+      ],
+      "content_hash": "sha256:519ab89d8a9f40189c55c6377aa8ae8871130d092db1ac8c6c08000083b699fc",
+      "updated": "2026-04-07"
+    },
+    "800-53:PS": {
+      "path": "nist/800-53/PS.md",
+      "category": "nist",
+      "description": "NIST 800-53 PS \u2014 Personnel Security (9 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "ps"
+      ],
+      "sections": [
+        "PS-1",
+        "PS-2",
+        "PS-3",
+        "PS-4",
+        "PS-5",
+        "PS-6",
+        "PS-7",
+        "PS-8",
+        "PS-9"
+      ],
+      "content_hash": "sha256:ba4992e865a95b802c70e6fec5b5eee2d803f798c339d0a1d2c3b625fa3be367",
+      "updated": "2026-04-07"
+    },
+    "800-53:PT": {
+      "path": "nist/800-53/PT.md",
+      "category": "nist",
+      "description": "NIST 800-53 PT \u2014 PII Processing and Transparency (8 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "pt"
+      ],
+      "sections": [
+        "PT-1",
+        "PT-2",
+        "PT-3",
+        "PT-4",
+        "PT-5",
+        "PT-6",
+        "PT-7",
+        "PT-8"
+      ],
+      "content_hash": "sha256:03c3c3cb8f6356452e74e8f0a3352688715f82a1d4937385be5a18175fa4507d",
+      "updated": "2026-04-07"
+    },
+    "800-53:RA": {
+      "path": "nist/800-53/RA.md",
+      "category": "nist",
+      "description": "NIST 800-53 RA \u2014 Risk Assessment (9 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "ra"
+      ],
+      "sections": [
+        "RA-1",
+        "RA-2",
+        "RA-3",
+        "RA-5",
+        "RA-6",
+        "RA-7",
+        "RA-8",
+        "RA-9",
+        "RA-10"
+      ],
+      "content_hash": "sha256:c42aaa95ae6ae693803e6dbcda643a51d17291a14941d27890a4e74c55b2b9e8",
+      "updated": "2026-04-07"
+    },
+    "800-53:SA": {
+      "path": "nist/800-53/SA.md",
+      "category": "nist",
+      "description": "NIST 800-53 SA \u2014 System and Services Acquisition (17 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "sa"
+      ],
+      "sections": [
+        "SA-1",
+        "SA-2",
+        "SA-3",
+        "SA-4",
+        "SA-5",
+        "SA-8",
+        "SA-9",
+        "SA-10",
+        "SA-11",
+        "SA-15",
+        "SA-16",
+        "SA-17",
+        "SA-20",
+        "SA-21",
+        "SA-22",
+        "SA-23",
+        "SA-24"
+      ],
+      "content_hash": "sha256:850e962f4c182ccfc98009ced6e35e01dbe60e56516cf5f3cf4bb5d31228863c",
+      "updated": "2026-04-07"
+    },
+    "800-53:SC": {
+      "path": "nist/800-53/SC.md",
+      "category": "nist",
+      "description": "NIST 800-53 SC \u2014 System and Communications Protection (47 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "sc"
+      ],
+      "sections": [
+        "SC-1",
+        "SC-2",
+        "SC-3",
+        "SC-4",
+        "SC-5",
+        "SC-6",
+        "SC-7",
+        "SC-8",
+        "SC-10",
+        "SC-11",
+        "SC-12",
+        "SC-13",
+        "SC-15",
+        "SC-16",
+        "SC-17",
+        "SC-18",
+        "SC-20",
+        "SC-21",
+        "SC-22",
+        "SC-23",
+        "SC-24",
+        "SC-25",
+        "SC-26",
+        "SC-27",
+        "SC-28",
+        "SC-29",
+        "SC-30",
+        "SC-31",
+        "SC-32",
+        "SC-34",
+        "SC-35",
+        "SC-36",
+        "SC-37",
+        "SC-38",
+        "SC-39",
+        "SC-40",
+        "SC-41",
+        "SC-42",
+        "SC-43",
+        "SC-44",
+        "SC-45",
+        "SC-46",
+        "SC-47",
+        "SC-48",
+        "SC-49",
+        "SC-50",
+        "SC-51"
+      ],
+      "content_hash": "sha256:babafea6bce06a3034c94ab4a451f5915cfcc53b5bc4aeba40924ac48a2fac0b",
+      "updated": "2026-04-07"
+    },
+    "800-53:SI": {
+      "path": "nist/800-53/SI.md",
+      "category": "nist",
+      "description": "NIST 800-53 SI \u2014 System and Information Integrity (22 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "si"
+      ],
+      "sections": [
+        "SI-1",
+        "SI-2",
+        "SI-3",
+        "SI-4",
+        "SI-5",
+        "SI-6",
+        "SI-7",
+        "SI-8",
+        "SI-10",
+        "SI-11",
+        "SI-12",
+        "SI-13",
+        "SI-14",
+        "SI-15",
+        "SI-16",
+        "SI-17",
+        "SI-18",
+        "SI-19",
+        "SI-20",
+        "SI-21",
+        "SI-22",
+        "SI-23"
+      ],
+      "content_hash": "sha256:8c28d1b1893172b1aba983c592579e6e4fe7d022cfc181a17894945d869605a2",
+      "updated": "2026-04-07"
+    },
+    "800-53:SR": {
+      "path": "nist/800-53/SR.md",
+      "category": "nist",
+      "description": "NIST 800-53 SR \u2014 Supply Chain Risk Management (12 controls)",
+      "keywords": [
+        "nist",
+        "800-53",
+        "sr"
+      ],
+      "sections": [
+        "SR-1",
+        "SR-2",
+        "SR-3",
+        "SR-4",
+        "SR-5",
+        "SR-6",
+        "SR-7",
+        "SR-8",
+        "SR-9",
+        "SR-10",
+        "SR-11",
+        "SR-12"
+      ],
+      "content_hash": "sha256:f07a218c360f9c378d71eaaa0c24200572ec3c9ccaa54ec7ddd99d0d13ad4bd5",
+      "updated": "2026-04-07"
+    },
+    "csf-2.0": {
+      "path": "nist/csf-2.0-framework.md",
+      "category": "nist",
+      "description": "NIST Cybersecurity Framework 2.0",
+      "keywords": [
+        "csf",
+        "cybersecurity",
+        "framework",
+        "nist"
+      ],
+      "sections": [
+        "Framework Components",
+        "CSF Core",
+        "CSF Implementation Tiers",
+        "CSF Profiles",
+        "Integration Guidance",
+        "CSF Uses"
+      ],
+      "content_hash": "sha256:aa1b7b2f78500cdc7a02afdfe5736cc7cee92a898acb14ce255d5fce5307bab8",
+      "updated": "2026-04-07"
+    },
+    "nice-framework": {
+      "path": "nist/sp-800-181-nice.md",
+      "category": "nist",
+      "description": "NICE Cybersecurity Workforce Framework (SP 800-181)",
+      "keywords": [
+        "nice",
+        "workforce",
+        "roles",
+        "nist"
+      ],
+      "sections": [
+        "Framework Overview",
+        "Building Blocks",
+        "Usage Guidance",
+        "Deprecated 2017 Categories"
+      ],
+      "content_hash": "sha256:cc698afbea25797a550a39611a10ffb6df98ca0b83a6a698cd4825f33dcb1cbf",
+      "updated": "2026-04-07"
+    },
+    "ai-100-2": {
+      "path": "nist/ai-100-2-aml-taxonomy.md",
+      "category": "nist",
+      "description": "NIST AI 100-2 Adversarial ML Taxonomy",
+      "keywords": [
+        "ai",
+        "adversarial",
+        "machine learning",
+        "taxonomy"
+      ],
+      "sections": [
+        "Taxonomy Index",
+        "Attack Classification",
+        "Predictive Ai Attacks",
+        "Generative Ai Attacks",
+        "Key Challenges"
+      ],
+      "content_hash": "sha256:67fca9d80caf34d7a80110503a30f6821e0c6ca146b80c64af7158031b216daa",
+      "updated": "2026-04-07"
+    },
+    "800-53B-baselines": {
+      "path": "nist/800-53B-baselines.md",
+      "category": "nist",
+      "description": "NIST 800-53B Control Baselines",
+      "keywords": [
+        "nist",
+        "800-53b",
+        "baselines",
+        "controls"
+      ],
+      "sections": [
+        "Control Baselines by Family",
+        "Tailoring Guidance"
+      ],
+      "content_hash": "sha256:2f1dae5cb32a901fe2386596140409d1e236f921f62392220fac1bf4b36bf0bb",
+      "updated": "2026-04-07"
+    },
+    "osint-sources": {
+      "path": "osint-sources.md",
+      "category": "operational",
+      "description": "OSINT intelligence sources and techniques",
+      "keywords": [
+        "osint",
+        "intelligence",
+        "reconnaissance"
+      ],
+      "sections": [
+        "Tier 1 \u2014 Vendor Security Advisory Pages (most authoritative)",
+        "Tier 2 \u2014 Aggregator CVE Feeds (cross-cutting)",
+        "Tier 3 \u2014 Threat Intel and News",
+        "Notable Recent CVEs (as of 2026-03-26)",
+        "Automation quick wins"
+      ],
+      "content_hash": "sha256:a18213c555c4fb60cb173f3de8381fc7468354209f7c950978c0c4cddf0c877c",
+      "updated": "2026-04-07"
+    }
+  }
+}
