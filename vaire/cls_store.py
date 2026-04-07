@@ -115,20 +115,10 @@ class DualStoreCLS:
         4. Return qualifying clusters
         """
         # 1. Get episodic memories
-        if directory:
-            rows = self._storage._conn.execute(
-                "SELECT * FROM memories WHERE store_type = 'episodic' "
-                "AND heat > 0 AND embedding IS NOT NULL "
-                "AND directory_context = ?",
-                (directory,),
-            ).fetchall()
-        else:
-            rows = self._storage._conn.execute(
-                "SELECT * FROM memories WHERE store_type = 'episodic' "
-                "AND heat > 0 AND embedding IS NOT NULL"
-            ).fetchall()
-
-        memories = self._storage._rows_to_dicts(rows)
+        memories = self._storage.get_memories_by_store_type(
+            "episodic", directory=directory if directory else None,
+            min_heat=0.0, require_embedding=True
+        )
         if len(memories) < min_occurrences:
             return []
 
@@ -168,11 +158,9 @@ class DualStoreCLS:
                 directories.add(mem.get("directory_context", ""))
                 ep_id = mem.get("source_episode_id")
                 if ep_id is not None:
-                    ep_row = self._storage._conn.execute(
-                        "SELECT session_id FROM episodes WHERE id = ?", (ep_id,)
-                    ).fetchone()
-                    if ep_row:
-                        session_ids.add(ep_row[0])
+                    session_id = self._storage.get_episode_session_id(ep_id)
+                    if session_id:
+                        session_ids.add(session_id)
                 else:
                     # No episode linkage — treat created_at date as session proxy
                     created = mem.get("created_at", "")
@@ -393,11 +381,10 @@ class DualStoreCLS:
             })
 
             # Set store_type to semantic
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET store_type = 'semantic' WHERE id = ?",
                 (semantic_id,),
             )
-            self._storage._conn.commit()
 
             # e. Link episodic memories to semantic via derived_from
             for mem in cluster_mems:
@@ -406,12 +393,8 @@ class DualStoreCLS:
             stats["promoted"] += 1
 
         # Count totals
-        ep_count = self._storage._conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE store_type = 'episodic' AND heat > 0"
-        ).fetchone()[0]
-        sem_count = self._storage._conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE store_type = 'semantic' AND heat > 0"
-        ).fetchone()[0]
+        ep_count = self._storage.count_memories(store_type="episodic", min_heat=0.0)
+        sem_count = self._storage.count_memories(store_type="semantic", min_heat=0.0)
         stats["total_episodic"] = ep_count
         stats["total_semantic"] = sem_count
 
@@ -508,21 +491,10 @@ class DualStoreCLS:
         directory: str,
     ) -> list[tuple[dict, float]]:
         """Search a specific store (episodic or semantic) by embedding similarity."""
-        if directory:
-            rows = self._storage._conn.execute(
-                "SELECT * FROM memories WHERE store_type = ? "
-                "AND heat > 0 AND embedding IS NOT NULL "
-                "AND directory_context = ?",
-                (store_type, directory),
-            ).fetchall()
-        else:
-            rows = self._storage._conn.execute(
-                "SELECT * FROM memories WHERE store_type = ? "
-                "AND heat > 0 AND embedding IS NOT NULL",
-                (store_type,),
-            ).fetchall()
-
-        memories = self._storage._rows_to_dicts(rows)
+        memories = self._storage.get_memories_by_store_type(
+            store_type, directory=directory if directory else None,
+            min_heat=0.0, require_embedding=True
+        )
 
         results = []
         for mem in memories:

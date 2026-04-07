@@ -1,0 +1,36 @@
+services:
+  vaire-qa:
+    build: .
+    container_name: vaire-qa
+    user: "${UID}:${GID}"
+    volumes:
+      - ${HOME}/.vaire-qa:/data
+      - ${HOME}/workspace:/workspace:ro
+      - ./tests/fixtures/ingest:/ingest:ro
+    environment:
+      - VAIRE_PATH_REMAP=/workspace:${VAIRE_HOST_WORKSPACE:-${HOME}/workspace}
+      - VAIRE_COGNITIVE_LOAD_LIMIT=8
+
+      # ── No mTLS for QA (no certs in .vaire-qa) ─────────────────────────
+      # Omitting TLS vars disables HTTPS listener
+
+      # ── Security limits ─────────────────────────────────────────────────
+      - VAIRE_INGEST_ALLOWED_DIRS=/workspace,/ingest
+
+      # ── Reranking / enrichment (match prod) ─────────────────────────────
+      - VAIRE_NLI_RERANKING_ENABLED=false
+      - VAIRE_COMET_ENRICHMENT_ENABLED=false
+      - VAIRE_CONCEPTNET_ENRICHMENT_ENABLED=false
+      - VAIRE_WRRF_FTS_WEIGHT=0.3
+      - VAIRE_CANDIDATE_POOL_MULTIPLIER=5
+      - VAIRE_WRRF_CANDIDATE_MULTIPLIER=5
+
+      # ── Low gate for testing ────────────────────────────────────────────
+      - VAIRE_WRITE_GATE_THRESHOLD=0.1
+    healthcheck:
+      test: ["CMD", "python", "-m", "vaire", "health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    restart: "no"

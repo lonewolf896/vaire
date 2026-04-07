@@ -663,19 +663,17 @@ def _delete_existing_seed_memories(storage) -> int:
     Uses the storage engine's delete_memory() to handle vec0, FTS, and archive
     cleanup correctly rather than writing raw SQL.
     """
-    rows = storage._conn.execute(
-        "SELECT id FROM memories WHERE tags LIKE '%\"_seed\"%'"
-    ).fetchall()
-    if not rows:
+    ids = storage.get_memory_ids_by_tag("_seed")
+    if not ids:
         return 0
 
-    for (mid,) in rows:
+    for mid in ids:
         try:
             storage.delete_memory(mid)
         except Exception as e:
             logger.warning("Failed to delete seed memory id=%d: %s", mid, e)
 
-    return len(rows)
+    return len(ids)
 
 
 def seed_project(

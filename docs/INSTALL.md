@@ -19,7 +19,7 @@ Docker is the recommended way to run Vaire. The image bundles all three ML model
 ### 1. Clone and build
 
 ```bash
-git clone https://github.com/amanhij/Vaire.git
+git clone https://github.com/lonewolf896/Vaire.git
 cd Vaire
 UID=$(id -u) GID=$(id -g) docker compose up -d --build
 ```
@@ -126,7 +126,7 @@ pip install vaire
 Or from source:
 
 ```bash
-git clone https://github.com/amanhij/Vaire.git
+git clone https://github.com/lonewolf896/Vaire.git
 cd Vaire
 pip install -e .
 ```
@@ -272,6 +272,9 @@ All settings use the `VAIRE_` environment variable prefix. Set them in `docker-c
 | `VAIRE_WRITE_GATE_THRESHOLD` | `0.55` | Minimum surprisal to store a memory |
 | `VAIRE_COGNITIVE_LOAD_LIMIT` | `8` | Active context chunk limit |
 | `VAIRE_WRRF_FTS_WEIGHT` | `0.3` | Weight of keyword signal in retrieval |
+| `VAIRE_ACTION_LOG_INTERVAL` | `60` | Seconds between light cycles (decay + action log) |
+| `VAIRE_MEDIUM_CYCLE_INTERVAL` | `900` | Seconds between medium cycles (entity extraction + merge) |
+| `VAIRE_SLEEP_CYCLE_MIN_GAP_HOURS` | `6.0` | Minimum hours between full sleep cycles |
 
 Full list in `vaire/config.py`.
 

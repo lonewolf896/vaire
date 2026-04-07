@@ -117,17 +117,17 @@ class HippocampalReplay:
             "file_hash": None,
             "embedding_model": self._embeddings.get_model_name(),
         })
-        # Set protection and importance flags
-        self._storage._conn.execute(
-            "UPDATE memories SET is_protected = 1, importance = 1.0 WHERE id = ?",
-            (memory_id,),
-        )
+        # Set protection, importance, and full fidelity flags
+        stmts = [
+            ("UPDATE memories SET is_protected = 1, importance = 1.0, content_fidelity = 'full' WHERE id = ?",
+             (memory_id,)),
+        ]
         if reason:
-            self._storage._conn.execute(
+            stmts.append((
                 "UPDATE memories SET contextual_prefix = ? WHERE id = ?",
                 (f"[ANCHOR: {reason}] ", memory_id),
-            )
-        self._storage._conn.commit()
+            ))
+        self._storage.execute_writes(stmts)
         return memory_id
 
     def should_micro_checkpoint(self, content: str, tags: list[str], surprisal: float = 0.0) -> tuple[bool, str]:
@@ -200,11 +200,10 @@ class HippocampalReplay:
             auto_created = True
         else:
             # Update existing checkpoint with new epoch
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE checkpoints SET epoch = ? WHERE id = ?",
                 (new_epoch, active["id"]),
             )
-            self._storage._conn.commit()
 
         return {
             "status": "drained",
@@ -230,14 +229,7 @@ class HippocampalReplay:
         checkpoint = self._storage.get_active_checkpoint()
 
         # 2. Get anchored memories (always included)
-        anchored = self._storage._conn.execute(
-            """SELECT * FROM memories
-               WHERE is_protected = 1 AND heat > 0
-               AND tags LIKE '%_anchor%'
-               ORDER BY created_at DESC LIMIT ?""",
-            (max_memories,),
-        ).fetchall()
-        anchored = [dict(r) for r in anchored]
+        anchored = self._storage.get_anchored_memories(min_heat=0.0, limit=max_memories)
         for m in anchored:
             m.pop("embedding", None)
             m.pop("hdc_vector", None)
@@ -252,15 +244,10 @@ class HippocampalReplay:
         # the user's active train of thought before compaction
         recent_memories = []
         try:
-            recent_rows = self._storage._conn.execute(
-                """SELECT * FROM memories
-                   WHERE heat > 0 AND is_protected = 0
-                   AND tags NOT LIKE '%_anchor%'
-                   ORDER BY created_at DESC LIMIT ?""",
-                (max_memories,),
-            ).fetchall()
-            for r in recent_rows:
-                m = dict(r)
+            recent_rows = self._storage.get_recent_memories(
+                exclude_anchored=True, min_heat=0.0, limit=max_memories
+            )
+            for m in recent_rows:
                 m.pop("embedding", None)
                 m.pop("hdc_vector", None)
                 if isinstance(m.get("tags"), str):

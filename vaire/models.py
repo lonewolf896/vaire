@@ -73,7 +73,7 @@ class Memory(BaseModel):
     stability: float = 0.0  # Increases with successful retrievals (reconsolidation)
     excitability: float = 1.0  # Competitive allocation score (engram)
     last_excitability_update: Optional[datetime] = None  # For excitability decay calc
-    store_type: str = "episodic"  # "episodic" or "semantic" (CLS dual-store)
+    store_type: str = "episodic"  # "episodic", "semantic" (CLS dual-store), or "reference" (static ref data)
     compression_level: int = 0  # 0=full, 1=gist, 2=tag (rate-distortion)
     original_content: Optional[str] = None  # Full content preserved before compression
     hdc_vector: Optional[bytes] = None  # Hyperdimensional computing vector

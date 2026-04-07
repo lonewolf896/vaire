@@ -49,6 +49,10 @@ def _load_ini() -> dict[str, str]:
 
 _INI_VALUES = _load_ini()
 
+# Cache for _parse_remap results, keyed by PATH_REMAP string value.
+_REMAP_NONE = object()  # sentinel for "parsed but result is None"
+_remap_cache: dict = {}
+
 
 class IniSettingsSource(PydanticBaseSettingsSource):
     """Pydantic-settings source that reads from vaire.ini.
@@ -74,6 +78,9 @@ class IniSettingsSource(PydanticBaseSettingsSource):
 class Settings(BaseSettings):
     PORT: int = 8742
     IDLE_THRESHOLD_SECONDS: int = 300
+    ACTION_LOG_INTERVAL: int = 60  # light cycle: decay + action log processing
+    MEDIUM_CYCLE_INTERVAL: int = 900  # medium cycle: + entity extraction + merge (15 min)
+    SLEEP_CYCLE_MIN_GAP_HOURS: float = 6.0  # minimum hours between full sleep cycles
     DECAY_FACTOR: float = 0.95
     COLD_THRESHOLD: float = 0.05
     HOT_THRESHOLD: float = 0.7
@@ -113,6 +120,8 @@ class Settings(BaseSettings):
     EXCITABILITY_HALF_LIFE_HOURS: float = 6.0  # Engram excitability decay half-life
     EXCITABILITY_BOOST: float = 0.5  # Excitability increase on slot activation
     WRITE_GATE_THRESHOLD: float = 0.4  # Min surprisal to pass write gate
+    DEDUP_THRESHOLD: float = 0.85         # Cosine similarity above which = duplicate
+    DEDUP_WINDOW_HOURS: int = 24          # Time window for dedup check
     COMPRESSION_GIST_AGE_HOURS: float = 168.0  # 7 days before gist compression
     COMPRESSION_TAG_AGE_HOURS: float = 720.0  # 30 days before tag compression
     HDC_DIMENSIONS: int = 10000  # Hyperdimensional vector size
@@ -133,7 +142,7 @@ class Settings(BaseSettings):
     MICRO_CHECKPOINT_COOLDOWN: int = 5  # Min tool calls between micro-checkpoints
     SESSION_COHERENCE_BONUS: float = 0.2  # Heat bonus for current-session memories
     SESSION_COHERENCE_WINDOW_HOURS: float = 4.0  # How long the session coherence lasts
-    REINJECTION_ENABLED: bool = True  # Auto-surface related context on remember
+    REINJECTION_ENABLED: bool = False  # Disabled: 10s+ per write. Agents call recall() when needed.
     REINJECTION_MAX_RESULTS: int = 3  # Max related memories to reinject
     DECISION_AUTO_PROTECT: bool = True  # Auto-protect detected decisions from decay
     ACTION_STREAM_ENABLED: bool = True  # Capture tool actions in sensory buffer
@@ -189,6 +198,7 @@ class Settings(BaseSettings):
     GRAPH_SPREADING_DECAY: float = 0.5
     GRAPH_SPREADING_MAX_DEPTH: int = 2
     GRAPH_ENTITY_MIN_LENGTH: int = 3
+    GRAPH_ENTITY_EXTRA_STOPWORDS: str = ""  # comma-separated additional stopwords
 
     # v13: Adversarial protection settings
     ADVERSARIAL_DETECTION_ENABLED: bool = True
@@ -270,6 +280,14 @@ class Settings(BaseSettings):
     IMPLICIT_EMBEDDING_MODEL: str = ""
     IMPLICIT_VECTOR_WEIGHT: float = 0.5
 
+    # ── Response size control ────────────────────────────────────────────────
+    RECALL_DEFAULT_MAX_TOKENS: int = 8000   # Applied when caller omits max_tokens (≈28K chars)
+    RECALL_STRIP_INTERNAL_FIELDS: bool = True  # Strip enrichment/internal fields from responses
+
+    # ── Socket authentication ────────────────────────────────────────────────
+    SOCKET_AUTH_ENABLED: bool = True
+    SOCKET_AUTH_TOKENS_DIR: str = "~/.vaire/tokens"
+
     # Phase 1: Unix domain socket server settings
     SOCKET_PATH: str = "~/.vaire/vaire.sock"
     PID_FILE: str = "~/.vaire/vaire.pid"
@@ -293,6 +311,39 @@ class Settings(BaseSettings):
     # Use when the server runs in Docker: "CONTAINER_PREFIX:HOST_PREFIX"
     # e.g. "/workspace:/home/alice/workspace" rewrites /workspace/foo → /home/alice/workspace/foo
     PATH_REMAP: str = ""
+
+    # ── mTLS remote access ────────────────────────────────────────────────────
+    TLS_CERT: str = ""              # Server certificate PEM path
+    TLS_KEY: str = ""               # Server private key PEM path
+    TLS_CA: str = ""                # CA cert PEM (verifies client certs)
+    HTTPS_BIND: str = ""            # "host:port" — empty = disabled
+    HTTPS_TRANSPORT: str = "streamable-http"  # "sse" or "streamable-http"
+    HTTPS_ALLOWED_HOSTS: str = "*"  # comma-separated allowed Host headers; "*" disables check (mTLS is auth boundary)
+
+    # ── Reference system ────────────────────────────────────────────────────
+    REFERENCE_PATH: str = "/app/reference"       # container path (baked into image)
+    REFERENCE_MANIFEST: str = "manifest.json"    # filename within REFERENCE_PATH
+
+    # ── GitLab task sync ─────────────────────────────────────────────────────
+    GITLAB_API_URL: str = ""                     # e.g. "https://gitlab.example.com/api/v4"
+    GITLAB_PROJECT_ID: str = ""                  # e.g. "42"
+    GITLAB_TOKEN: str = ""                       # project access token — env var ONLY
+    GITLAB_TASKS_FILE: str = "tasks.json"        # path within repo
+    GITLAB_TASKS_BRANCH: str = "main"
+    TASK_SYNC_INTERVAL: int = 30                 # seconds between GitLab syncs
+    TASK_HEARTBEAT_TTL: int = 30                 # minutes before task considered abandoned
+    TASK_DATA_PATH: str = "/data/tasks.json"     # runtime writable task file
+    TASK_CREATE_ALLOWED: str = ""                # comma-separated agent_id prefixes; empty = unrestricted
+
+    # ── Security limits ───────────────────────────────────────────────────────
+    MAX_CONTENT_LENGTH: int = 50000   # max chars for memory content
+    MAX_TAG_COUNT: int = 50           # max tags per memory
+    MAX_TAG_LENGTH: int = 100         # max chars per individual tag
+    RATE_LIMIT_PER_MINUTE: int = 120  # per-connection request rate limit
+    RATE_LIMIT_BURST: int = 20        # burst allowance above steady rate
+    INGEST_ALLOWED_DIRS: str = ""     # comma-separated allowed dir prefixes for ingest
+    REGEX_TIMEOUT_MATCHES: int = 100  # max matches per regex scan in groomer
+    PROMPT_INJECTION_DETECTION: bool = True  # flag suspicious content on write
 
     model_config = {"env_prefix": "VAIRE_"}
 
@@ -332,6 +383,70 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_tls_settings(self) -> "Settings":
+        tls_fields = [self.TLS_CERT, self.TLS_KEY, self.TLS_CA]
+        set_count = sum(1 for f in tls_fields if f)
+        if 0 < set_count < 3:
+            raise ValueError(
+                "TLS_CERT, TLS_KEY, and TLS_CA must all be set together "
+                f"(got {set_count}/3)"
+            )
+        if self.HTTPS_BIND and not all(tls_fields):
+            raise ValueError(
+                "HTTPS_BIND requires TLS_CERT, TLS_KEY, and TLS_CA to be set"
+            )
+        if self.HTTPS_BIND and ":" not in self.HTTPS_BIND:
+            raise ValueError(
+                f"HTTPS_BIND must be 'host:port', got '{self.HTTPS_BIND}'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_gitlab_settings(self) -> "Settings":
+        gitlab_fields = [self.GITLAB_API_URL, self.GITLAB_PROJECT_ID]
+        if any(gitlab_fields) and not all(gitlab_fields):
+            raise ValueError("GITLAB_API_URL and GITLAB_PROJECT_ID must both be set")
+        return self
+
+    @property
+    def tls_enabled(self) -> bool:
+        return bool(self.TLS_CERT and self.TLS_KEY and self.TLS_CA and self.HTTPS_BIND)
+
+    @property
+    def https_host(self) -> str:
+        if not self.HTTPS_BIND:
+            return ""
+        return self.HTTPS_BIND.rsplit(":", 1)[0]
+
+    @property
+    def https_port(self) -> int:
+        if not self.HTTPS_BIND:
+            return 0
+        return int(self.HTTPS_BIND.rsplit(":", 1)[1])
+
+    @property
+    def tls_cert_resolved(self) -> Path:
+        return Path(self.TLS_CERT).expanduser()
+
+    @property
+    def tls_key_resolved(self) -> Path:
+        return Path(self.TLS_KEY).expanduser()
+
+    @property
+    def tls_ca_resolved(self) -> Path:
+        return Path(self.TLS_CA).expanduser()
+
+    @property
+    def ingest_allowed_dirs_list(self) -> list[str]:
+        if not self.INGEST_ALLOWED_DIRS:
+            return []
+        return [d.strip() for d in self.INGEST_ALLOWED_DIRS.split(",") if d.strip()]
+
+    @property
+    def socket_auth_tokens_dir_resolved(self) -> Path:
+        return Path(self.SOCKET_AUTH_TOKENS_DIR).expanduser()
+
     @property
     def db_path_resolved(self) -> Path:
         return Path(self.DB_PATH).expanduser()
@@ -344,16 +459,83 @@ class Settings(BaseSettings):
     def pid_file_resolved(self) -> Path:
         return Path(self.PID_FILE).expanduser()
 
+    @property
+    def reference_path_resolved(self) -> Path:
+        return Path(self.REFERENCE_PATH)
+
+    @property
+    def reference_manifest_resolved(self) -> Path:
+        return self.reference_path_resolved / self.REFERENCE_MANIFEST
+
+    @property
+    def task_data_path_resolved(self) -> Path:
+        return Path(self.TASK_DATA_PATH).expanduser()
+
+    @property
+    def gitlab_enabled(self) -> bool:
+        return bool(self.GITLAB_API_URL and self.GITLAB_PROJECT_ID and self.GITLAB_TOKEN)
+
+    @property
+    def task_create_allowed_list(self) -> list[str]:
+        if not self.TASK_CREATE_ALLOWED:
+            return []
+        return [p.strip() for p in self.TASK_CREATE_ALLOWED.split(",") if p.strip()]
+
+    @staticmethod
+    def _prefix_matches(path: str, prefix: str) -> bool:
+        """Check if path starts with prefix at a directory boundary.
+
+        Prevents '/workspace' from matching '/workspace2/foo'.
+        Only matches if the prefix is followed by '/' or is the entire path.
+        """
+        if not path.startswith(prefix):
+            return False
+        return len(path) == len(prefix) or path[len(prefix)] == "/"
+
+    def _parse_remap(self) -> tuple[str, str] | None:
+        """Parse PATH_REMAP into (container_prefix, host_prefix).
+
+        Returns None if unset, malformed, or either prefix is empty.
+        Result is cached in module-level dict keyed by PATH_REMAP value.
+        """
+        cached = _remap_cache.get(self.PATH_REMAP)
+        if cached is not None:
+            return cached if cached != _REMAP_NONE else None
+        if not self.PATH_REMAP or ":" not in self.PATH_REMAP:
+            _remap_cache[self.PATH_REMAP] = _REMAP_NONE
+            return None
+        container_prefix, host_prefix = self.PATH_REMAP.split(":", 1)
+        if not container_prefix or not host_prefix:
+            _remap_cache[self.PATH_REMAP] = _REMAP_NONE
+            return None
+        result = (container_prefix, host_prefix)
+        _remap_cache[self.PATH_REMAP] = result
+        return result
+
     def remap_path(self, path: str) -> str:
         """Rewrite a container-side path to its host equivalent.
 
         Reads PATH_REMAP ("container_prefix:host_prefix").  No-op if unset.
         """
-        if not self.PATH_REMAP or ":" not in self.PATH_REMAP:
+        parsed = self._parse_remap()
+        if parsed is None:
             return path
-        container_prefix, host_prefix = self.PATH_REMAP.split(":", 1)
-        if path.startswith(container_prefix):
+        container_prefix, host_prefix = parsed
+        if self._prefix_matches(path, container_prefix):
             return host_prefix + path[len(container_prefix):]
+        return path
+
+    def reverse_remap_path(self, path: str) -> str:
+        """Rewrite a host-side path back to its container equivalent.
+
+        Inverse of remap_path().  No-op if PATH_REMAP is unset.
+        """
+        parsed = self._parse_remap()
+        if parsed is None:
+            return path
+        container_prefix, host_prefix = parsed
+        if self._prefix_matches(path, host_prefix):
+            return container_prefix + path[len(host_prefix):]
         return path
 
 

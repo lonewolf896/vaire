@@ -181,41 +181,53 @@ class WriteQueue:
         """Execute all ops in a single transaction.
 
         Results are collected locally; futures are resolved and callbacks fired
-        only after a successful commit.  On any failure, all CRITICAL futures
-        receive the exception and the transaction is rolled back.
+        only after a successful commit but BEFORE the write lock is released.
+        This ensures cache invalidation callbacks see consistent state and no
+        stale reads can slip in between commit and invalidation.
+
+        On any failure, all CRITICAL futures receive the exception and the
+        transaction is rolled back.
         """
         results: list[tuple[WriteOp, Any]] = []
-        try:
-            self._storage.begin_transaction()
-            for op in batch:
-                result = getattr(self._storage, op.method)(**op.kwargs)
-                results.append((op, result))
-            self._storage.commit()
-        except Exception as exc:
+        with self._storage._write_lock:
             try:
-                self._storage.rollback()
-            except Exception:
-                pass
+                self._storage._in_batch = True
+                conn = self._storage.get_write_connection()
+                conn.execute("BEGIN")
+                for op in batch:
+                    result = getattr(self._storage, op.method)(**op.kwargs)
+                    results.append((op, result))
+                conn.commit()
+            except Exception as exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                self._storage._in_batch = False
 
-            # Resolve all CRITICAL futures with the exception.
-            for op in batch:
+                # Resolve all CRITICAL futures with the exception.
+                for op in batch:
+                    if op.priority is WriteOpPriority.CRITICAL and op.future is not None:
+                        if not op.future.done():
+                            op.future.set_exception(exc)
+
+                logger.error("Write batch failed (%d ops): %s", len(batch), exc)
+                return
+            finally:
+                self._storage._in_batch = False
+
+            # Commit succeeded — resolve futures and fire callbacks INSIDE the
+            # write lock so cache invalidation completes before any other writer
+            # can modify the DB state.
+            for op, result in results:
                 if op.priority is WriteOpPriority.CRITICAL and op.future is not None:
                     if not op.future.done():
-                        op.future.set_exception(exc)
-
-            logger.error("Write batch failed (%d ops): %s", len(batch), exc)
-            return
-
-        # Commit succeeded — resolve futures then fire callbacks.
-        for op, result in results:
-            if op.priority is WriteOpPriority.CRITICAL and op.future is not None:
-                if not op.future.done():
-                    op.future.set_result(result)
-            if op.callback is not None:
-                try:
-                    op.callback()
-                except Exception:
-                    logger.exception("Callback raised after commit")
+                        op.future.set_result(result)
+                if op.callback is not None:
+                    try:
+                        op.callback()
+                    except Exception:
+                        logger.exception("Callback raised after commit")
 
     async def _drain_all(self) -> None:
         """Drain every item currently on the queue in one batch."""

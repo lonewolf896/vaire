@@ -58,7 +58,12 @@ def _parse_condition(condition: str) -> tuple[str, str, str]:
             parts = condition.split(f" {op} ", 1)
             return parts[0].strip(), op, parts[1].strip()
 
-    raise ValueError(f"Cannot parse condition: {condition!r}")
+    raise ValueError(
+        f"Cannot parse condition: {condition!r}. "
+        f"Expected format: 'field operator value'. "
+        f"Valid operators: ==, !=, >, <, >=, <=, contains, not_contains, matches. "
+        f"Example: 'importance > 0.7' or 'tag contains architecture'"
+    )
 
 
 def _parse_action(action: str) -> tuple[str, float]:
@@ -70,17 +75,21 @@ def _parse_action(action: str) -> tuple[str, float]:
     """
     if action == "filter":
         return "filter", 0.0
+    _VALID_ACTIONS_HELP = (
+        "Valid actions: 'filter' (hard rules only), "
+        "'boost:N' (e.g. 'boost:1.5'), or 'penalty:N' (e.g. 'penalty:0.3')"
+    )
     if action.startswith("boost:"):
         try:
             return "boost", float(action.split(":", 1)[1])
         except (ValueError, IndexError):
-            raise ValueError(f"Invalid action: {action!r}")
+            raise ValueError(f"Invalid boost value in {action!r}. {_VALID_ACTIONS_HELP}")
     if action.startswith("penalty:"):
         try:
             return "penalty", float(action.split(":", 1)[1])
         except (ValueError, IndexError):
-            raise ValueError(f"Invalid action: {action!r}")
-    raise ValueError(f"Invalid action: {action!r}")
+            raise ValueError(f"Invalid penalty value in {action!r}. {_VALID_ACTIONS_HELP}")
+    raise ValueError(f"Unknown action: {action!r}. {_VALID_ACTIONS_HELP}")
 
 
 def _get_field_value(memory: dict, field: str) -> Any:
@@ -178,26 +187,17 @@ class RulesEngine:
         global_rules = self._storage.get_rules_for_scope("global")
 
         # Get directory-scoped rules: need to check prefix match
-        # Query all active directory rules and filter by prefix
-        rows = self._storage._conn.execute(
-            "SELECT * FROM memory_rules WHERE scope = 'directory' AND is_active = 1 "
-            "ORDER BY priority DESC"
-        ).fetchall()
+        all_dir_rules = self._storage.get_rules_by_scope_type("directory")
         dir_rules = []
-        for row in rows:
-            rule = self._storage._row_to_dict(row)
+        for rule in all_dir_rules:
             sv = rule.get("scope_value") or ""
             if directory.startswith(sv):
                 dir_rules.append(rule)
 
         # Get file-scoped rules: glob pattern matching
-        rows = self._storage._conn.execute(
-            "SELECT * FROM memory_rules WHERE scope = 'file' AND is_active = 1 "
-            "ORDER BY priority DESC"
-        ).fetchall()
+        all_file_rules = self._storage.get_rules_by_scope_type("file")
         file_rules = []
-        for row in rows:
-            rule = self._storage._row_to_dict(row)
+        for rule in all_file_rules:
             sv = rule.get("scope_value") or ""
             if fnmatch.fnmatch(directory, sv):
                 file_rules.append(rule)
@@ -343,18 +343,11 @@ class RulesEngine:
         Returns True if the rule existed and was deactivated.
         """
         # Check if rule exists
-        row = self._storage._conn.execute(
-            "SELECT id FROM memory_rules WHERE id = ?", (rule_id,)
-        ).fetchone()
-        if row is None:
+        if not self._storage.rule_exists(rule_id):
             return False
         self._storage.update_rule(rule_id, {"is_active": False})
         return True
 
     def get_all_rules(self) -> list[dict]:
         """Return all active rules, sorted by scope then priority."""
-        rows = self._storage._conn.execute(
-            "SELECT * FROM memory_rules WHERE is_active = 1 "
-            "ORDER BY scope, priority DESC"
-        ).fetchall()
-        return self._storage._rows_to_dicts(rows)
+        return self._storage.get_all_rules_sorted()

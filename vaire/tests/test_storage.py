@@ -25,7 +25,7 @@ def _make_memory(content="test memory", directory="/tmp/project", **kwargs):
 
 class TestSchemaCreation:
     def test_all_tables_exist(self, storage):
-        tables = storage._conn.execute(
+        tables = storage._test_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
         table_names = sorted(t["name"] for t in tables)
@@ -45,7 +45,7 @@ class TestSchemaCreation:
             assert name in table_names, f"Table {name} not found"
 
     def test_fts_virtual_table_exists(self, storage):
-        tables = storage._conn.execute(
+        tables = storage._test_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'"
         ).fetchall()
         assert len(tables) == 1
@@ -53,7 +53,7 @@ class TestSchemaCreation:
     def test_v2_memory_columns_exist(self, storage):
         cols = {
             row["name"]
-            for row in storage._conn.execute("PRAGMA table_info(memories)").fetchall()
+            for row in storage._test_conn.execute("PRAGMA table_info(memories)").fetchall()
         }
         v2_cols = [
             "surprise_score", "importance", "emotional_valence", "confidence",
@@ -66,7 +66,7 @@ class TestSchemaCreation:
     def test_v2_entity_columns_exist(self, storage):
         cols = {
             row["name"]
-            for row in storage._conn.execute("PRAGMA table_info(entities)").fetchall()
+            for row in storage._test_conn.execute("PRAGMA table_info(entities)").fetchall()
         }
         for col in ("causal_weight", "domain"):
             assert col in cols, f"Column entities.{col} not found"
@@ -74,7 +74,7 @@ class TestSchemaCreation:
     def test_v2_relationship_columns_exist(self, storage):
         cols = {
             row["name"]
-            for row in storage._conn.execute("PRAGMA table_info(relationships)").fetchall()
+            for row in storage._test_conn.execute("PRAGMA table_info(relationships)").fetchall()
         }
         for col in ("event_time", "record_time", "is_causal", "confidence"):
             assert col in cols, f"Column relationships.{col} not found"
@@ -82,7 +82,7 @@ class TestSchemaCreation:
     def test_v2_indexes_exist(self, storage):
         indexes = {
             row["name"]
-            for row in storage._conn.execute(
+            for row in storage._test_conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='index'"
             ).fetchall()
             if row["name"]
@@ -345,7 +345,7 @@ class TestEpisodes:
 
 class TestWALMode:
     def test_wal_mode(self, storage):
-        mode = storage._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        mode = storage._test_conn.execute("PRAGMA journal_mode").fetchone()[0]
         assert mode == "wal"
 
 

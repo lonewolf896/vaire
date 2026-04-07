@@ -77,10 +77,12 @@ class AstrocyteEngine:
         storage: StorageEngine,
         embeddings: EmbeddingEngine,
         settings: Settings,
+        write_gate=None,
     ) -> None:
         self._storage = storage
         self._embeddings = embeddings
         self._settings = settings
+        self._write_gate = write_gate
         self._thermo = MemoryThermodynamics(storage, embeddings, settings)
         self._graph = KnowledgeGraph(storage, settings)
         self._curator = MemoryCurator(storage, embeddings, self._thermo, settings)
@@ -89,7 +91,11 @@ class AstrocyteEngine:
         )
         self._cls = DualStoreCLS(storage, embeddings, settings)
         self._compressor = MemoryCompressor(storage, embeddings, settings)
-        self._last_sleep_cycle: datetime | None = None
+        self._last_sleep_cycle: datetime | None = self._load_last_sleep_cycle()
+        self._last_light_cycle: datetime | None = None
+        self._last_medium_cycle: datetime | None = None
+        self._last_full_activity: datetime | None = None  # activity stamp when full cycle last ran
+        self._last_decay_time: datetime | None = None  # prevents double decay per iteration
 
         self.last_activity: datetime = datetime.now(timezone.utc)
         self.is_running: bool = False
@@ -143,6 +149,29 @@ class AstrocyteEngine:
     def record_activity(self) -> None:
         self.last_activity = datetime.now(timezone.utc)
 
+    def _load_last_sleep_cycle(self) -> datetime | None:
+        """Load last sleep cycle timestamp from DB to survive restarts."""
+        try:
+            val = self._storage.get_metadata_value("last_sleep_cycle")
+            if val:
+                dt = datetime.fromisoformat(val)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+        except Exception:
+            pass
+        return None
+
+    def _save_last_sleep_cycle(self, ts: datetime) -> None:
+        """Persist last sleep cycle timestamp to DB."""
+        try:
+            self._storage.execute_write(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                ("last_sleep_cycle", ts.isoformat()),
+            )
+        except Exception:
+            logger.debug("Could not persist last_sleep_cycle (metadata table may not exist)")
+
     def pause(self) -> None:
         """Pause the consolidation daemon (e.g. during bulk ingestion)."""
         self._pause_event.set()
@@ -166,29 +195,116 @@ class AstrocyteEngine:
                 break
             if self._pause_event.is_set():
                 continue
-            elapsed = (datetime.now(timezone.utc) - self.last_activity).total_seconds()
-            if elapsed > self._settings.IDLE_THRESHOLD_SECONDS:
+
+            now = datetime.now(timezone.utc)
+            elapsed = (now - self.last_activity).total_seconds()
+
+            # Light cycle (every 60s): decay + action log processing
+            light_interval = self._settings.ACTION_LOG_INTERVAL
+            if self._last_light_cycle is None or (
+                (now - self._last_light_cycle).total_seconds() >= light_interval
+            ):
                 try:
-                    self._consolidation_cycle()
+                    self._light_cycle()
                 except Exception:
-                    logger.exception("Consolidation cycle failed")
-                # Extended idle: trigger sleep cycle (less frequent than consolidation)
+                    logger.exception("Light cycle failed")
+                finally:
+                    self._last_light_cycle = now
+
+            # Medium cycle (every 15min): + entity extraction + merge
+            medium_interval = self._settings.MEDIUM_CYCLE_INTERVAL
+            if self._last_medium_cycle is None or (
+                (now - self._last_medium_cycle).total_seconds() >= medium_interval
+            ):
+                try:
+                    self._medium_cycle()
+                except Exception:
+                    logger.exception("Medium cycle failed")
+                finally:
+                    self._last_medium_cycle = now
+
+            # Full cycle: + causal discovery + memify + CLS + compression
+            # Only on idle, and only if there's been new activity since last run
+            if elapsed > self._settings.IDLE_THRESHOLD_SECONDS:
+                if self._last_full_activity != self.last_activity:
+                    try:
+                        self._consolidation_cycle()
+                        self._last_full_activity = self.last_activity
+                    except Exception:
+                        logger.exception("Full consolidation cycle failed")
+                # Extended idle: trigger sleep cycle (also gated by min gap)
                 if elapsed > 2 * self._settings.IDLE_THRESHOLD_SECONDS:
                     self._maybe_sleep_cycle()
 
     def _maybe_sleep_cycle(self) -> None:
-        """Run a full sleep cycle if at least 6 hours since the last one."""
+        """Run a full sleep cycle if minimum gap has elapsed."""
         now = datetime.now(timezone.utc)
+        min_gap = self._settings.SLEEP_CYCLE_MIN_GAP_HOURS
         if self._last_sleep_cycle is not None:
             hours_since = (now - self._last_sleep_cycle).total_seconds() / 3600.0
-            if hours_since < 6.0:
+            if hours_since < min_gap:
                 return
         try:
             stats = self._sleep_engine.run_sleep_cycle()
             self._last_sleep_cycle = now
+            self._save_last_sleep_cycle(now)
             logger.info("Sleep cycle complete: %s", stats)
         except Exception:
             logger.exception("Sleep cycle failed")
+
+    # -- Light cycle (runs during activity) --
+
+    def _light_cycle(self) -> dict:
+        """Lightweight cycle: action log processing + decay only.
+
+        Safe to run while agents are active. Skips the heavier phases
+        (entity extraction, merge, dedup, memify, sleep).
+        """
+        start = time.monotonic()
+        stats = {
+            "memories_updated": 0,
+            "memories_archived": 0,
+            "action_log": {},
+        }
+        self._apply_decay(stats)
+        stats["action_log"] = self._process_action_log()
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if stats["action_log"].get("memories_created", 0) > 0 or stats["memories_archived"] > 0:
+            logger.info(
+                "Light cycle: %d action outcomes stored, %d archived (%.0fms)",
+                stats["action_log"].get("memories_created", 0),
+                stats["memories_archived"],
+                elapsed_ms,
+            )
+        return stats
+
+    # -- Medium cycle (runs during activity, every 15min) --
+
+    def _medium_cycle(self) -> dict:
+        """Medium-weight cycle: entity extraction + merge.
+
+        Keeps the knowledge graph fresh while agents are active.
+        Skips the heaviest phases (causal discovery, memify, CLS,
+        compression, sleep) which only run on idle.
+        """
+        start = time.monotonic()
+        stats = {
+            "memories_added": 0,
+            "memories_updated": 0,
+            "memories_archived": 0,
+            "memories_deleted": 0,
+        }
+        self._process_new_episodes(stats)
+        self._merge_duplicates(stats)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if stats["memories_added"] > 0 or stats["memories_deleted"] > 0:
+            logger.info(
+                "Medium cycle: %d entities extracted, %d duplicates merged (%.0fms)",
+                stats["memories_added"],
+                stats["memories_deleted"],
+                elapsed_ms,
+            )
+        return stats
 
     # -- Core consolidation --
 
@@ -307,12 +423,29 @@ class AstrocyteEngine:
 
     def _apply_decay(self, stats: dict) -> None:
         now = datetime.now(timezone.utc)
+
+        # Prevent double decay when light cycle and full cycle fire in the
+        # same daemon loop iteration (Phase 4 fix for M14)
+        min_gap = self._settings.ACTION_LOG_INTERVAL * 0.9
+        if self._last_decay_time is not None:
+            since_last = (now - self._last_decay_time).total_seconds()
+            if since_last < min_gap:
+                return
+        self._last_decay_time = now
+
         decay = self._settings.DECAY_FACTOR
         cold = self._settings.COLD_THRESHOLD
 
+        heat_updates: list[tuple[int, float]] = []
         for mem in self._storage.get_all_memories_for_decay():
+            if mem.get("is_protected"):
+                continue
+            if mem.get("store_type") == "reference":
+                continue
             try:
                 last = datetime.fromisoformat(mem["last_accessed"])
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 continue
             hours = (now - last).total_seconds() / 3600.0
@@ -321,12 +454,16 @@ class AstrocyteEngine:
                 new_heat = 0.0
                 stats["memories_archived"] += 1
             if abs(new_heat - mem["heat"]) > 1e-9:
-                self._storage.update_memory_heat(mem["id"], new_heat)
+                heat_updates.append((mem["id"], new_heat))
                 stats["memories_updated"] += 1
+        if heat_updates:
+            self._storage.batch_update_heat(heat_updates)
 
         for ent in self._storage.get_all_entities_for_decay():
             try:
                 last = datetime.fromisoformat(ent["last_accessed"])
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 continue
             hours = (now - last).total_seconds() / 3600.0
@@ -510,35 +647,137 @@ class AstrocyteEngine:
 
     # -- Action log processing --
 
-    def _process_action_log(self) -> dict:
-        """Process unprocessed action_log entries into summarized memories.
+    # Patterns for extracting intent from tool summaries
+    _FILE_PATH_IN_SUMMARY = re.compile(
+        r"""(?:["'])?(/[\w./@-]+(?:/[\w./@-]+)+)(?:["'])?"""
+    )
+    _GIT_COMMAND = re.compile(r"\bgit\s+(commit|push|pull|merge|rebase|checkout|branch|stash)")
+    _KUBECTL_COMMAND = re.compile(r"\bkubectl\s+(apply|delete|rollout|scale|exec|get|describe|logs)")
+    _DOCKER_COMMAND = re.compile(r"\bdocker(?:\s+compose)?\s+(up|down|build|push|pull|restart|exec)")
+    _ERROR_IN_SUMMARY = re.compile(r"\b(error|failed|exception|traceback|crash|panic)\b", re.I)
 
-        Groups actions by directory + 30-minute time windows, then creates
-        a summary memory for each group. This is the cold path — the hot
-        path (PostToolCall hook) just writes to action_log.
+    def _extract_outcome(self, actions: list[dict]) -> str | None:
+        """Extract a concise outcome narrative from a group of tool actions.
+
+        Returns None if no meaningful outcome can be inferred (the group
+        should be silently dropped rather than stored as a raw log).
+        """
+        files_read: list[str] = []
+        files_edited: list[str] = []
+        files_created: list[str] = []
+        commands_run: list[str] = []
+        searches: list[str] = []
+        errors_seen: list[str] = []
+
+        for a in actions:
+            tool = a["tool"]
+            summary = a.get("summary", "") or ""
+
+            # Classify by tool type
+            if tool == "Read":
+                m = self._FILE_PATH_IN_SUMMARY.search(summary)
+                if m:
+                    files_read.append(m.group(1))
+            elif tool == "Edit":
+                m = self._FILE_PATH_IN_SUMMARY.search(summary)
+                if m:
+                    files_edited.append(m.group(1))
+            elif tool == "Write":
+                m = self._FILE_PATH_IN_SUMMARY.search(summary)
+                if m:
+                    files_created.append(m.group(1))
+            elif tool in ("Grep", "Glob"):
+                # Extract search pattern
+                pat = summary[:80].strip()
+                if pat:
+                    searches.append(pat)
+            elif tool == "Bash":
+                cmd = summary[:100].strip()
+                if cmd:
+                    commands_run.append(cmd)
+                    if self._ERROR_IN_SUMMARY.search(summary):
+                        errors_seen.append(cmd[:60])
+
+            # Check any summary for error signals
+            if self._ERROR_IN_SUMMARY.search(summary):
+                errors_seen.append(summary[:60])
+
+        # Build narrative from what happened
+        parts: list[str] = []
+
+        if files_edited or files_created:
+            # Most interesting: something was changed
+            all_modified = list(dict.fromkeys(files_edited + files_created))
+            # Dedupe and shorten paths (keep last 2 components)
+            short = ["/".join(p.split("/")[-2:]) for p in all_modified[:5]]
+            verb = "edited" if files_edited else "created"
+            if files_edited and files_created:
+                verb = "modified"
+            parts.append(f"{verb}: {', '.join(short)}")
+
+        # Detect specific workflows
+        git_ops = [self._GIT_COMMAND.search(c) for c in commands_run]
+        git_ops = [m.group(1) for m in git_ops if m]
+        if git_ops:
+            parts.append(f"git: {', '.join(dict.fromkeys(git_ops))}")
+
+        kubectl_ops = [self._KUBECTL_COMMAND.search(c) for c in commands_run]
+        kubectl_ops = [m.group(1) for m in kubectl_ops if m]
+        if kubectl_ops:
+            parts.append(f"kubectl: {', '.join(dict.fromkeys(kubectl_ops))}")
+
+        docker_ops = [self._DOCKER_COMMAND.search(c) for c in commands_run]
+        docker_ops = [m.group(1) for m in docker_ops if m]
+        if docker_ops:
+            parts.append(f"docker: {', '.join(dict.fromkeys(docker_ops))}")
+
+        if errors_seen:
+            parts.append(f"errors encountered: {errors_seen[0]}")
+
+        if searches and not parts:
+            # Pure investigation session — only store if there were many searches
+            if len(searches) >= 3:
+                parts.append(f"investigated: {', '.join(searches[:3])}")
+
+        if files_read and not parts:
+            # Pure reading session — low value, skip unless many files
+            if len(files_read) >= 5:
+                short = ["/".join(p.split("/")[-2:]) for p in files_read[:5]]
+                parts.append(f"reviewed: {', '.join(short)}")
+
+        if not parts:
+            return None
+
+        return "; ".join(parts)
+
+    def _process_action_log(self) -> dict:
+        """Process unprocessed action_log entries into outcome-based memories.
+
+        Groups actions by directory + 30-minute time windows, extracts the
+        intent/outcome of each group, and stores only meaningful narratives.
+        Raw tool-call logs are never stored.
         """
         from datetime import datetime, timezone
 
-        stats = {"processed": 0, "memories_created": 0}
+        stats = {"processed": 0, "memories_created": 0, "skipped_no_outcome": 0}
 
         try:
-            rows = self._storage._conn.execute(
-                "SELECT id, tool_name, tool_input_summary, directory, timestamp "
-                "FROM action_log WHERE processed = 0 "
-                "ORDER BY timestamp ASC LIMIT 200"
-            ).fetchall()
+            entries = self._storage.get_unprocessed_action_log(limit=200)
         except Exception:
             return stats
 
-        if not rows:
+        if not entries:
             return stats
+
+        # Current time bucket — skip it since the window is still open
+        now = datetime.now(timezone.utc)
+        current_bucket = now.strftime("%Y-%m-%d-%H") + f"-{now.minute // 30}"
 
         # Group by directory + 30-min windows
         groups: dict[str, list] = {}
-        for row in rows:
-            directory = row[3] or "unknown"
-            timestamp = row[4]
-            # Create a window key: directory + 30-min bucket
+        for entry in entries:
+            directory = entry["directory"] or "unknown"
+            timestamp = entry["timestamp"]
             try:
                 dt = datetime.fromisoformat(timestamp)
                 bucket = dt.strftime("%Y-%m-%d-%H") + f"-{dt.minute // 30}"
@@ -548,52 +787,66 @@ class AstrocyteEngine:
             if key not in groups:
                 groups[key] = []
             groups[key].append({
-                "id": row[0],
-                "tool": row[1],
-                "summary": row[2],
+                "id": entry["id"],
+                "tool": entry["tool_name"],
+                "summary": entry["tool_input_summary"],
                 "directory": directory,
+                "bucket": bucket,
             })
 
-        # Create a summary memory for each group with 3+ actions
         for key, actions in groups.items():
             directory = actions[0]["directory"]
+            bucket = actions[0]["bucket"]
 
-            # Build action summary
-            tool_counts: dict[str, int] = {}
-            details = []
-            for a in actions:
-                tool_counts[a["tool"]] = tool_counts.get(a["tool"], 0) + 1
-                if a["summary"] and len(details) < 5:
-                    details.append(f"{a['tool']}: {a['summary'][:80]}")
+            # Skip the current (incomplete) time window — process it next cycle
+            if bucket == current_bucket:
+                continue
 
             if len(actions) >= 3:
-                tools_str = ", ".join(f"{t}({c})" for t, c in sorted(tool_counts.items(), key=lambda x: -x[1]))
-                content = f"Session activity [{tools_str}]: {len(actions)} tool calls"
-                if details:
-                    content += "\n" + "\n".join(f"- {d}" for d in details)
+                # Extract outcome narrative instead of raw tool dump
+                outcome = self._extract_outcome(actions)
 
-                # Store as a low-heat episodic memory (will be consolidated normally)
-                embedding = self._embeddings.encode(content)
-                self._storage.insert_memory({
-                    "content": content,
-                    "embedding": embedding,
-                    "tags": ["_action_stream", "_auto"],
-                    "directory_context": directory,
-                    "heat": 0.4,
-                    "is_stale": False,
-                    "file_hash": None,
-                    "embedding_model": self._embeddings.get_model_name(),
-                })
-                stats["memories_created"] += 1
+                if outcome is None:
+                    stats["skipped_no_outcome"] += 1
+                else:
+                    content = f"Work session ({len(actions)} actions): {outcome}"
 
-            # Mark all as processed
+                    # Gate through write gate
+                    gate_pass = True
+                    if self._write_gate is not None:
+                        should_store, _surprisal, _reason = (
+                            self._write_gate.should_store(
+                                content, directory, ["_action_stream", "_auto"]
+                            )
+                        )
+                        if not should_store:
+                            logger.debug(
+                                "Action outcome rejected by write gate: %s",
+                                _reason,
+                            )
+                            gate_pass = False
+
+                    if gate_pass:
+                        embedding = self._embeddings.encode(content)
+                        self._storage.insert_memory({
+                            "content": content,
+                            "embedding": embedding,
+                            "tags": ["_action_outcome", "_auto"],
+                            "directory_context": directory,
+                            "heat": 0.15,
+                            "is_stale": False,
+                            "file_hash": None,
+                            "embedding_model": self._embeddings.get_model_name(),
+                        })
+                        stats["memories_created"] += 1
+
+            # Mark all as processed (even if skipped — prevents reprocessing)
             ids = [a["id"] for a in actions]
             placeholders = ",".join("?" * len(ids))
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 f"UPDATE action_log SET processed = 1 WHERE id IN ({placeholders})",
-                ids,
+                tuple(ids),
             )
             stats["processed"] += len(actions)
 
-        self._storage._conn.commit()
         return stats

@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import tempfile
 
 import pytest
@@ -56,7 +57,7 @@ class TestCheckpoints:
         assert active["current_task"] == "Task 2"
 
         # Only one active checkpoint
-        count = storage._conn.execute(
+        count = storage._test_conn.execute(
             "SELECT COUNT(*) FROM checkpoints WHERE is_active = 1"
         ).fetchone()[0]
         assert count == 1
@@ -186,7 +187,7 @@ class TestCLISubcommands:
     def test_cli_drain(self, temp_db):
         import subprocess
         result = subprocess.run(
-            ["python", "-m", "vaire", "drain", "/test/project", "--db-path", temp_db],
+            [sys.executable, "-m", "vaire", "drain", "/test/project", "--db-path", temp_db],
             capture_output=True, text=True, timeout=120,
         )
         assert result.returncode == 0
@@ -198,12 +199,12 @@ class TestCLISubcommands:
         import subprocess
         # First drain to create a checkpoint
         subprocess.run(
-            ["python", "-m", "vaire", "drain", "/test/project", "--db-path", temp_db],
+            [sys.executable, "-m", "vaire", "drain", "/test/project", "--db-path", temp_db],
             capture_output=True, text=True, timeout=120,
         )
         # Then restore
         result = subprocess.run(
-            ["python", "-m", "vaire", "restore", "/test/project", "--db-path", temp_db],
+            [sys.executable, "-m", "vaire", "restore", "/test/project", "--db-path", temp_db],
             capture_output=True, text=True, timeout=120,
         )
         assert result.returncode == 0
@@ -212,7 +213,7 @@ class TestCLISubcommands:
     def test_cli_restore_empty_db(self, temp_db):
         import subprocess
         result = subprocess.run(
-            ["python", "-m", "vaire", "restore", "/test/project", "--db-path", temp_db],
+            [sys.executable, "-m", "vaire", "restore", "/test/project", "--db-path", temp_db],
             capture_output=True, text=True, timeout=120,
         )
         assert result.returncode == 0

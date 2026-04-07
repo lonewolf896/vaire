@@ -137,7 +137,7 @@ class TestDreamReplay:
         assert stats["insights_generated"] >= 1
 
         # Verify dream insight memory was created
-        dream_mems = storage._conn.execute(
+        dream_mems = storage._test_conn.execute(
             "SELECT * FROM memories WHERE content LIKE 'Dream connection:%'"
         ).fetchall()
         assert len(dream_mems) >= 1
@@ -241,11 +241,11 @@ class TestClusterSummarization:
                 "directory_context": "/project",
                 "heat": 0.7,
             })
-            storage._conn.execute(
+            storage._test_conn.execute(
                 "UPDATE memories SET cluster_id = ? WHERE id = ?",
                 (cluster_id, mid),
             )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         sleep_engine.generate_cluster_summaries()
 
@@ -314,60 +314,6 @@ class TestReembedStale:
         assert count == 0
 
 
-class TestMemoryCompression:
-    def test_old_long_memories_compressed(self, sleep_engine, storage, mock_embeddings):
-        """Old memories with long content should be compressed."""
-        long_content = (
-            "This is a long memory about Python development. "
-            "We worked on vaire/server.py and fixed the API endpoint. "
-            + "This is filler content that does not contain entities. " * 30
-            + "The final fix was in vaire/storage.py which resolved the issue."
-        )
-        old_time = _old_timestamp(60)
-        mid = storage.insert_memory({
-            "content": long_content,
-            "embedding": _make_embedding(1.0),
-            "directory_context": "/proj",
-            "heat": 0.5,
-            "created_at": old_time,
-            "last_accessed": old_time,
-        })
-
-        count = sleep_engine.compress_old_memories(days_threshold=30)
-        assert count >= 1
-
-        mem = storage.get_memory(mid)
-        assert len(mem["content"]) < len(long_content)
-        assert mem["compressed"] is True
-
-    def test_recent_memories_not_compressed(self, sleep_engine, storage):
-        """Recent memories should not be compressed regardless of length."""
-        mid = storage.insert_memory({
-            "content": "x " * 600,  # long but recent
-            "embedding": _make_embedding(1.0),
-            "directory_context": "/proj",
-            "heat": 0.8,
-        })
-
-        count = sleep_engine.compress_old_memories(days_threshold=30)
-        assert count == 0
-
-    def test_short_memories_not_compressed(self, sleep_engine, storage):
-        """Short old memories should not be compressed."""
-        old_time = _old_timestamp(60)
-        storage.insert_memory({
-            "content": "Short memory",
-            "embedding": _make_embedding(1.0),
-            "directory_context": "/proj",
-            "heat": 0.5,
-            "created_at": old_time,
-            "last_accessed": old_time,
-        })
-
-        count = sleep_engine.compress_old_memories(days_threshold=30)
-        assert count == 0
-
-
 class TestFullSleepCycle:
     def test_all_phases_run(self, sleep_engine, storage, mock_embeddings):
         """Full sleep cycle should execute all phases without errors."""
@@ -389,7 +335,6 @@ class TestFullSleepCycle:
         assert "communities" in stats
         assert "cluster_summaries_generated" in stats
         assert "reembedded" in stats
-        assert "compressed" in stats
 
     def test_sleep_cycle_with_empty_db(self, sleep_engine):
         """Sleep cycle should handle an empty database gracefully."""
@@ -398,4 +343,3 @@ class TestFullSleepCycle:
         assert stats["dream_replay"]["pairs_examined"] == 0
         assert stats["communities"] == []
         assert stats["reembedded"] == 0
-        assert stats["compressed"] == 0

@@ -180,7 +180,7 @@ def test_curate_link_moderate(curator, storage, embeddings):
         assert storage.get_memory(original_id) is not None
 
         # Check that a derived_from relationship was created
-        rels = storage._conn.execute(
+        rels = storage._test_conn.execute(
             "SELECT * FROM relationships WHERE relationship_type = 'derived_from'"
         ).fetchall()
         assert len(rels) >= 1
@@ -263,11 +263,11 @@ def test_memify_prune(curator, storage):
         "is_stale": False,
     })
     # Set confidence < 0.3 and access_count = 0
-    storage._conn.execute(
+    storage._test_conn.execute(
         "UPDATE memories SET confidence = 0.2, access_count = 0 WHERE id = ?",
         (mid,),
     )
-    storage._conn.commit()
+    storage._test_conn.commit()
 
     stats = curator.memify_cycle()
     assert stats["pruned"] >= 1
@@ -288,12 +288,12 @@ def test_memify_strengthen(curator, storage):
         "heat": 0.8,
         "is_stale": False,
     })
-    storage._conn.execute(
+    storage._test_conn.execute(
         "UPDATE memories SET access_count = 10, confidence = 0.9, importance = 0.5 "
         "WHERE id = ?",
         (mid,),
     )
-    storage._conn.commit()
+    storage._test_conn.commit()
 
     stats = curator.memify_cycle()
     assert stats["strengthened"] >= 1
@@ -325,7 +325,7 @@ def test_memify_derive(curator, storage):
     assert stats["derived"] >= 1
 
     # Check the derived memory exists
-    rows = storage._conn.execute(
+    rows = storage._test_conn.execute(
         "SELECT * FROM memories WHERE content LIKE '%module.py%utils.py%frequently modified%'"
     ).fetchall()
     assert len(rows) >= 1
@@ -345,12 +345,12 @@ def test_curation_preserves_existing(curator, storage):
         "heat": 0.9,
         "is_stale": False,
     })
-    storage._conn.execute(
+    storage._test_conn.execute(
         "UPDATE memories SET confidence = 0.95, access_count = 3, importance = 0.7 "
         "WHERE id = ?",
         (mid1,),
     )
-    storage._conn.commit()
+    storage._test_conn.commit()
 
     original = storage.get_memory(mid1)
 
@@ -394,7 +394,7 @@ def test_memify_reweight(curator, storage):
     stats = curator.memify_cycle()
     assert stats["reweighted"] >= 1
 
-    row = storage._conn.execute(
+    row = storage._test_conn.execute(
         "SELECT weight FROM relationships WHERE id = ?", (rid,)
     ).fetchone()
     assert row[0] == pytest.approx(6.5, abs=0.01)  # 6.0 + 0.5 boost
@@ -415,7 +415,7 @@ def test_memify_reweight_cold_decay(curator, storage):
     stats = curator.memify_cycle()
     assert stats["reweighted"] >= 1
 
-    row = storage._conn.execute(
+    row = storage._test_conn.execute(
         "SELECT weight FROM relationships WHERE id = ?", (rid,)
     ).fetchone()
     assert row[0] == pytest.approx(2.7, abs=0.01)  # 3.0 * 0.9
@@ -439,7 +439,7 @@ def test_memify_derive_idempotent(curator, storage):
     stats2 = curator.memify_cycle()
     assert stats2["derived"] == 0  # Should not re-derive
 
-    rows = storage._conn.execute(
+    rows = storage._test_conn.execute(
         "SELECT COUNT(*) FROM memories WHERE content LIKE '%a.py%b.py%frequently%'"
     ).fetchone()
     assert rows[0] == 1

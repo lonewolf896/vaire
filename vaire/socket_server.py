@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .crdt_sync import CRDTMemorySync
+    from .token_manager import TokenManager
 
 from .protocol import (
     ProtocolError,
@@ -35,8 +37,10 @@ GROOMER_METHODS: frozenset[str] = frozenset({
     "groom_audit", "groom_inspect", "groom_duplicates", "groom_contradictions",
     "groom_orphans", "groom_stale", "groom_stats",
     "groom_merge", "groom_split", "groom_retag", "groom_reclassify",
+    "groom_forget", "groom_search", "groom_bulk_retag",
+    "groom_content_scan", "groom_provenance", "groom_bulk_update_content",
     "groom_update_content", "groom_promote", "groom_demote", "groom_bulk_delete",
-    "groom_auto",
+    "groom_auto", "groom_sanitize", "groom_sanitize_archives",
 })
 
 
@@ -49,6 +53,29 @@ class ConnectionState:
     agent_id: str = ""
     role: str = "agent"        # "agent" or "groomer"
     request_count: int = 0
+    is_remote: bool = False    # True for HTTPS connections
+    authenticated: bool = False  # True after successful token auth
+
+    # ── Token bucket rate limiter (R2) ──
+    _rate_tokens: float = 20.0
+    _rate_last_refill: float = 0.0
+
+    def check_rate_limit(self, max_per_min: int, burst: int) -> bool:
+        """Return True if the request is allowed, False if rate-limited."""
+        now = time.monotonic()
+        if self._rate_last_refill == 0.0:
+            self._rate_last_refill = now
+            self._rate_tokens = float(burst)
+        elapsed = now - self._rate_last_refill
+        self._rate_tokens = min(
+            float(burst),
+            self._rate_tokens + elapsed * (max_per_min / 60.0),
+        )
+        self._rate_last_refill = now
+        if self._rate_tokens >= 1.0:
+            self._rate_tokens -= 1.0
+            return True
+        return False
 
 
 # ── Server ─────────────────────────────────────────────────────────────────────
@@ -65,6 +92,11 @@ class VaireSocketServer:
         max_clients: int = 32,
         crdt: CRDTMemorySync | None = None,
         groomer_methods: dict[str, Callable[..., Any]] | None = None,
+        approved_groomers: frozenset[str] | None = None,
+        rate_limit_per_minute: int = 120,
+        rate_limit_burst: int = 20,
+        token_manager: TokenManager | None = None,
+        auth_enabled: bool = True,
     ) -> None:
         self._socket_path = socket_path
         self._pid_file = pid_file
@@ -73,6 +105,14 @@ class VaireSocketServer:
         self._max_clients = max_clients
         self._crdt = crdt
         self._groomer_methods: dict[str, Callable[..., Any]] = groomer_methods or {}
+        self._approved_groomers: frozenset[str] = approved_groomers or frozenset()
+        self._rate_limit_per_minute = rate_limit_per_minute
+        self._rate_limit_burst = rate_limit_burst
+        self._token_manager = token_manager
+        self._auth_enabled = auth_enabled
+
+        # Track whether we've warned about missing tokens (log once, not per connection)
+        self._warned_no_tokens = False
 
         self._server: asyncio.Server | None = None
         # Fix #5 — every client task is tracked here; stop() cancels them all.
@@ -198,8 +238,28 @@ class VaireSocketServer:
                         break
                     continue
 
-                # Latch agent identity on the first valid request.
-                if not state.agent_id:
+                # ── Socket auth: validate token on first request ──────────
+                if not state.authenticated:
+                    auth_result = self._authenticate(msg)
+                    if auth_result is None:
+                        # Auth failed — reject and close connection
+                        err = make_error_response(
+                            request_id,
+                            "Authentication failed: invalid or missing token",
+                            code="AUTH_FAILED",
+                        )
+                        try:
+                            await write_message(writer, err)
+                        except (OSError, ConnectionResetError):
+                            pass
+                        break  # close connection on auth failure
+
+                    state.authenticated = True
+                    state.agent_id = auth_result
+                    state.role = self._resolve_role(state.agent_id)
+                elif not state.agent_id:
+                    # Fallback: latch agent identity on first valid request
+                    # (only reached when auth is disabled)
                     state.agent_id = msg["agent_id"]
                     state.role = self._resolve_role(state.agent_id)
 
@@ -231,6 +291,63 @@ class VaireSocketServer:
             except Exception:
                 pass  # Connection may already be dead; nothing more we can do.
 
+    # ── Authentication ────────────────────────────────────────────────────────
+
+    def _authenticate(self, msg: dict[str, Any]) -> str | None:
+        """Validate the auth_token in *msg* and return the verified agent_name.
+
+        Returns:
+            The agent_name (from the token file) if auth succeeds.
+            None if auth fails (invalid token, missing token when required).
+
+        When auth is disabled or no tokens exist yet (migration path),
+        falls back to accepting the self-reported agent_id.
+        """
+        # Auth disabled entirely — accept the self-reported agent_id
+        if not self._auth_enabled:
+            return msg.get("agent_id", "")
+
+        # Auth enabled but no token manager configured — accept (defensive)
+        if self._token_manager is None:
+            return msg.get("agent_id", "")
+
+        # Auth enabled but no tokens exist yet — migration grace period
+        if not self._token_manager.has_tokens():
+            if not self._warned_no_tokens:
+                logger.warning(
+                    "Socket auth is enabled but no tokens exist in %s. "
+                    "Allowing unauthenticated connections until tokens are created. "
+                    "Run 'python -m vaire token create <agent-name>' to create one.",
+                    self._token_manager.tokens_dir,
+                )
+                self._warned_no_tokens = True
+            return msg.get("agent_id", "")
+
+        # Token required — extract and validate
+        auth_token = msg.get("auth_token", "")
+        if not auth_token:
+            logger.warning(
+                "Auth failed: no auth_token in request from self-reported "
+                "agent_id=%r",
+                msg.get("agent_id", "<missing>"),
+            )
+            return None
+
+        agent_name = self._token_manager.validate(auth_token)
+        if agent_name is None:
+            logger.warning(
+                "Auth failed: invalid token from self-reported agent_id=%r",
+                msg.get("agent_id", "<missing>"),
+            )
+            return None
+
+        logger.info(
+            "Auth success: agent_name=%r (self-reported=%r)",
+            agent_name,
+            msg.get("agent_id", "<missing>"),
+        )
+        return agent_name
+
     # ── Dispatch ───────────────────────────────────────────────────────────────
 
     async def _dispatch_message(
@@ -241,6 +358,14 @@ class VaireSocketServer:
         state: ConnectionState,
     ) -> dict[str, Any]:
         """Route *method* to the registered handler, enforcing role checks."""
+        # ── Rate limiting (R2) ──
+        if not state.check_rate_limit(
+            self._rate_limit_per_minute, self._rate_limit_burst
+        ):
+            return make_error_response(
+                request_id, "Rate limit exceeded", code="RATE_LIMITED"
+            )
+
         # ZK-W3: groomer-only methods are never exposed to regular agents.
         if method in GROOMER_METHODS and state.role != "groomer":
             return make_error_response(
@@ -268,22 +393,43 @@ class VaireSocketServer:
         safe_params = {k: v for k, v in params.items() if k != "agent_id"}
 
         try:
-            result = await handler(**safe_params, agent_id=state.agent_id)
+            result = await asyncio.wait_for(
+                handler(**safe_params, agent_id=state.agent_id),
+                timeout=300.0,  # 5-minute handler timeout
+            )
             if not isinstance(result, dict):
                 result = {"result": result}
             return make_ok_response(request_id, result)
+        except asyncio.TimeoutError:
+            logger.error("Handler %s timed out after 300s", method)
+            return make_error_response(
+                request_id, f"Handler {method} timed out", code="TIMEOUT"
+            )
         except Exception as exc:
             logger.exception("Handler %s raised: %s", method, exc)
+            # R5: Sanitize error messages — don't expose internals to remote clients
+            if state.is_remote:
+                error_msg = f"Internal error in {method}"
+            else:
+                error_msg = str(exc)
             return make_error_response(
-                request_id, str(exc), code="HANDLER_ERROR"
+                request_id, error_msg, code="HANDLER_ERROR"
             )
 
     # ── Role resolution ────────────────────────────────────────────────────────
 
     def _resolve_role(self, agent_id: str) -> str:
-        """Return 'groomer' if agent_id carries the groomer prefix, else 'agent'."""
-        if agent_id.startswith(self._groomer_id_prefix):
-            return "groomer"
+        """Return 'groomer' if agent_id is in the approved groomers list.
+
+        R10 hardening: when no allowlist is configured, groomer role is
+        DENIED entirely.  The old prefix-based fallback was too permissive
+        — any agent could self-assign groomer by choosing an agent_id
+        starting with 'groomer-'.
+        """
+        if self._approved_groomers:
+            if agent_id in self._approved_groomers:
+                return "groomer"
+        # No prefix fallback — require explicit allowlist
         return "agent"
 
     # ── PID file helpers ───────────────────────────────────────────────────────

@@ -74,18 +74,18 @@ def _make_memory(
 
     if updates:
         set_clauses = ", ".join(f"{k} = ?" for k in updates)
-        storage._conn.execute(
+        storage._test_conn.execute(
             f"UPDATE memories SET {set_clauses} WHERE id = ?",
             (*updates.values(), mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
     if created_at is not None:
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET created_at = ? WHERE id = ?",
             (created_at.isoformat(), mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
     return mid
 

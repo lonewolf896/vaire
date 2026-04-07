@@ -39,6 +39,19 @@ def _get_engram_class():
 
 logger = logging.getLogger(__name__)
 
+# Compliance keyword detection for reference store_type demotion
+_COMPLIANCE_RE = re.compile(
+    r"\b(?:NIST|800-53|CSF|compliance|control\s+baseline|policy|"
+    r"security\s+control|SP\s+800|FISMA|FedRAMP|RMF)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_compliance_query(query: str) -> bool:
+    """Return True if query references compliance/standards topics."""
+    return bool(_COMPLIANCE_RE.search(query))
+
+
 # Lightweight entity extraction for queries (subset of consolidation patterns)
 _WORD_RE = re.compile(r"\b[A-Z][\w]*(?:[A-Z][\w]*)*\b")  # CamelCase
 _PATH_RE = re.compile(r"(?:\.{0,2}/)?(?:[\w@.-]+/)+[\w@.-]+\.\w+")
@@ -838,12 +851,9 @@ class HippoRetriever:
 
         memory_scores: dict[int, float] = defaultdict(float)
         for entity_id, score in entity_scores:
-            entity = self._storage._conn.execute(
-                "SELECT name FROM entities WHERE id = ?", (entity_id,)
-            ).fetchone()
-            if not entity:
+            entity_name = self._storage.get_entity_name(entity_id)
+            if not entity_name:
                 continue
-            entity_name = entity[0]
             # Find memories containing this entity name via FTS5
             associated = self._find_memories_for_entity(entity_name)
             for mid in associated:
@@ -933,11 +943,9 @@ class HippoRetriever:
                     activation = spread_factor ** current_depth
 
                     # Find memories for this neighbor entity
-                    entity_row = self._storage._conn.execute(
-                        "SELECT name FROM entities WHERE id = ?", (nid,)
-                    ).fetchone()
-                    if entity_row:
-                        mids = self._find_memories_for_entity(entity_row[0])
+                    neighbor_name = self._storage.get_entity_name(nid)
+                    if neighbor_name:
+                        mids = self._find_memories_for_entity(neighbor_name)
                         for mid in mids:
                             if mid not in seed_memory_set:
                                 activated[mid] = max(
@@ -953,7 +961,8 @@ class HippoRetriever:
     # -- d. Unified Recall --
 
     def recall(
-        self, query: str, max_results: int = 5, min_heat: float = 0.1
+        self, query: str, max_results: int = 5, min_heat: float = 0.1,
+        fast: bool = False,
     ) -> list[dict]:
         """Combine retrieval signals via Weighted Reciprocal Rank Fusion (WRRF).
 
@@ -1177,20 +1186,15 @@ class HippoRetriever:
                         candidate_ids = list(scores.keys()) if scores else []
                         if not candidate_ids:
                             # If no candidates from other signals, get recent memories
-                            all_mems = self._storage._conn.execute(
-                                "SELECT id FROM memories WHERE heat > ? LIMIT ?",
-                                (min_heat, candidate_k),
-                            ).fetchall()
-                            candidate_ids = [r[0] for r in all_mems]
+                            candidate_ids = self._storage.get_memory_ids_by_heat(
+                                min_heat, candidate_k
+                            )
 
                         hdc_candidates: list[tuple[int, "np.ndarray"]] = []
                         for mid in candidate_ids:
-                            row = self._storage._conn.execute(
-                                "SELECT hdc_vector FROM memories WHERE id = ?",
-                                (mid,),
-                            ).fetchone()
-                            if row and row[0] is not None:
-                                hdc_vec = self._hdc.from_bytes(row[0])
+                            hdc_raw = self._storage.get_hdc_vector(mid)
+                            if hdc_raw is not None:
+                                hdc_vec = self._hdc.from_bytes(hdc_raw)
                                 hdc_candidates.append((mid, hdc_vec))
 
                         if hdc_candidates:
@@ -1381,80 +1385,86 @@ class HippoRetriever:
             mem = self._storage.get_memory(mid)
             if mem and mem["heat"] >= min_heat:
                 mem["_retrieval_score"] = round(total_score, 4)
-                mem.pop("embedding", None)
+                for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+                    mem.pop(_bf, None)
                 result_memories.append(mem)
                 seen_ids.add(mid)
             if len(result_memories) >= rerank_pool:
                 break
 
-        # Inject top signal-specific results for CE pool diversity
-        # This ensures CE sees the best FTS/vector candidates even if
-        # they didn't rank in the fused top-K
-        if getattr(self._settings, 'CROSS_ENCODER_ENABLED', False):
-            diversity_k = getattr(self._settings, 'CE_DIVERSITY_INJECT_K', 10)
-            if open_domain_mode:
-                diversity_k = max(diversity_k, 15)
-            for sig in ["fts", "vector"]:
-                top_sig = sorted(
-                    [(mid, s[sig]) for mid, s in scores.items() if s[sig] > 0],
-                    key=lambda x: x[1], reverse=True,
-                )[:diversity_k]
-                for mid, _ in top_sig:
-                    if mid not in seen_ids:
-                        mem = self._storage.get_memory(mid)
-                        if mem and mem["heat"] >= min_heat:
-                            mem["_retrieval_score"] = round(fused_scores.get(mid, 0.0), 4)
-                            mem.pop("embedding", None)
-                            result_memories.append(mem)
-                            seen_ids.add(mid)
+        # Demote reference store_type memories unless compliance query
+        if not _is_compliance_query(query):
+            for mem in result_memories:
+                if mem.get("store_type") == "reference":
+                    mem["_retrieval_score"] = round(
+                        mem.get("_retrieval_score", 0.0) * 0.5, 4
+                    )
 
-        # Heuristic reranker
+        # Heuristic reranker (lightweight — always runs)
         if self._settings.RERANKER_ENABLED:
-            # When CE follows, don't clip yet — let CE see the full pool
             heuristic_k = max_results
-            if getattr(self._settings, 'CROSS_ENCODER_ENABLED', False):
-                heuristic_k = None  # Uses RERANKER_TOP_K (50)
+            if not fast and getattr(self._settings, 'CROSS_ENCODER_ENABLED', False):
+                heuristic_k = None  # Uses RERANKER_TOP_K (50) — feed more to CE
             result_memories = self._heuristic_rerank(result_memories, query, top_k=heuristic_k)
 
-        # Comparison dual search: merge extra candidates for "A or B?" queries
-        comparison_options = query_analysis.get("comparison_options", [])
-        if (
-            getattr(self._settings, "COMPARISON_DUAL_SEARCH_ENABLED", False)
-            and comparison_options
-        ):
-            subject = query_analysis.get("named_entities", [None])[0] if query_analysis.get("named_entities") else None
-            comp_results = self._comparison_dual_search(
-                query, comparison_options, subject, max_results,
-            )
-            for r in comp_results:
-                rid = r.get("id", -1)
-                if rid not in seen_ids:
-                    r.setdefault("_retrieval_score", 0.0)
-                    r.pop("embedding", None)
-                    result_memories.append(r)
-                    seen_ids.add(rid)
+        # ── Deep reranking (skipped in fast mode) ──────────────────────────
+        if not fast:
+            # Inject top signal-specific results for CE pool diversity
+            if getattr(self._settings, 'CROSS_ENCODER_ENABLED', False):
+                diversity_k = getattr(self._settings, 'CE_DIVERSITY_INJECT_K', 10)
+                if open_domain_mode:
+                    diversity_k = max(diversity_k, 15)
+                for sig in ["fts", "vector"]:
+                    top_sig = sorted(
+                        [(mid, s[sig]) for mid, s in scores.items() if s[sig] > 0],
+                        key=lambda x: x[1], reverse=True,
+                    )[:diversity_k]
+                    for mid, _ in top_sig:
+                        if mid not in seen_ids:
+                            mem = self._storage.get_memory(mid)
+                            if mem and mem["heat"] >= min_heat:
+                                mem["_retrieval_score"] = round(fused_scores.get(mid, 0.0), 4)
+                                for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+                                    mem.pop(_bf, None)
+                                result_memories.append(mem)
+                                seen_ids.add(mid)
 
-        # Cross-encoder reranker (FlashRank ONNX — fast CPU inference)
-        # Feed the raw query directly — CE performs best with the original question.
-        # CE query augmentation (concatenating HyDE expansion) was tested and HURTS MRR.
-        if getattr(self._settings, 'CROSS_ENCODER_ENABLED', False):
-            result_memories = self._cross_encoder_rerank(result_memories, query)
+            # Comparison dual search: merge extra candidates for "A or B?" queries
+            comparison_options = query_analysis.get("comparison_options", [])
+            if (
+                getattr(self._settings, "COMPARISON_DUAL_SEARCH_ENABLED", False)
+                and comparison_options
+            ):
+                subject = query_analysis.get("named_entities", [None])[0] if query_analysis.get("named_entities") else None
+                comp_results = self._comparison_dual_search(
+                    query, comparison_options, subject, max_results,
+                )
+                for r in comp_results:
+                    rid = r.get("id", -1)
+                    if rid not in seen_ids:
+                        r.setdefault("_retrieval_score", 0.0)
+                        r.pop("embedding", None)
+                        result_memories.append(r)
+                        seen_ids.add(rid)
 
-        # NLI entailment scoring: complementary signal to CE for open-domain queries
-        if (getattr(self._settings, 'NLI_RERANKING_ENABLED', False)
-                and (not self._settings.NLI_ONLY_FOR_OPEN_DOMAIN or open_domain_mode)):
-            result_memories = self._nli_rerank(query, result_memories)
-            # Blend NLI with CE score
-            nli_weight = self._settings.NLI_WEIGHT
-            for mem in result_memories:
-                ce = mem.get("_cross_encoder_score", 0)
-                nli = mem.get("_nli_entailment_score", 0)
-                mem["_retrieval_score"] = (1 - nli_weight) * ce + nli_weight * nli
-            result_memories.sort(key=lambda m: m.get("_retrieval_score", 0), reverse=True)
+            # Cross-encoder reranker
+            if getattr(self._settings, 'CROSS_ENCODER_ENABLED', False):
+                result_memories = self._cross_encoder_rerank(result_memories, query)
 
-        # Multi-passage evidence aggregation: boost scattered evidence clusters
-        if getattr(self._settings, 'MULTI_PASSAGE_RERANKING_ENABLED', False):
-            result_memories = self._multi_passage_rerank(query, result_memories, max_results)
+            # NLI entailment scoring
+            if (getattr(self._settings, 'NLI_RERANKING_ENABLED', False)
+                    and (not self._settings.NLI_ONLY_FOR_OPEN_DOMAIN or open_domain_mode)):
+                result_memories = self._nli_rerank(query, result_memories)
+                nli_weight = self._settings.NLI_WEIGHT
+                for mem in result_memories:
+                    ce = mem.get("_cross_encoder_score", 0)
+                    nli = mem.get("_nli_entailment_score", 0)
+                    mem["_retrieval_score"] = (1 - nli_weight) * ce + nli_weight * nli
+                result_memories.sort(key=lambda m: m.get("_retrieval_score", 0), reverse=True)
+
+            # Multi-passage evidence aggregation
+            if getattr(self._settings, 'MULTI_PASSAGE_RERANKING_ENABLED', False):
+                result_memories = self._multi_passage_rerank(query, result_memories, max_results)
 
         # Profile and belief search: merge structured knowledge after CE reranking
         directory = ""
@@ -1628,7 +1638,8 @@ class HippoRetriever:
                 for mid, distance in vec_hits:
                     mem = self._storage.get_memory(mid)
                     if mem:
-                        mem.pop("embedding", None)
+                        for _bf in ("embedding", "hdc_vector", "implicit_embedding"):
+                            mem.pop(_bf, None)
                         vec_results.append(mem)
             # Also do FTS
             fts_results = self._storage.search_memories_fts(
@@ -2011,6 +2022,8 @@ class HippoRetriever:
             hypothesis = _question_to_statement(query)
             pairs = [(m["content"][:512], hypothesis) for m in memories]
             scores = self._nli_model.predict(pairs)  # Shape: (n, 3) for [contradiction, neutral, entailment]
+            if scores is None:
+                return memories
 
             for i, mem in enumerate(memories):
                 if hasattr(scores[i], '__len__') and len(scores[i]) == 3:
@@ -2347,22 +2360,7 @@ class HippoRetriever:
 
     def _find_memories_for_entity(self, entity_name: str) -> list[int]:
         """Find memory IDs whose content contains the entity name."""
-        # Use FTS5 for efficient text search
-        try:
-            rows = self._storage._conn.execute(
-                "SELECT m.id FROM memories m "
-                "JOIN memories_fts fts ON m.id = fts.rowid "
-                "WHERE memories_fts MATCH ? AND m.heat > 0",
-                (f'"{entity_name}"',),
-            ).fetchall()
-            return [r[0] for r in rows]
-        except Exception:
-            # Fallback to LIKE search if FTS5 match fails
-            rows = self._storage._conn.execute(
-                "SELECT id FROM memories WHERE content LIKE ? AND heat > 0",
-                (f"%{entity_name}%",),
-            ).fetchall()
-            return [r[0] for r in rows]
+        return self._storage.find_memories_mentioning(entity_name)
 
     def _find_entities_in_content(self, content: str) -> set[int]:
         """Find entity IDs that appear in the given content."""
@@ -2388,12 +2386,9 @@ class HippoRetriever:
         for eid in content_entities:
             neighbors = self._graph._get_adjacent(eid, None)
             for n in neighbors:
-                entity_row = self._storage._conn.execute(
-                    "SELECT name FROM entities WHERE id = ?",
-                    (n["entity_id"],),
-                ).fetchone()
-                if entity_row and n["entity_id"] not in content_entities:
-                    partner_counts[entity_row[0]] += n["weight"]
+                entity_name = self._storage.get_entity_name(n["entity_id"])
+                if entity_name and n["entity_id"] not in content_entities:
+                    partner_counts[entity_name] += n["weight"]
 
         # Sort by weight and return top
         sorted_partners = sorted(

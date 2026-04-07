@@ -171,18 +171,73 @@ Ingested chunks use `importance=0.8`, keeping them warm for ~59 days without acc
 | `get_rules` | List active rules |
 | `create_trigger` | Set prospective triggers that fire when matching context appears |
 
+### Reference documents
+
+| Tool | What it does |
+|---|---|
+| `load_reference` | Load NIST standards, directives, or operational reference docs from the static library |
+
+```
+# List all available references
+load_reference(show_index=True)
+
+# Load a specific NIST control family
+load_reference(topic="800-53:AC")
+
+# Load a specific control
+load_reference(topic="800-53:AC", section="AC-17")
+
+# Filter by category
+load_reference(show_index=True, category="nist")
+```
+
+Available categories: `nist` (800-53 families, CSF, NICE, AI 100-2, baselines), `operational` (OSINT sources), `directives` (governance documents).
+
+### Task management
+
+| Tool | What it does |
+|---|---|
+| `task_list` | List tasks, filter by status (`open`, `in_progress`, `done`, `on_hold`) and/or role |
+| `task_get` | Full task details including acceptance criteria and history |
+| `task_create` | Create a task with title, role, priority, acceptance criteria |
+| `task_claim` | Claim an open task — one-at-a-time enforcement, starts heartbeat |
+| `task_update` | Update progress, mark criteria done, add files/blockers (owner-only) |
+| `task_complete` | Mark done with result summary (owner-only) |
+| `task_release` | Release back to open pool (owner-only) |
+
+Tasks are local-first (`/data/tasks.json`). Optional GitLab sync pushes every 30s when `VAIRE_GITLAB_API_URL`, `VAIRE_GITLAB_PROJECT_ID`, and `VAIRE_GITLAB_TOKEN` are set.
+
 ### Maintenance
 
 | Tool | What it does |
 |---|---|
-| `consolidate_now` | Force a background consolidation cycle (entity extraction, dream replay, dedup) |
+| `consolidate_now` | Force a full consolidation cycle (entity extraction, dream replay, dedup) |
 | `memory_stats` | System statistics across all subsystems |
+
+---
+
+## How consolidation works
+
+Vaire's consolidation daemon runs continuously on three tiers, designed for always-on operation with multiple agents checking in concurrently:
+
+| Tier | Interval | What it does | Runs during activity? |
+|---|---|---|---|
+| **Light** | 60s | Heat decay + action log outcome extraction | Yes |
+| **Medium** | 15min | Entity extraction + duplicate merging | Yes |
+| **Full** | 5min idle | Causal discovery + memify + CLS + compression | No |
+| **Sleep** | 6h min gap | Dream replay + community detection + temporal compression | No |
+
+**Action log processing** transforms raw tool calls into outcome narratives. Instead of storing "Bash: kubectl get pods; Read: values.yaml; Edit: deployment.yaml", it extracts "edited: deployment.yaml; kubectl: apply, rollout." Only complete 30-minute time windows are processed — the current bucket stays open until it closes.
+
+**Outcome extraction** passes through the write gate, so redundant work sessions are filtered. A specificity filter ensures derived patterns only use code identifiers (file paths, function names, error types) rather than generic words.
+
+All intervals are configurable via environment variables (`VAIRE_ACTION_LOG_INTERVAL`, `VAIRE_MEDIUM_CYCLE_INTERVAL`, `VAIRE_SLEEP_CYCLE_MIN_GAP_HOURS`). The sleep cycle timestamp is persisted to the database so it survives container restarts.
 
 ---
 
 ## Tips
 
-**Let the hooks do the work.** If you've installed the hooks, you rarely need to call `remember` manually. The PostToolUse hook captures every action, and the consolidation daemon processes the raw action log into real memories.
+**Let the hooks do the work.** If you've installed the hooks, you rarely need to call `remember` manually. The PostToolUse hook captures every action, and the consolidation daemon transforms the raw action log into outcome-based memories automatically.
 
 **Pin decisions early.** When you make an architecture decision, ask Claude to anchor or rate it with high importance. Decisions that aren't pinned will eventually decay if not accessed.
 
@@ -190,4 +245,4 @@ Ingested chunks use `importance=0.8`, keeping them warm for ~59 days without acc
 
 **Check coverage before deep work.** Before starting a complex task, use `assess_coverage` to see what Vaire knows and what gaps exist. This tells you whether you need to ingest more context first.
 
-**Force consolidation after heavy sessions.** Consolidation runs automatically on idle, but after a long session with many actions, calling `consolidate_now` ensures entities and relationships are extracted promptly.
+**`consolidate_now` is rarely needed.** The three-tier daemon handles consolidation continuously. Use it only after bulk ingestion or when you need entities extracted immediately.

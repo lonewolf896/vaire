@@ -100,10 +100,7 @@ class AstrocytePool:
                     "memory_ids": [],
                     "entity_ids": [],
                 })
-                proc = self._storage._conn.execute(
-                    "SELECT * FROM astrocyte_processes WHERE id = ?", (proc_id,)
-                ).fetchone()
-                proc = self._storage._row_to_dict(proc)
+                proc = self._storage.get_astrocyte_process(proc_id)
 
             self._processes[domain_name] = proc
 
@@ -200,6 +197,12 @@ class AstrocytePool:
                 continue
 
             stats["memories_processed"] += 1
+
+            if mem.get("is_protected"):
+                continue
+
+            if mem.get("store_type") == "reference":
+                continue
 
             try:
                 last = datetime.fromisoformat(mem["last_accessed"])

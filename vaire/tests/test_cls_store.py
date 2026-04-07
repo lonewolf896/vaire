@@ -64,11 +64,11 @@ def _make_memory(
     mid = storage.insert_memory(mem)
 
     # Set store_type
-    storage._conn.execute(
+    storage._test_conn.execute(
         "UPDATE memories SET store_type = ? WHERE id = ?",
         (store_type, mid),
     )
-    storage._conn.commit()
+    storage._test_conn.commit()
 
     return mid
 

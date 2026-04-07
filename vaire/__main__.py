@@ -1,6 +1,7 @@
 """Entry point for python -m vaire."""
 
 import argparse
+import configparser
 import sys
 from pathlib import Path
 
@@ -140,29 +141,46 @@ def cmd_capture(args):
         sys.exit(0)  # nothing meaningful to capture
 
     conn = sqlite3.connect(str(db_path), timeout=1)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS action_log("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "tool_name TEXT NOT NULL,"
-        "tool_input_summary TEXT DEFAULT '',"
-        "directory TEXT DEFAULT '',"
-        "session_id TEXT DEFAULT '',"
-        "timestamp TEXT NOT NULL,"
-        "processed INTEGER DEFAULT 0)"
-    )
-    conn.execute(
-        "INSERT INTO action_log (tool_name, tool_input_summary, directory, session_id, timestamp) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (
-            tool_name,
-            summary,
-            directory,
-            session_id,
-            datetime.now(timezone.utc).isoformat(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS action_log("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "tool_name TEXT NOT NULL,"
+            "tool_input_summary TEXT DEFAULT '',"
+            "directory TEXT DEFAULT '',"
+            "session_id TEXT DEFAULT '',"
+            "timestamp TEXT NOT NULL,"
+            "processed INTEGER DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO action_log (tool_name, tool_input_summary, directory, session_id, timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                tool_name,
+                summary,
+                directory,
+                session_id,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _load_approved_groomers(settings) -> frozenset[str]:
+    """Load approved groomer agent_ids from ~/.vaire/vaire.ini.
+
+    Falls back to empty set (prefix-based matching) if the file
+    doesn't exist or has no [groomer] approved entry.
+    """
+    ini_path = Path(settings.DB_PATH).expanduser().parent / "vaire.ini"
+    if not ini_path.exists():
+        return frozenset()
+    cfg = configparser.ConfigParser()
+    cfg.read(ini_path)
+    raw = cfg.get("groomer", "approved", fallback="")
+    return frozenset(g.strip() for g in raw.split(",") if g.strip())
 
 
 def cmd_server(args):
@@ -175,26 +193,44 @@ def cmd_server(args):
         build_dispatch_table,
         build_groomer_dispatch,
         build_ingest_dispatch,
+        build_task_dispatch,
         init_engines,
+        run_https,
         shutdown,
     )
     import vaire.server as _server_mod
     from vaire.socket_server import VaireSocketServer
+    from vaire.token_manager import TokenManager
 
     settings = get_settings()
+
+    _shutdown_event = asyncio.Event()
 
     async def _run():
         # Engine initialisation happens inside the event loop so that
         # asyncio.create_task() in WriteQueue.start() has a running loop.
         init_engines(db_path=args.db_path, start_daemons=True)
 
-        # Register SIGTERM only after engines are fully initialised so the
-        # handler calls shutdown() on a consistent, fully-constructed state.
-        _signal.signal(_signal.SIGTERM, lambda sig, frame: (shutdown(), sys.exit(0)))
+        loop = asyncio.get_running_loop()
+
+        # Register SIGTERM/SIGINT after engines are fully initialised.
+        # Set an event flag so the event loop can shut down gracefully
+        # (drain write queue, stop server) instead of calling sys.exit().
+        for sig in (_signal.SIGTERM, _signal.SIGINT):
+            loop.add_signal_handler(sig, _shutdown_event.set)
 
         dispatch = build_dispatch_table()
         dispatch.update(build_ingest_dispatch(_server_mod._pipeline))
+        dispatch.update(build_task_dispatch())
         groomer = build_groomer_dispatch()
+
+        # Load approved groomers from ini file (not in code — runtime config)
+        approved = _load_approved_groomers(settings)
+
+        # Initialise token manager for socket authentication
+        token_manager = TokenManager(
+            str(settings.socket_auth_tokens_dir_resolved)
+        )
 
         server = VaireSocketServer(
             socket_path=str(settings.socket_path_resolved),
@@ -202,11 +238,33 @@ def cmd_server(args):
             dispatch_table=dispatch,
             groomer_methods=groomer,
             max_clients=settings.MAX_CLIENTS,
+            approved_groomers=approved,
+            rate_limit_per_minute=settings.RATE_LIMIT_PER_MINUTE,
+            rate_limit_burst=settings.RATE_LIMIT_BURST,
+            token_manager=token_manager,
+            auth_enabled=settings.SOCKET_AUTH_ENABLED,
         )
 
         await server.start()
         try:
-            await server.serve_forever()
+            tasks: set[asyncio.Task] = set()
+            serve_task = asyncio.create_task(server.serve_forever())
+            tasks.add(serve_task)
+
+            # Start mTLS HTTPS server alongside the socket server if configured
+            if settings.tls_enabled:
+                https_task = asyncio.create_task(run_https(settings))
+                tasks.add(https_task)
+
+            shutdown_task = asyncio.create_task(_shutdown_event.wait())
+            tasks.add(shutdown_task)
+
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
         finally:
             await server.stop()
             await async_shutdown()  # drain write queue before tearing down
@@ -231,6 +289,8 @@ def cmd_health(args):
     """Health check — ping the socket server and exit 0 (healthy) or 1 (unhealthy).
 
     Designed for use as a Docker HEALTHCHECK. Imports no ML models.
+    Verifies the socket accepts a fresh connection AND the response has
+    expected structure (not just that the process is alive).
     """
     import asyncio
     import logging
@@ -246,14 +306,70 @@ def cmd_health(args):
     async def _check() -> bool:
         client = VaireClient(socket_path, call_timeout=4.0)
         try:
-            await client.call("memory_stats", {})
+            result = await client.call("memory_stats", {})
             await client.disconnect()
-            return True
         except Exception:
             return False
 
+        # Validate response structure — not just "no exception"
+        if not isinstance(result, dict):
+            return False
+        if "total_memories" not in result:
+            return False
+
+        return True
+
     ok = asyncio.run(_check())
     sys.exit(0 if ok else 1)
+
+
+def cmd_token(args):
+    """Manage socket authentication tokens."""
+    from vaire.config import get_settings
+    from vaire.token_manager import TokenManager
+
+    settings = get_settings()
+    tokens_dir = args.tokens_dir or str(settings.socket_auth_tokens_dir_resolved)
+    manager = TokenManager(tokens_dir)
+
+    action = args.token_action
+    if action == "create":
+        agent_name = args.agent_name
+        try:
+            secret = manager.create(agent_name)
+            print(f"Token created for agent: {agent_name}")
+            print(f"Secret: {secret}")
+            print(f"Token file: {manager.tokens_dir / f'{agent_name}.token'}")
+            print()
+            print("The client will auto-detect this token if the tokens")
+            print("directory is the default (~/.vaire/tokens/).")
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    elif action == "revoke":
+        agent_name = args.agent_name
+        if manager.revoke(agent_name):
+            print(f"Token revoked for agent: {agent_name}")
+        else:
+            print(f"No token found for agent: {agent_name}", file=sys.stderr)
+            sys.exit(1)
+
+    elif action == "list":
+        tokens = manager.list_tokens()
+        if not tokens:
+            print("No tokens found.")
+            return
+        print(f"{'Agent Name':<30} {'Created':<25} {'Path'}")
+        print("-" * 90)
+        from datetime import datetime, timezone
+        for t in tokens:
+            created = datetime.fromtimestamp(t.created_at, tz=timezone.utc)
+            print(f"{t.agent_name:<30} {created.isoformat():<25} {t.token_path}")
+
+    else:
+        print(f"Unknown token action: {action}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_context(args):
@@ -272,22 +388,23 @@ def cmd_context(args):
 
     directory = args.directory
     conn = sqlite3.connect(str(db_path), timeout=2)
-    conn.row_factory = sqlite3.Row
+    try:
+        conn.row_factory = sqlite3.Row
 
-    hot = conn.execute(
-        "SELECT content, heat FROM memories "
-        "WHERE directory_context = ? AND heat > 0.5 "
-        "ORDER BY heat DESC LIMIT 6",
-        (directory,),
-    ).fetchall()
+        hot = conn.execute(
+            "SELECT content, heat FROM memories "
+            "WHERE directory_context = ? AND heat > 0.5 "
+            "ORDER BY heat DESC LIMIT 6",
+            (directory,),
+        ).fetchall()
 
-    anchored = conn.execute(
-        "SELECT content FROM memories "
-        "WHERE is_protected = 1 AND heat > 0 AND tags LIKE '%_anchor%' "
-        "ORDER BY created_at DESC"
-    ).fetchall()
-
-    conn.close()
+        anchored = conn.execute(
+            "SELECT content FROM memories "
+            "WHERE is_protected = 1 AND heat > 0 AND tags LIKE '%_anchor%' "
+            "ORDER BY created_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
 
     if not hot and not anchored:
         return
@@ -359,6 +476,17 @@ def cli():
                                 help="Read tool_name/session_id/tool_input from Claude Code JSON on stdin")
     capture_parser.add_argument("--db-path", type=str, default=None, help="SQLite database path")
 
+    # token subcommand — manage socket auth tokens
+    token_parser = subparsers.add_parser("token", help="Manage socket auth tokens")
+    token_parser.add_argument("--tokens-dir", type=str, default=None,
+                              help="Tokens directory (default: VAIRE_SOCKET_AUTH_TOKENS_DIR)")
+    token_sub = token_parser.add_subparsers(dest="token_action")
+    token_create = token_sub.add_parser("create", help="Create a new agent token")
+    token_create.add_argument("agent_name", help="Agent name (becomes the file stem)")
+    token_revoke = token_sub.add_parser("revoke", help="Revoke an agent token")
+    token_revoke.add_argument("agent_name", help="Agent name to revoke")
+    token_sub.add_parser("list", help="List all agent tokens")
+
     # health subcommand (used by Docker HEALTHCHECK)
     subparsers.add_parser("health", help="Ping the socket server; exits 0 if healthy")
 
@@ -385,6 +513,11 @@ def cli():
         cmd_context(args)
     elif args.command == "health":
         cmd_health(args)
+    elif args.command == "token":
+        if not getattr(args, "token_action", None):
+            print("Usage: python -m vaire token {create|revoke|list}", file=sys.stderr)
+            sys.exit(1)
+        cmd_token(args)
     else:
         # Default: run MCP server
         if not args.quiet and args.transport != "stdio":

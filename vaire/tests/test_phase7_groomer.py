@@ -123,6 +123,88 @@ class TestAuditTools:
         result = groomer.find_contradictions()
         assert isinstance(result, list)
 
+    def test_find_contradictions_skips_long_memories(self, groomer, storage):
+        """Long multi-topic memories (>2000 chars) should be excluded."""
+        long_content = "We use Python. " * 200  # ~3000 chars, multi-topic reference doc
+        _insert(storage, long_content)
+        _insert(storage, "We don't use Python, we prefer Go for services.")
+        result = groomer.find_contradictions()
+        # Long memory should be skipped entirely — no pairs involving it
+        assert all(
+            len(r["content_a"]) <= 2000 and len(r["content_b"]) <= 2000
+            for r in result
+        )
+
+    def test_find_contradictions_requires_shared_ratio(self, groomer, storage):
+        """Two memories sharing only common words but different topics should not match."""
+        # These share "deploy" and "kubernetes" but are about very different things
+        _insert(storage, "We deploy kubernetes pods using helm charts on the production cluster every week.")
+        _insert(storage, "We don't deploy kubernetes operators manually; we use gitops automation instead.")
+        result = groomer.find_contradictions()
+        # With the shared ratio check, these may still match (high overlap).
+        # But unrelated topics sharing just 2-3 generic words should not.
+        _insert(storage, "The coffee machine in the break room uses filtered water from the tap system.")
+        _insert(storage, "We don't use the elevator during fire drills according to safety protocol.")
+        result2 = groomer.find_contradictions()
+        # Coffee machine vs fire drill — minimal topical overlap despite sharing "use"
+        unrelated_pairs = [
+            r for r in result2
+            if ("coffee" in r["content_a"] and "elevator" in r["content_b"])
+            or ("elevator" in r["content_a"] and "coffee" in r["content_b"])
+        ]
+        assert len(unrelated_pairs) == 0
+
+    def test_find_contradictions_embedding_gate(self, groomer, storage, embeddings):
+        """When embeddings exist, low-similarity pairs should be filtered out."""
+        import struct
+        # Create two memories with embeddings that have low similarity
+        low_sim_emb1 = struct.pack(f"{384}f", *([1.0] + [0.0] * 383))
+        low_sim_emb2 = struct.pack(f"{384}f", *([0.0] + [1.0] + [0.0] * 382))
+        embeddings.similarity.return_value = 0.1  # Very low similarity
+
+        mid1 = storage.insert_memory({
+            "content": "We use Python for backend services in our platform.",
+            "embedding": low_sim_emb1,
+            "tags": [],
+            "directory_context": "/tmp",
+            "heat": 1.0,
+        })
+        mid2 = storage.insert_memory({
+            "content": "We don't use Python, we prefer Rust for backend work.",
+            "embedding": low_sim_emb2,
+            "tags": [],
+            "directory_context": "/tmp",
+            "heat": 1.0,
+        })
+        result = groomer.find_contradictions()
+        # Low embedding similarity should block the pair
+        pair_ids = {(r["memory_id_a"], r["memory_id_b"]) for r in result}
+        assert (mid1, mid2) not in pair_ids and (mid2, mid1) not in pair_ids
+
+    def test_find_contradictions_real_contradiction_detected(self, groomer, storage, embeddings):
+        """Real contradictions with high embedding similarity should still be caught."""
+        import struct
+        high_sim_emb = struct.pack(f"{384}f", *([1.0] + [0.0] * 383))
+        embeddings.similarity.return_value = 0.9  # High similarity
+
+        mid1 = storage.insert_memory({
+            "content": "We use Python for all backend services in the platform.",
+            "embedding": high_sim_emb,
+            "tags": [],
+            "directory_context": "/tmp",
+            "heat": 1.0,
+        })
+        mid2 = storage.insert_memory({
+            "content": "We don't use Python for backend services, we switched to Go.",
+            "embedding": high_sim_emb,
+            "tags": [],
+            "directory_context": "/tmp",
+            "heat": 1.0,
+        })
+        result = groomer.find_contradictions()
+        pair_ids = {(r["memory_id_a"], r["memory_id_b"]) for r in result}
+        assert (mid1, mid2) in pair_ids or (mid2, mid1) in pair_ids
+
 
 # ── TestMutationTools ──────────────────────────────────────────────────────────
 

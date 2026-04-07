@@ -8,9 +8,17 @@ services:
       - ${HOME}/.vaire:/data
       - ${HOME}/workspace:/workspace:ro
       - ./tests/fixtures/ingest:/ingest:ro
+      - ${HOME}/.vaire/certs:/certs:ro
     environment:
       - VAIRE_PATH_REMAP=/workspace:${VAIRE_HOST_WORKSPACE:-${HOME}/workspace}
       - VAIRE_COGNITIVE_LOAD_LIMIT=8
+
+      # ── mTLS remote access ─────────────────────────────────────────────────
+      - VAIRE_TLS_CERT=/certs/server.crt
+      - VAIRE_TLS_KEY=/certs/server.key
+      - VAIRE_TLS_CA=/certs/ca.crt
+      - VAIRE_HTTPS_BIND=${VAIRE_HTTPS_BIND:-0.0.0.0:8743}
+      - VAIRE_INGEST_ALLOWED_DIRS=/workspace
 
       # ── Reranking: GTE reranker is in the image (gte-reranker-modernbert-base) ─
       # CROSS_ENCODER_ENABLED enables the _cross_encoder_rerank() path which tries
@@ -34,12 +42,13 @@ services:
 
       # ── Write gate: raise threshold to filter more low-signal captures ─────
       - VAIRE_WRITE_GATE_THRESHOLD=0.55
+    network_mode: host
     healthcheck:
       test: ["CMD", "python", "-m", "vaire", "health"]
-      interval: 30s
+      interval: 15s
       timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
+      retries: 2
+      start_period: 60s
+    restart: on-failure
     # Optional: limit memory if running on a shared machine.
     # mem_limit: 2g

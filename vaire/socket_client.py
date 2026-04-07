@@ -82,10 +82,12 @@ class VaireClient:
         socket_path: str,
         agent_id: str | None = None,
         call_timeout: float = _DEFAULT_CALL_TIMEOUT,
+        auth_token: str | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._agent_id = agent_id or generate_agent_id()
         self._call_timeout = call_timeout
+        self._auth_token = auth_token
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -174,12 +176,14 @@ class VaireClient:
         await self._ensure_connected()
 
         request_id = secrets.token_hex(8)
-        payload = {
+        payload: dict[str, Any] = {
             "id": request_id,
             "method": method,
             "agent_id": self._agent_id,
             "params": params,
         }
+        if self._auth_token:
+            payload["auth_token"] = self._auth_token
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -190,24 +194,6 @@ class VaireClient:
             response = await asyncio.wait_for(
                 future, timeout=self._call_timeout
             )
-        except OSError:
-            # Broken pipe or connection reset — reset state and retry once.
-            self._pending.pop(request_id, None)
-            self._writer = None
-            self._reader = None
-            await self._ensure_connected()
-            request_id = secrets.token_hex(8)
-            payload["id"] = request_id
-            future = loop.create_future()
-            self._pending[request_id] = future
-            try:
-                await write_message(self._writer, payload)
-                response = await asyncio.wait_for(
-                    future, timeout=self._call_timeout
-                )
-            except (asyncio.TimeoutError, Exception):
-                self._pending.pop(request_id, None)
-                raise
         except (asyncio.TimeoutError, Exception):
             self._pending.pop(request_id, None)
             raise
@@ -236,7 +222,10 @@ class VaireClient:
                 response_id = msg.get("id")
                 future = self._pending.pop(response_id, None)
                 if future is not None and not future.done():
-                    future.set_result(msg)
+                    try:
+                        future.set_result(msg)
+                    except asyncio.InvalidStateError:
+                        pass  # cancelled between done() check and set_result()
                 else:
                     logger.debug(
                         "Received response for unknown/expired request id=%s",
@@ -275,14 +264,50 @@ def _get_client_lock() -> asyncio.Lock:
     return _client_lock
 
 
+def _load_auth_token(settings) -> str | None:
+    """Load the first available auth token from the tokens directory.
+
+    Returns the token secret string, or None if auth is disabled or no
+    token files exist.
+    """
+    if not settings.SOCKET_AUTH_ENABLED:
+        return None
+
+    tokens_dir = settings.socket_auth_tokens_dir_resolved
+    if not tokens_dir.is_dir():
+        return None
+
+    # Look for a token file matching this host, then fall back to any token
+    hostname = socket.gethostname() or "unknown"
+    host_token = tokens_dir / f"{hostname}.token"
+    if host_token.is_file():
+        try:
+            return host_token.read_text().strip()
+        except OSError:
+            pass
+
+    # Fall back to first available token
+    for path in sorted(tokens_dir.glob("*.token")):
+        try:
+            secret = path.read_text().strip()
+            if secret:
+                return secret
+        except OSError:
+            continue
+
+    return None
+
+
 def _build_client() -> VaireClient:
     from .config import get_settings
 
     settings = get_settings()
+    auth_token = _load_auth_token(settings)
     return VaireClient(
         socket_path=str(settings.socket_path_resolved),
         agent_id=generate_agent_id(),
         call_timeout=float(settings.CALL_TIMEOUT_SECONDS),
+        auth_token=auth_token,
     )
 
 
@@ -312,9 +337,45 @@ def get_client() -> VaireClient:
 # All @mcp.tool() stubs are async and may run concurrently; use the async
 # client accessor so the singleton is created under a lock.
 
+_RETRY_BACKOFF = [0.5, 1.0, 2.0]
+
+
 async def _client_call(method: str, params: dict) -> Any:
-    """Fetch the client singleton (async-safe) and invoke method."""
-    return await (await get_client_async()).call(method, params)
+    """Fetch client singleton and invoke method with retry + backoff.
+
+    Retries on connection errors (OSError, TimeoutError, etc.).
+    Does NOT retry on VaireError (server returned a valid error —
+    the connection is fine, the request was rejected).
+    """
+    global _client
+    last_exc: Exception | None = None
+    max_retries = len(_RETRY_BACKOFF) + 1
+
+    for attempt in range(max_retries):
+        try:
+            client = await get_client_async()
+            return await client.call(method, params)
+        except VaireError:
+            raise  # server-side error — don't retry
+        except (OSError, ConnectionRefusedError, asyncio.TimeoutError,
+                ConnectionResetError, BrokenPipeError) as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                wait = _RETRY_BACKOFF[attempt]
+                logger.warning(
+                    "Vaire call %s failed (attempt %d/%d): %s. "
+                    "Retrying in %.1fs...",
+                    method, attempt + 1, max_retries, exc, wait,
+                )
+                # Force client recreation on next attempt (fresh socket)
+                _client = None
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    "Vaire call %s failed after %d attempts: %s",
+                    method, max_retries, exc,
+                )
+    raise last_exc  # type: ignore[misc]
 
 
 # ── MCP tool stubs ─────────────────────────────────────────────────────────────
@@ -325,12 +386,16 @@ async def remember(
     content: str,
     context: str,
     tags: list[str] | None = None,
+    force: bool = False,
 ) -> dict:
-    """Store a memory in Vaire."""
-    return await _client_call(
-        "remember",
-        {"content": content, "context": context, "tags": tags or []},
-    )
+    """Store a memory in Vaire.
+
+    force: bypass the write gate and store regardless of surprisal score.
+    """
+    params: dict = {"content": content, "context": context, "tags": tags or []}
+    if force:
+        params["force"] = True
+    return await _client_call("remember", params)
 
 
 @mcp.tool()
@@ -338,12 +403,26 @@ async def recall(
     query: str,
     context: str | None = None,
     max_results: int = 10,
+    min_heat: float = 0.1,
+    max_tokens: int | None = None,
+    compact: bool = False,
+    fast: bool = True,
 ) -> dict:
-    """Retrieve memories matching a query."""
-    return await _client_call(
-        "recall",
-        {"query": query, "context": context, "max_results": max_results},
-    )
+    """Retrieve memories matching a query.
+
+    fast: if True (default), skip cross-encoder for ~130ms response.
+          if False, run full deep reranking for highest quality (~6s).
+    """
+    params: dict = {
+        "query": query, "context": context,
+        "max_results": max_results, "min_heat": min_heat,
+        "fast": fast,
+    }
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    if compact:
+        params["compact"] = True
+    return await _client_call("recall", params)
 
 
 @mcp.tool()
@@ -353,11 +432,14 @@ async def forget(memory_id: int) -> dict:
 
 
 @mcp.tool()
-async def get_project_context(directory: str) -> dict:
+async def get_project_context(directory: str, max_tokens: int | None = None, compact: bool = False) -> dict:
     """Return all hot memories for a directory."""
-    return await _client_call(
-        "get_project_context", {"directory": directory}
-    )
+    params: dict = {"directory": directory}
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    if compact:
+        params["compact"] = True
+    return await _client_call("get_project_context", params)
 
 
 @mcp.tool()
@@ -373,11 +455,12 @@ async def consolidate_now() -> dict:
 
 
 @mcp.tool()
-async def rate_memory(memory_id: int, rating: float) -> dict:
+async def rate_memory(memory_id: int, rating: float = 1.0, was_useful: bool | None = None) -> dict:
     """Rate a memory's usefulness."""
-    return await _client_call(
-        "rate_memory", {"memory_id": memory_id, "rating": rating}
-    )
+    params: dict = {"memory_id": memory_id, "rating": rating}
+    if was_useful is not None:
+        params["was_useful"] = was_useful
+    return await _client_call("rate_memory", params)
 
 
 @mcp.tool()
@@ -391,12 +474,16 @@ async def recall_hierarchical(
     query: str,
     level: int | None = None,
     max_results: int = 10,
+    max_tokens: int | None = None,
+    compact: bool = False,
 ) -> list:
     """Retrieve memories from the fractal hierarchy."""
-    return await _client_call(
-        "recall_hierarchical",
-        {"query": query, "level": level, "max_results": max_results},
-    )
+    params: dict = {"query": query, "level": level, "max_results": max_results}
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    if compact:
+        params["compact"] = True
+    return await _client_call("recall_hierarchical", params)
 
 
 @mcp.tool()
@@ -439,7 +526,21 @@ async def add_rule(
     priority: int = 0,
     scope_value: str = "",
 ) -> dict:
-    """Add a neuro-symbolic rule for filtering/re-ranking memories."""
+    """Add a neuro-symbolic rule for filtering/re-ranking memories.
+
+    Args:
+        rule_type: "hard" (must satisfy — uses "filter" action only) or "soft" (preference — uses boost/penalty).
+        scope: "global" (all memories), "directory" (match scope_value path), or "file" (match scope_value pattern).
+        condition: Format is "field operator value". Operators: ==, !=, >, <, >=, <=, contains, not_contains, matches.
+            Fields: tag, content, directory_context, importance, heat, confidence, surprise_score,
+            emotional_valence, plasticity, stability, excitability, access_count, useful_count.
+            Examples: "importance > 0.7", "tag contains architecture", "directory_context matches /project/*".
+        action: "filter" (hard rules only — excludes non-matching memories),
+            "boost:N" (soft rules — multiply score by N, e.g. "boost:1.5"),
+            or "penalty:N" (soft rules — reduce score by N, e.g. "penalty:0.3").
+        priority: Higher values are applied first. Default 0.
+        scope_value: Directory path or file glob pattern. Required when scope is "directory" or "file".
+    """
     return await _client_call(
         "add_rule",
         {
@@ -571,6 +672,124 @@ async def ingest_preview(file_path: str) -> dict:
     return await _client_call("ingest_preview", {"file_path": file_path})
 
 
+# ── Reference system ─────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def load_reference(
+    topic: str = "",
+    section: str | None = None,
+    show_index: bool = False,
+    category: str | None = None,
+) -> dict:
+    """Load a reference document from the static reference library.
+
+    Examples:
+        load_reference(show_index=True)                     # list all references
+        load_reference(show_index=True, category="nist")    # list NIST references
+        load_reference(topic="800-53:AC")                   # full AC family document
+        load_reference(topic="800-53:AC", section="AC-17")  # just AC-17
+        load_reference(topic="directive:all-agents")         # prime directive
+    """
+    return await _client_call(
+        "load_reference",
+        {"topic": topic, "section": section, "show_index": show_index, "category": category},
+    )
+
+
+# ── Task system ──────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def task_list(
+    status: str = "", role: str = "", include_history: bool = False,
+) -> dict:
+    """List tasks, optionally filtered by status and/or role."""
+    return await _client_call(
+        "task_list",
+        {"status": status, "role": role, "include_history": include_history},
+    )
+
+
+@mcp.tool()
+async def task_get(task_id: str) -> dict:
+    """Get full details for a single task including history."""
+    return await _client_call("task_get", {"task_id": task_id})
+
+
+@mcp.tool()
+async def task_create(
+    title: str,
+    role: str,
+    priority: str = "medium",
+    directory: str = "",
+    description: str = "",
+    acceptance_criteria: list[str] | None = None,
+    depends_on: list[str] | None = None,
+    context_queries: list[str] | None = None,
+    on_completion: str = "",
+) -> dict:
+    """Create a new task. Restricted to allowed agent prefixes."""
+    return await _client_call(
+        "task_create",
+        {
+            "title": title, "role": role, "priority": priority,
+            "directory": directory, "description": description,
+            "acceptance_criteria": acceptance_criteria,
+            "depends_on": depends_on, "context_queries": context_queries,
+            "on_completion": on_completion,
+        },
+    )
+
+
+@mcp.tool()
+async def task_claim(
+    task_id: str, model: str = "", pid: int = 0,
+) -> dict:
+    """Claim an open task for this agent."""
+    return await _client_call(
+        "task_claim", {"task_id": task_id, "model": model, "pid": pid},
+    )
+
+
+@mcp.tool()
+async def task_update(
+    task_id: str,
+    notes: str = "",
+    phase: str | None = None,
+    action: str | None = None,
+    progress: int | None = None,
+    files: list[str] | None = None,
+    blockers: list[str] | None = None,
+    criteria_done: list[int] | None = None,
+) -> dict:
+    """Update progress on a claimed task. Only the claiming agent can update."""
+    return await _client_call(
+        "task_update",
+        {
+            "task_id": task_id, "notes": notes, "phase": phase,
+            "action": action, "progress": progress, "files": files,
+            "blockers": blockers, "criteria_done": criteria_done,
+        },
+    )
+
+
+@mcp.tool()
+async def task_complete(task_id: str, result: str = "") -> dict:
+    """Mark a claimed task as complete."""
+    return await _client_call(
+        "task_complete", {"task_id": task_id, "result": result},
+    )
+
+
+@mcp.tool()
+async def task_release(task_id: str, reason: str = "") -> dict:
+    """Release a claimed task back to open status."""
+    return await _client_call(
+        "task_release", {"task_id": task_id, "reason": reason},
+    )
+
+
 # ── Groomer MCP instance ───────────────────────────────────────────────────────
 
 groomer_mcp = FastMCP(name="vaire-groomer")
@@ -588,18 +807,41 @@ def _get_groomer_client_lock() -> asyncio.Lock:
 
 
 def _build_groomer_client() -> VaireClient:
-    import os as _os
-    import socket as _sock
+    import configparser
+    from pathlib import Path
     from .config import get_settings
     settings = get_settings()
-    hostname = _sock.gethostname() or "unknown"
-    pid = _os.getpid()
-    token_fragment = _SESSION_TOKEN[:8]
-    groomer_agent_id = f"groomer-{hostname}:{pid}:{token_fragment}"
+    # Read the approved groomer agent_id from ~/.vaire/vaire.ini
+    ini_path = Path(settings.DB_PATH).expanduser().parent / "vaire.ini"
+    groomer_agent_id = ""
+    if ini_path.exists():
+        cfg = configparser.ConfigParser()
+        cfg.read(ini_path)
+        raw = cfg.get("groomer", "approved", fallback="")
+        ids = [g.strip() for g in raw.split(",") if g.strip()]
+        if ids:
+            groomer_agent_id = ids[0]
+    if not groomer_agent_id:
+        groomer_agent_id = f"groomer-{_SESSION_TOKEN[:8]}"
+
+    # Load auth token — prefer a token matching the groomer agent_id
+    auth_token = None
+    if settings.SOCKET_AUTH_ENABLED:
+        tokens_dir = settings.socket_auth_tokens_dir_resolved
+        groomer_token_path = tokens_dir / f"{groomer_agent_id}.token"
+        if groomer_token_path.is_file():
+            try:
+                auth_token = groomer_token_path.read_text().strip()
+            except OSError:
+                pass
+        if not auth_token:
+            auth_token = _load_auth_token(settings)
+
     return VaireClient(
         socket_path=str(settings.socket_path_resolved),
         agent_id=groomer_agent_id,
         call_timeout=float(settings.CALL_TIMEOUT_SECONDS),
+        auth_token=auth_token,
     )
 
 
@@ -641,9 +883,17 @@ async def groom_audit(
     max_heat: float | None = None,
     tags: list[str] | None = None,
     store_type: str | None = None,
+    provenance_agent: str | None = None,
+    content_length_min: int | None = None,
+    content_length_max: int | None = None,
+    tags_empty: bool | None = None,
+    id_range: list[int] | None = None,
     limit: int = 50,
 ) -> list:
-    """Browse the corpus with optional filters, ordered oldest/coldest first."""
+    """Browse the corpus with optional filters, ordered oldest/coldest first.
+
+    Extended filters: provenance_agent, content_length_min/max, tags_empty (bool), id_range ([min, max]).
+    """
     return await _groomer_call(
         "groom_audit",
         {
@@ -652,6 +902,11 @@ async def groom_audit(
             "max_heat": max_heat,
             "tags": tags,
             "store_type": store_type,
+            "provenance_agent": provenance_agent,
+            "content_length_min": content_length_min,
+            "content_length_max": content_length_max,
+            "tags_empty": tags_empty,
+            "id_range": id_range,
             "limit": limit,
         },
     )
@@ -692,10 +947,29 @@ async def groom_contradictions(
 
 
 @groomer_mcp.tool()
-async def groom_orphans(directory: str | None = None, limit: int = 50) -> list:
-    """Return low-connectivity memories (cold, untagged)."""
+async def groom_orphans(
+    directory: str | None = None,
+    max_heat: float = 0.15,
+    include_tagged: bool = False,
+    min_content_length: int | None = None,
+    limit: int = 50,
+) -> list:
+    """Return low-connectivity memories. Configurable thresholds.
+
+    Args:
+        max_heat: Heat threshold (default 0.15).
+        include_tagged: If True, include tagged memories too (default False = untagged only).
+        min_content_length: Minimum content length to include (catches keyword stubs).
+    """
     return await _groomer_call(
-        "groom_orphans", {"directory": directory, "limit": limit}
+        "groom_orphans",
+        {
+            "directory": directory,
+            "max_heat": max_heat,
+            "include_tagged": include_tagged,
+            "min_content_length": min_content_length,
+            "limit": limit,
+        },
     )
 
 
@@ -787,4 +1061,130 @@ async def groom_auto(directory: str | None = None, depth: str = "light") -> dict
     """Run a structured grooming pass (depth: light/medium/deep)."""
     return await _groomer_call(
         "groom_auto", {"directory": directory, "depth": depth}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_forget(memory_ids: list[int], reason: str = "groomer") -> dict:
+    """Delete memories by ID list. Archives each to grooming_archives first."""
+    return await _groomer_call(
+        "groom_forget", {"memory_ids": memory_ids, "reason": reason}
+    )
+
+
+@groomer_mcp.tool()
+async def groom_search(
+    provenance_agent: str | None = None,
+    content_like: str | None = None,
+    content_length_min: int | None = None,
+    content_length_max: int | None = None,
+    tags_empty: bool | None = None,
+    created_before: str | None = None,
+    created_after: str | None = None,
+    id_range: list[int] | None = None,
+    directory: str | None = None,
+    limit: int = 50,
+    fields: list[str] | None = None,
+) -> list:
+    """Raw filtered query — no embedding search, no reranking. Just a filtered SELECT.
+
+    Args:
+        provenance_agent: Filter by agent that created the memory.
+        content_like: SQL LIKE pattern match on content (wraps in %...%).
+        content_length_min: Minimum content length in characters.
+        content_length_max: Maximum content length in characters.
+        tags_empty: True = only untagged memories, False = only tagged.
+        created_before: ISO datetime upper bound.
+        created_after: ISO datetime lower bound.
+        id_range: [min_id, max_id] inclusive range.
+        directory: Filter by directory_context.
+        limit: Max results (default 50).
+        fields: Return only these fields (id always included).
+    """
+    return await _groomer_call(
+        "groom_search",
+        {
+            "provenance_agent": provenance_agent,
+            "content_like": content_like,
+            "content_length_min": content_length_min,
+            "content_length_max": content_length_max,
+            "tags_empty": tags_empty,
+            "created_before": created_before,
+            "created_after": created_after,
+            "id_range": id_range,
+            "directory": directory,
+            "limit": limit,
+            "fields": fields,
+        },
+    )
+
+
+@groomer_mcp.tool()
+async def groom_bulk_retag(
+    filter: dict,
+    new_tags: list[str],
+    mode: str = "replace",
+) -> dict:
+    """Retag multiple memories matching a filter.
+
+    Args:
+        filter: Same keys as groom_audit (directory, min_age_days, max_heat, tags, store_type, limit).
+        new_tags: Tags to apply.
+        mode: "replace" (overwrite), "append" (add without removing), or "remove" (remove these tags).
+    """
+    return await _groomer_call(
+        "groom_bulk_retag",
+        {"filter": filter, "new_tags": new_tags, "mode": mode},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_content_scan(
+    pattern: str,
+    replacement: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """Scan all memories for a regex pattern. Optionally find-and-replace (re-embeds automatically).
+
+    Args:
+        pattern: Python regex pattern to search for.
+        replacement: If given with dry_run=False, replaces matches and re-embeds affected memories.
+        dry_run: If True (default), only reports matches without modifying anything.
+    """
+    return await _groomer_call(
+        "groom_content_scan",
+        {"pattern": pattern, "replacement": replacement, "dry_run": dry_run},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_bulk_update_content(
+    memory_ids: list[int],
+    find: str,
+    replace: str,
+) -> dict:
+    """Find/replace across specified memory IDs. Re-embeds all affected memories."""
+    return await _groomer_call(
+        "groom_bulk_update_content",
+        {"memory_ids": memory_ids, "find": find, "replace": replace},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_sanitize_archives(dry_run: bool = True) -> dict:
+    """Scan all archive entries for credential patterns and redact them.
+
+    Args:
+        dry_run: If True (default), only reports matches without modifying anything.
+    """
+    return await _groomer_call(
+        "groom_sanitize_archives", {"dry_run": dry_run},
+    )
+
+
+@groomer_mcp.tool()
+async def groom_provenance(directory: str | None = None) -> list:
+    """List distinct provenance_agent values with counts, date ranges, and top tags."""
+    return await _groomer_call(
+        "groom_provenance", {"directory": directory}
     )

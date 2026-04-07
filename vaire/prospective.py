@@ -87,16 +87,15 @@ class ProspectiveMemoryEngine:
             if self._matches(pm, directory, content, entities, current_time):
                 self._storage.trigger_prospective_memory(pm["id"])
 
-                # Re-read to get updated count
+                # Mirror the DB increment (trigger_prospective_memory does +1 in SQL)
                 new_count = pm["triggered_count"] + 1
 
                 # Deactivate if over limit
                 if new_count > MAX_TRIGGER_COUNT:
-                    self._storage._conn.execute(
+                    self._storage.execute_write(
                         "UPDATE prospective_memories SET is_active = 0 WHERE id = ?",
                         (pm["id"],),
                     )
-                    self._storage._conn.commit()
 
                 pm["triggered_count"] = new_count
                 triggered.append(pm)

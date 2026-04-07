@@ -62,6 +62,13 @@ class EmbeddingEngine:
                 "embedding operations will return None"
             )
             self._unavailable = True
+        except Exception:
+            logger.exception(
+                "Failed to load embedding model %r; "
+                "embedding operations will return None",
+                self.model_name,
+            )
+            self._unavailable = True
 
     def get_model_name(self) -> str:
         """Return the current model name."""
@@ -106,25 +113,39 @@ class EmbeddingEngine:
         """Efficiently re-embed a batch of texts with the current model."""
         return self.encode_batch(texts)
 
+    # TurboQuant fixed-scale int8 quantization for L2-normalized vectors.
+    # For 384-dim unit vectors: SCALE = 3/sqrt(384) ≈ 0.153
+    # This maps the typical value range [-0.15, +0.15] to [-127, +127].
+    # Fixed scale means no per-vector metadata — dequantize is lossless.
+    _INT8_SCALE = 3.0 / (384 ** 0.5)  # ~0.1531
+
+    @classmethod
+    def quantize_int8(cls, embedding: bytes) -> bytes:
+        """Quantize float32 embedding to int8 using TurboQuant fixed scale."""
+        arr = np.frombuffer(embedding, dtype=np.float32)
+        scaled = np.clip(arr / cls._INT8_SCALE * 127, -127, 127)
+        return np.round(scaled).astype(np.int8).tobytes()
+
+    @classmethod
+    def dequantize_int8(cls, quantized: bytes) -> bytes:
+        """Dequantize int8 back to float32 using TurboQuant fixed scale."""
+        arr = np.frombuffer(quantized, dtype=np.int8).astype(np.float32)
+        arr = arr * cls._INT8_SCALE / 127.0
+        return arr.astype(np.float32).tobytes()
+
+    # Keep old names as aliases for backward compat
     @staticmethod
     def quantize(embedding: bytes, bits: int = 8) -> bytes:
-        """Quantize float32 embedding to int8 for storage efficiency."""
-        arr = np.frombuffer(embedding, dtype=np.float32)
+        """Quantize float32 embedding to int8 (legacy API, uses TurboQuant)."""
         if bits == 8:
-            max_val = np.max(np.abs(arr))
-            if max_val == 0:
-                return np.zeros(len(arr), dtype=np.int8).tobytes()
-            scaled = np.clip(arr / max_val * 127, -127, 127)
-            return scaled.astype(np.int8).tobytes()
+            return EmbeddingEngine.quantize_int8(embedding)
         raise ValueError(f"Unsupported quantization bits: {bits}")
 
     @staticmethod
     def dequantize(quantized: bytes, bits: int = 8) -> bytes:
-        """Dequantize int8 back to float32 (approximate)."""
+        """Dequantize int8 back to float32 (legacy API, uses TurboQuant)."""
         if bits == 8:
-            arr = np.frombuffer(quantized, dtype=np.int8).astype(np.float32)
-            arr = arr / 127.0
-            return arr.astype(np.float32).tobytes()
+            return EmbeddingEngine.dequantize_int8(quantized)
         raise ValueError(f"Unsupported dequantization bits: {bits}")
 
     def encode_query(self, text: str) -> Optional[bytes]:

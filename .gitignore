@@ -28,6 +28,7 @@ lockstep-specs/
 .claude/
 
 .env
+deploy.env
 vaire.ini
 *.log
 

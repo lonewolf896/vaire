@@ -60,11 +60,10 @@ class EngramAllocator:
 
         # Update the memory's excitability field to match slot
         now = self._storage._now_iso()
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE memories SET excitability = ?, last_excitability_update = ? WHERE id = ?",
             (new_excitability, now, memory_id),
         )
-        self._storage._conn.commit()
 
         return {
             "slot_index": best_slot,

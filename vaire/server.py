@@ -14,6 +14,7 @@ from pathlib import Path
 from vaire import __version__
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -45,6 +46,7 @@ from vaire.staleness import StalenessDetector
 from vaire.storage import StorageEngine
 from vaire.restoration import HippocampalReplay
 from vaire.thermodynamics import MemoryThermodynamics
+from vaire.transport_context import transport_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,8 @@ _groomer = None   # GroomerEngine — imported lazily in init_engines
 _write_queue = None  # WriteQueue
 _cache = None        # MemoryCache
 _pipeline = None     # IngestionPipeline — imported lazily in init_engines
+_reference_loader = None  # ReferenceLoader — loaded in init_engines
+_task_engine = None       # TaskEngine — loaded in init_engines
 
 # Session state for transition tracking
 _last_recalled_ids: dict[str, int] = {}  # session_id → last recalled memory_id
@@ -105,6 +109,17 @@ mcp_server = FastMCP(
     instructions="Biologically-inspired persistent memory engine for Claude Code.",
     host="127.0.0.1",
     port=settings.PORT,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "127.0.0.1:*", "localhost:*", "[::1]:*",
+        ] + (
+            [f"{h.strip()}:*" for h in settings.HTTPS_ALLOWED_HOSTS.split(",") if h.strip() and h.strip() != "*"]
+            if settings.HTTPS_ALLOWED_HOSTS and settings.HTTPS_ALLOWED_HOSTS != "*"
+            else []
+        ),
+        allowed_origins=[],
+    ) if settings.tls_enabled else None,
 )
 
 
@@ -187,7 +202,7 @@ async def hook_auto_capture(request: Request) -> JSONResponse:
     if tool_name.startswith("mcp__vaire__"):
         return JSONResponse({"status": "skipped", "reason": "vaire_tool"})
 
-    storage._conn.execute(
+    storage.execute_write(
         "INSERT INTO action_log (tool_name, tool_input_summary, directory, session_id, timestamp) "
         "VALUES (?, ?, ?, ?, ?)",
         (
@@ -198,7 +213,6 @@ async def hook_auto_capture(request: Request) -> JSONResponse:
             datetime.now(timezone.utc).isoformat(),
         ),
     )
-    storage._conn.commit()
     return JSONResponse({"status": "captured"})
 
 
@@ -275,6 +289,172 @@ def _file_hash(filepath: str) -> str | None:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+# ── Input Validation & Security ────────────────────────────────────────
+
+# Prompt injection patterns (R3) — single source in groomer.py, imported here.
+# Known limitations: Unicode homoglyphs, zero-width chars, HTML entities, and
+# leetspeak can evade regex detection. The "unprocessed" auto-tag + groomer
+# review pipeline is the real security gate; this regex is defense-in-depth.
+from vaire.groomer import _INJECTION_RE
+
+
+def _validate_input(content: str, tags: list[str]) -> str | None:
+    """Return error message if input limits are exceeded, None if valid."""
+    if len(content) > settings.MAX_CONTENT_LENGTH:
+        return (
+            f"Content length {len(content)} exceeds limit "
+            f"of {settings.MAX_CONTENT_LENGTH} chars"
+        )
+    if len(tags) > settings.MAX_TAG_COUNT:
+        return (
+            f"Tag count {len(tags)} exceeds limit of {settings.MAX_TAG_COUNT}"
+        )
+    for tag in tags:
+        if len(tag) > settings.MAX_TAG_LENGTH:
+            return (
+                f"Tag '{tag[:30]}...' length {len(tag)} exceeds limit "
+                f"of {settings.MAX_TAG_LENGTH} chars"
+            )
+    return None
+
+
+def _normalize_for_injection_scan(text: str) -> str:
+    """Normalize text to defeat common injection evasion techniques.
+
+    Strips zero-width characters, normalizes Unicode confusables to ASCII,
+    and decodes HTML entities. Applied before regex matching only — does
+    NOT modify the stored content.
+    """
+    import html
+    import unicodedata
+
+    # Decode HTML entities (&#112; → p, &amp; → &)
+    text = html.unescape(text)
+    # Replace zero-width characters with spaces (preserves word boundaries)
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff\u00ad]", " ", text)
+    # NFKD decomposition + ASCII folding (strips non-Latin characters)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    # Collapse multiple spaces left by above transforms
+    text = re.sub(r" {2,}", " ", text)
+    return text
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count using chars/3.5 heuristic."""
+    return int(len(text) / 3.5)
+
+
+# Fields stripped from recall responses to reduce bloat.
+# These are internal/enrichment fields that callers never need.
+_INTERNAL_FIELDS = frozenset({
+    "embedding", "hdc_vector", "implicit_embedding",
+    "enrichment_concepts", "enrichment_comet", "enrichment_queries",
+    "enrichment_logic", "enriched_content", "enrichment_model_versions",
+    "implicit_embedding_model", "original_content",
+    "sr_x", "sr_y", "slot_index", "vector_clock",
+    "compression_level", "reconsolidation_count", "last_reconsolidated",
+    "last_excitability_update", "source_episode_id", "file_hash",
+})
+
+
+def _strip_response_fields(mem: dict) -> dict:
+    """Remove internal fields from a memory dict before returning to caller."""
+    return {k: v for k, v in mem.items() if k not in _INTERNAL_FIELDS}
+
+
+# Minimal fields returned in compact mode — optimized for small-context agents.
+_COMPACT_FIELDS = frozenset({
+    "id", "content", "tags", "directory_context", "created_at",
+    "heat", "confidence", "contextual_prefix", "is_protected",
+    "_retrieval_score", "_cross_encoder_score", "_retrieval_confidence",
+    "_truncated",
+})
+
+
+def _compact_response(mem: dict) -> dict:
+    """Return only essential fields for compact mode."""
+    return {k: v for k, v in mem.items() if k in _COMPACT_FIELDS}
+
+
+def _estimate_mem_tokens(mem: dict) -> int:
+    """Estimate token count for an entire memory dict, not just content.
+
+    Accounts for content + tags + contextual_prefix + key metadata fields
+    that contribute to the serialized response size.
+    """
+    size = len(mem.get("content", ""))
+    tags = mem.get("tags")
+    if tags:
+        size += sum(len(t) for t in tags) + len(tags) * 4  # commas, quotes, brackets
+    prefix = mem.get("contextual_prefix")
+    if prefix:
+        size += len(prefix)
+    # Fixed overhead for other fields (id, dates, scores, etc.) ~200 chars
+    size += 200
+    return int(size / 3.5)
+
+
+def _apply_token_budget(results: list[dict], max_tokens: int) -> list[dict]:
+    """Truncate a list of memory dicts to fit within a token budget.
+
+    Returns the truncated list with a metadata dict appended containing
+    budget_used, budget_limit, and results_truncated counts.
+    """
+    budget_used = 0
+    truncated_count = 0
+    output: list[dict] = []
+
+    for mem in results:
+        tokens = _estimate_mem_tokens(mem)
+
+        if budget_used + tokens <= max_tokens:
+            output.append(mem)
+            budget_used += tokens
+        elif budget_used < max_tokens:
+            # Partially fit: truncate content at sentence boundary
+            content = mem.get("content", "")
+            remaining_chars = int((max_tokens - budget_used) * 3.5)
+            truncated_content = content[:remaining_chars]
+            # Find last sentence boundary
+            for sep in (". ", ".\n", "\n\n", "\n"):
+                last = truncated_content.rfind(sep)
+                if last > len(truncated_content) // 2:
+                    truncated_content = truncated_content[: last + len(sep)]
+                    break
+            trimmed = {**mem, "content": truncated_content, "_truncated": True}
+            output.append(trimmed)
+            budget_used += _estimate_mem_tokens(trimmed)
+            truncated_count += 1
+        else:
+            truncated_count += 1
+
+    output.append({
+        "_budget_meta": True,
+        "budget_used": budget_used,
+        "budget_limit": max_tokens,
+        "results_truncated": truncated_count,
+        "results_returned": len(output),
+    })
+    return output
+
+
+def _detect_injection(content: str) -> tuple[bool, list[str]]:
+    """Check content for prompt injection patterns.
+
+    Normalizes content first to defeat Unicode homoglyphs, zero-width
+    characters, and HTML entity evasion. Returns (detected, matched_patterns).
+    """
+    if not settings.PROMPT_INJECTION_DETECTION:
+        return False, []
+    normalized = _normalize_for_injection_scan(content)
+    found = list(_INJECTION_RE.finditer(normalized))
+    if found:
+        # Deduplicate matched text and truncate for logging
+        unique = list(dict.fromkeys(m.group()[:80] for m in found))
+        return True, unique[:5]
+    return False, []
+
+
 # ── MCP Tools ──────────────────────────────────────────────────────────
 
 
@@ -289,6 +469,34 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
     force: bypass the write gate and store regardless of surprisal score.
     Use for explicit high-value memories that must be stored unconditionally.
     """
+    # ── Input validation (R1) ──
+    err = _validate_input(content, tags)
+    if err:
+        return {"stored": False, "error": err}
+
+    # ── Prompt injection detection (R3) + Remote auto-tagging (Phase 5) ──
+    injection_detected, injection_matches = _detect_injection(content)
+    transport_info = transport_ctx.get()
+
+    # Copy tags once if any mutation is needed
+    if injection_detected or transport_info.is_remote:
+        tags = list(tags)  # don't mutate caller's list
+
+    if injection_detected:
+        if "_injection_warning" not in tags:
+            tags.append("_injection_warning")
+        logger.warning(
+            "Injection pattern detected in remember(): %s", injection_matches
+        )
+
+    if transport_info.is_remote:
+        if "unprocessed" not in tags:
+            tags.append("unprocessed")
+        logger.info(
+            "Remote remember from %s (%s)",
+            transport_info.agent_cn, transport_info.client_ip,
+        )
+
     storage = _get_storage()
     embeddings = _get_embeddings()
     buffer = _get_buffer()
@@ -316,6 +524,21 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
             "surprisal": round(surprisal, 4),
             "gate_reason": f"forced (was: {reason})",
         }
+
+    # Dedup check — runs AFTER surprisal gate passes, before storage
+    if _write_gate is not None and not force:
+        is_dup, dup_sim = _write_gate.is_duplicate(content, context, tags)
+        if is_dup:
+            logger.info(
+                "Dedup suppressed write: similarity=%.3f dir=%s",
+                dup_sim, context,
+            )
+            return {
+                "stored": False,
+                "similarity": round(dup_sim, 4),
+                "reason": "duplicate_suppressed",
+                "message": f"Near-duplicate of existing memory (similarity={dup_sim:.2f})",
+            }
 
     # Generate contextual prefix for richer embedding semantics
     contextual_prefix = None
@@ -389,11 +612,10 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
         )
 
         if contextual_prefix:
-            storage._conn.execute(
+            storage.execute_write(
                 "UPDATE memories SET contextual_prefix = ? WHERE id = ?",
                 (contextual_prefix, memory_id),
             )
-            storage._conn.commit()
 
         storage.update_memory_scores(
             memory_id,
@@ -405,20 +627,25 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
 
     # Apply CRDT provenance to the stored memory
     if crdt_provenance:
-        storage._conn.execute(
+        storage.execute_write(
             "UPDATE memories SET provenance_agent = ?, vector_clock = ? WHERE id = ?",
             (crdt_provenance["provenance_agent"], crdt_provenance["vector_clock"], memory_id),
         )
-        storage._conn.commit()
+
+    # Override provenance for remote calls — stamp with cert CN
+    if transport_info.is_remote and transport_info.agent_cn:
+        storage.execute_write(
+            "UPDATE memories SET provenance_agent = ? WHERE id = ?",
+            (f"remote:{transport_info.agent_cn}", memory_id),
+        )
 
     # CLS dual-store: classify memory as episodic or semantic
     if _consolidation is not None and _consolidation.cls is not None:
         store_type = _consolidation.cls.classify_memory(content, tags, context)
-        storage._conn.execute(
+        storage.execute_write(
             "UPDATE memories SET store_type = ? WHERE id = ?",
             (store_type, memory_id),
         )
-        storage._conn.commit()
 
     # Register file hash so staleness detector can find the filepath later
     if fhash is not None:
@@ -442,9 +669,11 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
         thermo.synaptic_boost(memory_id, initial_heat)
 
     # Prospective memory: auto-create triggers from content & check existing triggers
+    # Skip auto-trigger creation for remote calls (same restriction as create_trigger)
     triggered_memories = []
     if _prospective is not None:
-        _prospective.auto_create_from_content(content, context)
+        if not transport_info.is_remote:
+            _prospective.auto_create_from_content(content, context)
 
         from datetime import datetime as _dt, timezone as _tz
         trigger_context = {
@@ -474,11 +703,10 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
                 entities=hdc_entities,
                 store_type="episodic",
             )
-            storage._conn.execute(
+            storage.execute_write(
                 "UPDATE memories SET hdc_vector = ? WHERE id = ?",
                 (_hdc.to_bytes(hdc_vec), memory_id),
             )
-            storage._conn.commit()
         except Exception:
             logger.debug("HDC encoding failed for memory %s", memory_id)
 
@@ -489,13 +717,15 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
         _write_gate.record_stored(content, context, embedding)
 
     # 2. Decision auto-protection: detect decisions and shield from decay
+    # Skip for remote calls — prevents injected content from gaining protection
     auto_protected = False
-    if settings.DECISION_AUTO_PROTECT and _DECISION_STRONG_RE.search(content):
-        storage._conn.execute(
+    if (settings.DECISION_AUTO_PROTECT
+            and not transport_info.is_remote
+            and _DECISION_STRONG_RE.search(content)):
+        storage.execute_write(
             "UPDATE memories SET is_protected = 1, importance = 1.0 WHERE id = ?",
             (memory_id,),
         )
-        storage._conn.commit()
         auto_protected = True
         logger.debug("Decision auto-protected: memory %s", memory_id)
 
@@ -585,8 +815,19 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
 
 
 @mcp_server.tool()
-def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str | None = None) -> list[dict]:
-    """Semantic + keyword search filtered by heat. Boosts accessed memories."""
+def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str | None = None, max_tokens: int | None = None, compact: bool = False, fast: bool = True) -> list[dict]:
+    """Semantic + keyword search filtered by heat. Boosts accessed memories.
+
+    fast: if True (default), skip cross-encoder reranking for ~130ms response.
+          if False, run full deep reranking pipeline for highest quality (~6s).
+
+    If max_tokens is set, results are truncated to fit within the token budget.
+    Returns a list of dicts. When budget is active, the last element is a metadata
+    dict with keys: budget_used, budget_limit, results_truncated.
+    """
+    # ── Input validation (R1) — cap query length to prevent embedding OOM ──
+    if len(query) > settings.MAX_CONTENT_LENGTH:
+        query = query[:settings.MAX_CONTENT_LENGTH]
     storage = _get_storage()
 
     # Record activity on consolidation engine
@@ -596,7 +837,7 @@ def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str
     # Use HippoRetriever for unified 4-signal recall
     retriever = _retriever
     if retriever is not None:
-        merged = retriever.recall(query, max_results=max_results, min_heat=min_heat)
+        merged = retriever.recall(query, max_results=max_results, min_heat=min_heat, fast=fast)
     else:
         # Fallback to basic FTS + vector if retriever not initialized
         embeddings = _get_embeddings()
@@ -640,14 +881,13 @@ def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str
     for m in merged:
         new_heat = min(m["heat"] + 0.1, 1.0)
         storage.update_memory_heat(m["id"], new_heat)
-        storage._conn.execute(
+        storage.execute_write(
             "UPDATE memories SET last_accessed = ? WHERE id = ?", (now, m["id"])
         )
         m["heat"] = new_heat
         m["last_accessed"] = now
         if thermo is not None:
             thermo.record_access(m["id"], was_useful=True)
-    storage._conn.commit()
 
     # Record SR transitions: link previous recall → current recall
     if _cognitive_map is not None and merged:
@@ -681,10 +921,20 @@ def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str
     if _replay is not None:
         _replay.record_tool_call()
 
-    # Strip binary fields from response (not JSON-serializable)
-    for m in merged:
-        m.pop("embedding", None)
-        m.pop("hdc_vector", None)
+    # Strip fields from response — compact mode is more aggressive
+    if compact:
+        merged = [_compact_response(m) for m in merged]
+    elif settings.RECALL_STRIP_INTERNAL_FIELDS:
+        merged = [_strip_response_fields(m) for m in merged]
+    else:
+        for m in merged:
+            m.pop("embedding", None)
+            m.pop("hdc_vector", None)
+
+    # Apply token budget — use default cap when caller omits max_tokens
+    effective_max_tokens = max_tokens if max_tokens is not None else settings.RECALL_DEFAULT_MAX_TOKENS
+    if effective_max_tokens > 0 and merged:
+        merged = _apply_token_budget(merged, effective_max_tokens)
 
     return merged
 
@@ -692,6 +942,9 @@ def recall(query: str, max_results: int = 5, min_heat: float = 0.1, context: str
 @mcp_server.tool()
 def forget(memory_id: int) -> dict:
     """Mark a memory for deletion by setting heat to 0, then delete it."""
+    # ── Block remote deletion (evidence tampering prevention) ──
+    if transport_ctx.get().is_remote:
+        return {"memory_id": memory_id, "status": "error", "message": "Deletion not permitted via remote transport"}
     storage = _get_storage()
     memory = storage.get_memory(memory_id)
     if memory is None:
@@ -734,17 +987,36 @@ def validate_memory(memory_id: int) -> dict:
 
 
 @mcp_server.tool()
-def get_project_context(directory: str) -> dict:
+def get_project_context(directory: str, max_tokens: int | None = None, compact: bool = False) -> dict:
     """Return all hot memories for a directory, sorted by heat descending.
 
     Also checks if Hippocampal Replay hooks are installed for this project
     and includes a suggestion if they're missing.
+
+    If max_tokens is set, the memories list is truncated to fit within the token budget.
     """
     storage = _get_storage()
+    # Try the directory as given, then try remapping in both directions so
+    # queries work regardless of whether the caller uses a container-side or
+    # host-side path.
     memories = storage.get_memories_for_directory(directory, min_heat=settings.HOT_THRESHOLD)
-    for m in memories:
-        m.pop("embedding", None)
-        m.pop("hdc_vector", None)
+    if not memories:
+        remapped = settings.remap_path(directory)
+        if remapped != directory:
+            memories = storage.get_memories_for_directory(remapped, min_heat=settings.HOT_THRESHOLD)
+    if not memories:
+        reversed_path = settings.reverse_remap_path(directory)
+        if reversed_path != directory:
+            memories = storage.get_memories_for_directory(reversed_path, min_heat=settings.HOT_THRESHOLD)
+    # Strip fields from response — compact mode is more aggressive
+    if compact:
+        memories = [_compact_response(m) for m in memories]
+    elif settings.RECALL_STRIP_INTERNAL_FIELDS:
+        memories = [_strip_response_fields(m) for m in memories]
+    else:
+        for m in memories:
+            m.pop("embedding", None)
+            m.pop("hdc_vector", None)
 
     # Check if hooks are installed for this project
     hooks_installed = False
@@ -765,6 +1037,10 @@ def get_project_context(directory: str) -> dict:
             except Exception:
                 pass
             break
+
+    effective_max_tokens = max_tokens if max_tokens is not None else settings.RECALL_DEFAULT_MAX_TOKENS
+    if effective_max_tokens > 0 and memories:
+        memories = _apply_token_budget(memories, effective_max_tokens)
 
     result = {"memories": memories}
     if not hooks_installed:
@@ -804,14 +1080,13 @@ def memory_stats() -> dict:
         stats["hopfield_patterns"] = _hopfield.get_pattern_count()
 
     if _reconsolidation is not None:
-        recon_count = storage._conn.execute(
-            "SELECT COALESCE(SUM(reconsolidation_count), 0) FROM memories"
-        ).fetchone()[0]
+        recon_count = storage.sum_reconsolidation_count()
         stats["reconsolidation_count"] = recon_count
 
     if _write_gate is not None:
         # Track rejections via memories with surprisal below threshold
         stats["write_gate_rejections"] = getattr(_write_gate, "_rejection_count", 0)
+        stats["dedup_suppressions"] = getattr(_write_gate, "_dedup_suppression_count", 0)
 
     if _engram is not None:
         try:
@@ -827,21 +1102,14 @@ def memory_stats() -> dict:
         stats["active_rules"] = len(active_rules)
 
     if _cls is not None:
-        ep_count = storage._conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE store_type = 'episodic' AND heat > 0"
-        ).fetchone()[0]
-        sem_count = storage._conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE store_type = 'semantic' AND heat > 0"
-        ).fetchone()[0]
+        ep_count = storage.count_memories(store_type="episodic", min_heat=0.0)
+        sem_count = storage.count_memories(store_type="semantic", min_heat=0.0)
         stats["episodic_count"] = ep_count
         stats["semantic_count"] = sem_count
 
     if _compressor is not None:
         for level in (0, 1, 2):
-            count = storage._conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE compression_level = ? AND heat > 0",
-                (level,),
-            ).fetchone()[0]
+            count = storage.count_memories(compression_level=level, min_heat=0.0)
             stats[f"compressed_level_{level}"] = count
 
     if _cognitive_map is not None:
@@ -851,9 +1119,7 @@ def memory_stats() -> dict:
     # - causal_dag_edges: formal PC-algorithm DAG (populated every 50 memories)
     # - relationships WHERE is_causal=1: from detect_causality() (runs every cycle)
     dag_edges = storage.get_all_causal_edges() if _causal is not None else []
-    rel_causal = storage._conn.execute(
-        "SELECT COUNT(*) FROM relationships WHERE is_causal = 1"
-    ).fetchone()[0]
+    rel_causal = storage.count_causal_relationships()
     stats["causal_edges"] = len(dag_edges) + rel_causal
 
     if _metacognition is not None:
@@ -873,6 +1139,9 @@ def memory_stats() -> dict:
 @mcp_server.tool()
 def rate_memory(memory_id: int, rating: float = 1.0, was_useful: bool | None = None) -> dict:
     """Rate a memory's usefulness for metamemory tracking."""
+    # ── Block remote metadata manipulation ──
+    if transport_ctx.get().is_remote:
+        return {"memory_id": memory_id, "status": "error", "message": "Rating not permitted via remote transport"}
     storage = _get_storage()
     thermo = _get_thermo()
 
@@ -905,11 +1174,24 @@ def rate_memory(memory_id: int, rating: float = 1.0, was_useful: bool | None = N
 
 @mcp_server.tool()
 def recall_hierarchical(
-    query: str, level: int = None, max_results: int = 10
+    query: str, level: int = None, max_results: int = 10, max_tokens: int | None = None, compact: bool = False
 ) -> list[dict]:
-    """Retrieve memories from the fractal hierarchy at a specific level or adaptively."""
+    """Retrieve memories from the fractal hierarchy at a specific level or adaptively.
+
+    If max_tokens is set, results are truncated to fit within the token budget.
+    """
     retriever = _get_retriever()
-    return retriever.recall_hierarchical(query, level=level, max_results=max_results)
+    results = retriever.recall_hierarchical(query, level=level, max_results=max_results)
+
+    if compact:
+        results = [_compact_response(m) for m in results]
+    elif settings.RECALL_STRIP_INTERNAL_FIELDS:
+        results = [_strip_response_fields(m) for m in results]
+
+    effective_max_tokens = max_tokens if max_tokens is not None else settings.RECALL_DEFAULT_MAX_TOKENS
+    if effective_max_tokens > 0 and results:
+        results = _apply_token_budget(results, effective_max_tokens)
+    return results
 
 
 @mcp_server.tool()
@@ -927,6 +1209,24 @@ def create_trigger(
     target_directory: str | None = None,
 ) -> dict:
     """Create a prospective memory trigger that fires on matching context."""
+    # ── Input validation (R1) ──
+    if len(content) > settings.MAX_CONTENT_LENGTH:
+        return {"status": "error", "message": f"Content exceeds {settings.MAX_CONTENT_LENGTH} char limit"}
+
+    # ── Prompt injection detection (R3) ──
+    injection_detected, _ = _detect_injection(content)
+    if injection_detected:
+        return {"status": "error", "message": "Injection pattern detected in trigger content — rejected"}
+
+    # ── Block remote ingest of triggers (same principle as ingest) ──
+    transport_info = transport_ctx.get()
+    if transport_info.is_remote:
+        logger.warning(
+            "Remote create_trigger blocked from %s (%s)",
+            transport_info.agent_cn, transport_info.client_ip,
+        )
+        return {"status": "error", "message": "Prospective triggers cannot be created remotely"}
+
     if _prospective is None:
         return {"status": "error", "message": "ProspectiveMemoryEngine not initialized"}
     pm_id = _prospective.create_trigger(
@@ -961,6 +1261,10 @@ def add_rule(
     priority: Higher = applied first (default 0).
     scope_value: Directory path or file pattern for scoped rules.
     """
+    # ── Block remote global rule injection ──
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Rule creation not permitted via remote transport"}
+
     if _rules_engine is None:
         return {"status": "error", "message": "RulesEngine not initialized"}
     try:
@@ -1122,8 +1426,22 @@ def anchor(content: str, context: str, reason: str = "") -> dict:
     of other scoring. Use for decisions, constraints, and critical facts
     that must survive compaction.
     """
+    # ── Input validation (R1) ──
+    if len(content) > settings.MAX_CONTENT_LENGTH:
+        return {"error": f"Content exceeds {settings.MAX_CONTENT_LENGTH} char limit"}
+
+    # ── Prompt injection detection (R3) ──
+    injection_detected, _ = _detect_injection(content)
+
+    # ── Remote auto-tagging (Phase 5) ──
+    transport_info = transport_ctx.get()
+
     replay = _get_replay()
     tags = ["_anchor"]
+    if injection_detected:
+        tags.append("_injection_warning")
+    if transport_info.is_remote:
+        tags.append("unprocessed")
     if reason:
         tags.append(f"anchor:{reason}")
     memory_id = replay.anchor_memory(content, context, tags, reason)
@@ -1131,6 +1449,7 @@ def anchor(content: str, context: str, reason: str = "") -> dict:
         "memory_id": memory_id,
         "status": "anchored",
         "is_protected": True,
+        "is_remote": transport_info.is_remote,
         "reason": reason,
     }
 
@@ -1150,6 +1469,10 @@ def install_hooks(project_directory: str = "") -> dict:
 
     project_directory: The project root. Defaults to cwd.
     """
+    # ── Block remote filesystem writes ──
+    if transport_ctx.get().is_remote:
+        return {"error": "Hook installation is not permitted via remote transport"}
+
     import shutil
 
     project_dir = Path(project_directory) if project_directory else Path.cwd()
@@ -1261,6 +1584,147 @@ def install_hooks(project_directory: str = "") -> dict:
 
 
 @mcp_server.tool()
+def ingest_file(file_path: str, project_dir: str = "", tags: list[str] | None = None) -> dict:
+    """Ingest a single file into Vaire memory.
+
+    Chunks the file, generates embeddings, and stores each chunk as a memory.
+    Supported extensions: .md, .txt, .rst, .py, .js, .ts, .yaml, .yml, .json, .toml.
+
+    file_path: Absolute path to the file to ingest.
+    project_dir: directory_context to record for all chunks. If omitted, uses the file path.
+    tags: Optional list of tags to attach to every ingested chunk.
+    """
+    # ── Block remote file access ──
+    transport_info = transport_ctx.get()
+    if transport_info.is_remote:
+        return {"error": "File ingestion is not permitted via remote transport"}
+
+    import asyncio
+    import concurrent.futures
+
+    if _pipeline is None:
+        return {"error": "Ingestion pipeline not initialized"}
+    params = {"file_path": file_path, "project_dir": project_dir, "tags": tags or []}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, _pipeline.ingest_file(params, ""))
+        return future.result()
+
+
+@mcp_server.tool()
+def ingest_directory(
+    directory_path: str,
+    recursive: bool = True,
+    project_dir: str = "",
+    tags: list[str] | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Ingest all supported files in a directory into Vaire memory.
+
+    Returns a job_id immediately and runs ingestion in the background.
+    Poll with ingest_status(job_id) to check progress.
+
+    directory_path: Absolute path to the directory to ingest.
+    recursive: Whether to recurse into subdirectories (default True).
+    project_dir: directory_context for all chunks (host-side path).
+    tags: Optional list of tags to attach to every ingested chunk.
+    dry_run: If True, show what would be ingested without storing.
+    """
+    # ── Block remote file access ──
+    transport_info = transport_ctx.get()
+    if transport_info.is_remote:
+        return {"error": "Directory ingestion is not permitted via remote transport"}
+
+    import uuid as _uuid
+    import asyncio
+    import concurrent.futures
+
+    if _pipeline is None:
+        return {"error": "Ingestion pipeline not initialized"}
+
+    params = {
+        "directory_path": directory_path,
+        "recursive": recursive,
+        "project_dir": project_dir,
+        "tags": tags or [],
+        "dry_run": dry_run,
+    }
+
+    if dry_run:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, _pipeline.ingest_directory(params, ""))
+            return future.result()
+
+    job_id = str(_uuid.uuid4())
+    _mcp_ingest_jobs[job_id] = None  # sentinel: started, not done
+
+    def _run():
+        try:
+            result = asyncio.run(_pipeline.ingest_directory(params, ""))
+            _mcp_ingest_jobs[job_id] = result
+        except Exception as exc:
+            logger.exception("MCP ingest_directory failed for job %s", job_id)
+            _mcp_ingest_jobs[job_id] = {"status": "error", "error": str(exc)}
+
+    import threading
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {
+        "job_id": job_id,
+        "status": "started",
+        "directory_path": directory_path,
+        "message": "Ingestion running in background. Poll ingest_status with this job_id.",
+    }
+
+
+# Background job tracker for MCP ingest_directory calls.
+_mcp_ingest_jobs: dict = {}
+
+
+@mcp_server.tool()
+def ingest_status(job_id: str) -> dict:
+    """Check the status of a background ingest_directory job.
+
+    job_id: The job_id returned by ingest_directory.
+    """
+    if job_id in _mcp_ingest_jobs:
+        result = _mcp_ingest_jobs[job_id]
+        if result is None:
+            return {"job_id": job_id, "status": "running"}
+        # Job is terminal (completed or error) — evict to prevent unbounded growth.
+        del _mcp_ingest_jobs[job_id]
+        if result.get("status") == "error":
+            return {"job_id": job_id, **result}
+        return {"job_id": job_id, "status": "completed", **result}
+    return {"error": f"Job not found: {job_id}"}
+
+
+@mcp_server.tool()
+def ingest_preview(file_path: str, project_dir: str = "", tags: list[str] | None = None) -> dict:
+    """Preview how a file would be chunked without storing anything.
+
+    Returns chunk count and boundaries for the file.
+
+    file_path: Absolute path to the file to preview.
+    project_dir: directory_context that would be used.
+    tags: Tags that would be attached.
+    """
+    # ── Block remote file access ──
+    transport_info = transport_ctx.get()
+    if transport_info.is_remote:
+        return {"error": "File preview is not permitted via remote transport"}
+
+    import asyncio
+    import concurrent.futures
+
+    if _pipeline is None:
+        return {"error": "Ingestion pipeline not initialized"}
+    params = {"file_path": file_path, "project_dir": project_dir, "tags": tags or []}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, _pipeline.ingest_preview(params, ""))
+        return future.result()
+
+
+@mcp_server.tool()
 def seed_project(directory: str, dry_run: bool = False) -> dict:
     """Bootstrap Vaire memory for an existing project in one call.
 
@@ -1278,6 +1742,10 @@ def seed_project(directory: str, dry_run: bool = False) -> dict:
     directory: Project root directory to scan (absolute path).
     dry_run: If True, scan and show what would be stored without actually storing.
     """
+    # ── Block remote filesystem reads ──
+    if transport_ctx.get().is_remote:
+        return {"error": "Project seeding is not permitted via remote transport"}
+
     from vaire.seed import seed_project as _seed
 
     resolved = str(Path(directory).resolve())
@@ -1301,6 +1769,10 @@ def sync_instructions(claude_md_path: str = "") -> dict:
 
     claude_md_path: Path to CLAUDE.md. Defaults to ~/.claude/CLAUDE.md
     """
+    # ── Block remote filesystem writes ──
+    if transport_ctx.get().is_remote:
+        return {"status": "skipped", "reason": "Not permitted via remote transport"}
+
     md_path = Path(claude_md_path) if claude_md_path else Path.home() / ".claude" / "CLAUDE.md"
 
     if not md_path.parent.is_dir():
@@ -1383,6 +1855,235 @@ def sync_instructions(claude_md_path: str = "") -> dict:
     }
 
 
+# ── Reference & Task MCP tools ─────────────────────────────────────────
+
+
+@mcp_server.tool()
+def load_reference(
+    topic: str = "",
+    section: str | None = None,
+    show_index: bool = False,
+    category: str | None = None,
+) -> dict | str:
+    """Load a reference document from the static reference library.
+
+    Examples:
+        load_reference(show_index=True)                     # list all references
+        load_reference(show_index=True, category="nist")    # list NIST references
+        load_reference(topic="800-53:AC")                   # full AC family document
+        load_reference(topic="800-53:AC", section="AC-17")  # just AC-17
+        load_reference(topic="directive:all-agents")         # prime directive (hash-verified)
+    """
+    if _reference_loader is None:
+        return {"error": "Reference system not initialized"}
+
+    if show_index:
+        return _reference_loader.list_references(category=category)
+
+    if not topic:
+        return {"error": "Provide topic= or show_index=True"}
+
+    try:
+        from vaire.reference import PathSecurityError
+        content = _reference_loader.load(topic, section=section)
+        return {"topic": topic, "section": section, "content": content}
+    except KeyError as e:
+        return {"error": str(e)}
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+    except PathSecurityError:
+        return {"error": "Access denied"}
+
+
+@mcp_server.tool()
+def task_list(
+    status: str = "",
+    role: str = "",
+    include_history: bool = False,
+) -> dict:
+    """List tasks, optionally filtered by status and/or role.
+
+    Args:
+        status: Filter by status (open, in_progress, done, on_hold). Empty = all.
+        role: Filter by assigned role. Empty = all roles.
+        include_history: If True, include full task history in results.
+    """
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    return {
+        "tasks": _task_engine.list_tasks(
+            status=status or None,
+            role=role or None,
+            include_history=include_history,
+        )
+    }
+
+
+@mcp_server.tool()
+def task_get(task_id: str) -> dict:
+    """Get full details for a single task including acceptance criteria and history.
+
+    Args:
+        task_id: The task identifier (e.g. "TASK-044").
+    """
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    result = _task_engine.get_task(task_id)
+    if result is None:
+        return {"status": "error", "message": f"Task not found: {task_id}"}
+    return result
+
+
+@mcp_server.tool()
+def task_create(
+    title: str,
+    role: str,
+    priority: str = "medium",
+    directory: str = "",
+    description: str = "",
+    acceptance_criteria: list[str] | None = None,
+    depends_on: list[str] | None = None,
+    context_queries: list[str] | None = None,
+    on_completion: str = "",
+) -> dict:
+    """Create a new task. Restricted to allowed agent prefixes (TASK_CREATE_ALLOWED).
+
+    Args:
+        title: Short title for the task.
+        role: Target role (e.g. "builder", "defender", "architect").
+        priority: One of "low", "medium", "high", "critical". Default "medium".
+        directory: Project directory scope (optional).
+        description: Longer description of the task.
+        acceptance_criteria: List of criteria text strings.
+        depends_on: List of task IDs this task depends on.
+        context_queries: Vaire recall queries to run when claiming this task.
+        on_completion: Action to take on completion.
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task creation not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    # agent_id/host handled by dispatch wrapper for socket calls;
+    # MCP Starlette callers are local and trusted
+    try:
+        return _task_engine.create_task(
+            agent_id="local-mcp",
+            host="localhost",
+            title=title,
+            role=role,
+            priority=priority,
+            directory=directory,
+            description=description,
+            acceptance_criteria=[{"text": c} for c in (acceptance_criteria or [])],
+            depends_on=depends_on,
+            context_queries=context_queries,
+            on_completion=on_completion,
+        )
+    except (PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp_server.tool()
+def task_claim(task_id: str, model: str = "", pid: int = 0) -> dict:
+    """Claim an open task for this agent. Starts the heartbeat clock.
+
+    Args:
+        task_id: The task to claim.
+        model: Model identifier of the claiming agent (optional).
+        pid: Process ID of the claiming agent (optional).
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task claiming not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    try:
+        return _task_engine.claim_task(
+            task_id=task_id, agent_id="local-mcp",
+            host="localhost", model=model, pid=pid,
+        )
+    except (KeyError, PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp_server.tool()
+def task_update(
+    task_id: str,
+    notes: str = "",
+    phase: str | None = None,
+    action: str | None = None,
+    progress: int | None = None,
+    files: list[str] | None = None,
+    blockers: list[str] | None = None,
+    criteria_done: list[int] | None = None,
+) -> dict:
+    """Update progress on a claimed task. Only the claiming agent can update.
+
+    Args:
+        task_id: The task to update.
+        notes: Free-text progress notes.
+        phase: Current phase label (e.g. "pseudocode", "implement", "test").
+        action: Current action label (e.g. "editing server.py").
+        progress: Progress percentage (0-100). None means no change.
+        files: List of files modified in this update.
+        blockers: List of current blockers (replaces previous list).
+        criteria_done: IDs of acceptance criteria now satisfied.
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task updates not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    try:
+        return _task_engine.update_task(
+            task_id=task_id, agent_id="local-mcp", host="localhost",
+            notes=notes, phase=phase, action=action, progress=progress,
+            files=files, blockers=blockers, criteria_done=criteria_done,
+        )
+    except (KeyError, PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp_server.tool()
+def task_complete(task_id: str, result: str = "") -> dict:
+    """Mark a claimed task as complete. Only the claiming agent can complete.
+
+    Args:
+        task_id: The task to complete.
+        result: Summary of what was accomplished.
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task completion not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    try:
+        return _task_engine.complete_task(
+            task_id=task_id, agent_id="local-mcp",
+            host="localhost", result=result,
+        )
+    except (KeyError, PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp_server.tool()
+def task_release(task_id: str, reason: str = "") -> dict:
+    """Release a claimed task back to open status. Only the claiming agent can release.
+
+    Args:
+        task_id: The task to release.
+        reason: Why the task is being released.
+    """
+    if transport_ctx.get().is_remote:
+        return {"status": "error", "message": "Task release not permitted via remote transport"}
+    if _task_engine is None:
+        return {"error": "Task system not available"}
+    try:
+        return _task_engine.release_task(
+            task_id=task_id, agent_id="local-mcp",
+            host="localhost", reason=reason,
+        )
+    except (KeyError, PermissionError, ValueError) as e:
+        return {"status": "error", "message": str(e)}
+
+
 # ── MCP Resources ──────────────────────────────────────────────────────
 
 
@@ -1449,7 +2150,7 @@ def build_dispatch_table() -> dict:
         drill_down, create_trigger, get_project_story, add_rule, get_rules,
         navigate_memory, get_causal_chain, assess_coverage, detect_gaps,
         checkpoint, restore, anchor, install_hooks, sync_instructions,
-        seed_project,
+        seed_project, load_reference,
     ]
 
     # These tools do significant CPU/IO work and must not block the event loop.
@@ -1523,6 +2224,30 @@ def build_groomer_dispatch() -> dict:
     async def groom_auto(agent_id: str = "", **p):
         return g.auto_groom(**p)
 
+    async def groom_forget(agent_id: str = "", **p):
+        return g.forget(**p)
+
+    async def groom_search(agent_id: str = "", **p):
+        return g.search(**p)
+
+    async def groom_bulk_retag(agent_id: str = "", **p):
+        return g.bulk_retag(**p)
+
+    async def groom_content_scan(agent_id: str = "", **p):
+        return g.content_scan(**p)
+
+    async def groom_provenance(agent_id: str = "", **p):
+        return g.provenance(**p)
+
+    async def groom_bulk_update_content(agent_id: str = "", **p):
+        return g.bulk_update_content(**p)
+
+    async def groom_sanitize(agent_id: str = "", **p):
+        return g.sanitize(**p)
+
+    async def groom_sanitize_archives(agent_id: str = "", **p):
+        return g.sanitize_archives(**p)
+
     return {
         "groom_audit": groom_audit,
         "groom_inspect": groom_inspect,
@@ -1540,6 +2265,14 @@ def build_groomer_dispatch() -> dict:
         "groom_demote": groom_demote,
         "groom_bulk_delete": groom_bulk_delete,
         "groom_auto": groom_auto,
+        "groom_forget": groom_forget,
+        "groom_search": groom_search,
+        "groom_bulk_retag": groom_bulk_retag,
+        "groom_content_scan": groom_content_scan,
+        "groom_provenance": groom_provenance,
+        "groom_bulk_update_content": groom_bulk_update_content,
+        "groom_sanitize": groom_sanitize,
+        "groom_sanitize_archives": groom_sanitize_archives,
     }
 
 
@@ -1591,12 +2324,16 @@ def build_ingest_dispatch(pipeline) -> dict:
         _dir_jobs[job_id] = None  # sentinel: job started, not yet done
 
         async def _run():
-            loop = _asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: _asyncio.run(pipeline.ingest_directory(params, agent_id)),
-            )
-            _dir_jobs[job_id] = result
+            try:
+                loop = _asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: _asyncio.run(pipeline.ingest_directory(params, agent_id)),
+                )
+                _dir_jobs[job_id] = result
+            except Exception as exc:
+                logger.exception("Background ingest_directory failed for job %s", job_id)
+                _dir_jobs[job_id] = {"status": "error", "error": str(exc)}
 
         _asyncio.create_task(_run())
         return {
@@ -1613,6 +2350,10 @@ def build_ingest_dispatch(pipeline) -> dict:
             result = _dir_jobs[job_id]
             if result is None:
                 return {"job_id": job_id, "status": "running"}
+            # Job is terminal — evict to prevent unbounded growth.
+            del _dir_jobs[job_id]
+            if result.get("status") == "error":
+                return {"job_id": job_id, **result}
             return {"job_id": job_id, "status": "completed", **result}
         return await pipeline.ingest_status(params, agent_id)
 
@@ -1625,6 +2366,90 @@ def build_ingest_dispatch(pipeline) -> dict:
         "ingest_status": ingest_status,
         "ingest_preview": ingest_preview,
     }
+
+
+def build_task_dispatch() -> dict:
+    """Build task dispatch table — forwards agent_id to TaskEngine.
+
+    Read-only tools run directly; mutation tools run in executor.
+    """
+    import socket as _socket
+
+    if _task_engine is None:
+        return {}
+
+    engine = _task_engine
+    _host = _socket.gethostname()
+
+    async def task_list_handler(agent_id: str = "", **params):
+        status = params.get("status", "") or None
+        role = params.get("role", "") or None
+        include_history = params.get("include_history", False)
+        return {"tasks": engine.list_tasks(
+            status=status, role=role, include_history=include_history,
+        )}
+
+    async def task_get_handler(agent_id: str = "", **params):
+        result = engine.get_task(params.get("task_id", ""))
+        if result is None:
+            return {"status": "error", "message": f"Task not found: {params.get('task_id', '?')}"}
+        return result
+
+    async def task_create_handler(agent_id: str = "", **params):
+        allowed_prefixes = settings.task_create_allowed_list
+        if allowed_prefixes:
+            if not any(agent_id.startswith(p) for p in allowed_prefixes):
+                return {
+                    "status": "error",
+                    "message": f"Agent '{agent_id}' not authorized to create tasks",
+                }
+        # Convert acceptance_criteria strings to dicts if needed
+        ac = params.get("acceptance_criteria")
+        if ac and isinstance(ac, list) and ac and isinstance(ac[0], str):
+            params["acceptance_criteria"] = [{"text": c} for c in ac]
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.create_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    async def task_claim_handler(agent_id: str = "", **params):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.claim_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    async def task_update_handler(agent_id: str = "", **params):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.update_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    async def task_complete_handler(agent_id: str = "", **params):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.complete_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    async def task_release_handler(agent_id: str = "", **params):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: engine.release_task(agent_id=agent_id, host=_host, **params)
+        )
+
+    handlers = {
+        "task_list": task_list_handler,
+        "task_get": task_get_handler,
+        "task_create": task_create_handler,
+        "task_claim": task_claim_handler,
+        "task_update": task_update_handler,
+        "task_complete": task_complete_handler,
+        "task_release": task_release_handler,
+    }
+
+    for name, handler in handlers.items():
+        handler.__name__ = name
+
+    return handlers
 
 
 # ── Startup ────────────────────────────────────────────────────────────
@@ -1641,6 +2466,7 @@ def init_engines(
     global _prospective, _narrative, _sleep, _fractal, _pool, _kg, _reconsolidation, _write_gate, _engram
     global _rules_engine, _hopfield, _cls, _compressor, _hdc, _cognitive_map, _causal, _metacognition, _crdt
     global _replay, _groomer, _write_queue, _cache, _pipeline
+    global _reference_loader, _task_engine
 
     _settings = get_settings()
     _storage = StorageEngine(db_path or _settings.DB_PATH)
@@ -1655,12 +2481,12 @@ def init_engines(
     _retriever.set_hdc(_hdc)
     _retriever.set_cognitive_map(_cognitive_map)
     _curator = MemoryCurator(_storage, _embeddings, _thermo, _settings)
-    _consolidation = AstrocyteEngine(_storage, _embeddings, _settings)
     _staleness = StalenessDetector(_storage, _settings)
     _prospective = ProspectiveMemoryEngine(_storage, _settings)
     _narrative = NarrativeEngine(_storage, _kg, _settings)
     _reconsolidation = ReconsolidationEngine(_storage, _embeddings, _settings)
     _write_gate = PredictiveCodingGate(_storage, _embeddings, _retriever, _settings)
+    _consolidation = AstrocyteEngine(_storage, _embeddings, _settings, write_gate=_write_gate)
     _engram = EngramAllocator(_storage, _settings)
     _rules_engine = RulesEngine(_storage, _settings)
     _causal = CausalDiscovery(_storage, _kg, _settings)
@@ -1692,7 +2518,7 @@ def init_engines(
     from vaire.write_queue import WriteQueue
     from vaire.groomer import GroomerEngine
     from vaire.ingest import IngestionPipeline, MarkdownChunker
-    _cache = MemoryCache(_settings)
+    _cache = MemoryCache(_storage)
     _groomer = GroomerEngine(_storage, _embeddings, _cache, _settings)
     _write_queue = WriteQueue(_storage, _cache, _settings)
     _chunker = MarkdownChunker(_settings)
@@ -1706,11 +2532,99 @@ def init_engines(
         settings=_settings,
     )
 
+    # ── Reference system (non-fatal) ────────────────────────────────────
+    try:
+        from vaire.reference import ReferenceLoader
+        _reference_loader = ReferenceLoader(_settings)
+        _reference_loader.load_manifest()
+    except Exception:
+        logger.warning("Reference system unavailable — manifest load failed", exc_info=True)
+        _reference_loader = None
+
+    # ── Task engine (non-fatal) ─────────────────────────────────────────
+    try:
+        from vaire.task_engine import TaskEngine
+        _task_engine = TaskEngine(_settings)
+        logger.info("TaskEngine initialized (data=%s)", _settings.task_data_path_resolved)
+    except Exception:
+        logger.warning("TaskEngine init failed — task tools will return errors", exc_info=True)
+        _task_engine = None
+
+    # ── GitLab task sync (requires TaskEngine + GitLab config) ──────────
+    global _task_sync, _gitlab_client
+    _task_sync = None
+    _gitlab_client = None
+    if _task_engine is not None and _settings.gitlab_enabled:
+        try:
+            from vaire.gitlab_client import GitLabClient
+            from vaire.task_engine import TaskSyncThread
+            _gitlab_client = GitLabClient(
+                _settings.GITLAB_API_URL,
+                _settings.GITLAB_PROJECT_ID,
+                _settings.GITLAB_TOKEN,
+            )
+            _task_sync = TaskSyncThread(_task_engine, _gitlab_client, _settings)
+            _task_sync.start()
+            logger.info(
+                "GitLab task sync enabled (interval=%ds)",
+                _settings.TASK_SYNC_INTERVAL,
+            )
+        except Exception:
+            logger.warning("GitLab task sync init failed (non-fatal)", exc_info=True)
+    elif _task_engine is not None:
+        logger.info("GitLab task sync disabled — running local-only")
+
     if start_daemons:
         _consolidation.start()
         if watch_directory:
             _staleness.start(watch_directory)
         _write_queue.start()
+
+    # Pre-warm ML models so first client request doesn't pay load cost.
+    # Embedding model: ~5-9s cold load, <20ms after warmup.
+    # Cross-encoder (GTE): ~1.5s cold load + ~1.7s first inference.
+    try:
+        logger.info("Pre-warming ML models...")
+        _prewarm_start = time.time()
+
+        # 1. Embedding model — loads SentenceTransformer into class-level cache
+        _embeddings.encode("model warmup")
+        logger.info("  Embedding model loaded (%.1fs)", time.time() - _prewarm_start)
+
+        # 2. Cross-encoder (GTE reranker) — instance-level on retriever
+        if getattr(_settings, "CROSS_ENCODER_ENABLED", False) and _retriever is not None:
+            _ce_start = time.time()
+            try:
+                from sentence_transformers import CrossEncoder as _STCrossEncoder
+                if _retriever._gte_reranker is None:
+                    _retriever._gte_reranker = _STCrossEncoder(
+                        "Alibaba-NLP/gte-reranker-modernbert-base",
+                        trust_remote_code=True,
+                    )
+                # Force first inference to trigger JIT/compilation warmup
+                _retriever._gte_reranker.predict([["warmup query", "warmup document"]])
+                logger.info("  Cross-encoder loaded (%.1fs)", time.time() - _ce_start)
+            except Exception:
+                logger.debug("  Cross-encoder pre-warm failed (non-fatal)")
+
+        # 3. Doc2Query T5 model — ~15s cold load, used at write time
+        if getattr(_settings, "INDEX_ENRICHMENT_ENABLED", False) and getattr(_settings, "DOC2QUERY_ENRICHMENT_ENABLED", False):
+            _d2q_start = time.time()
+            try:
+                from vaire.storage import _get_enrichment_pipeline
+                pipeline = _get_enrichment_pipeline(_settings, _embeddings)
+                d2q = pipeline._get_doc2query()
+                d2q._ensure_model(_settings.DOC2QUERY_MODEL)
+                logger.info("  Doc2Query model loaded (%.1fs)", time.time() - _d2q_start)
+            except Exception:
+                logger.debug("  Doc2Query pre-warm failed (non-fatal)")
+
+        logger.info(
+            "ML models pre-warmed in %.1fs",
+            time.time() - _prewarm_start,
+        )
+    except Exception:
+        logger.debug("Model pre-warm failed (non-fatal)", exc_info=True)
 
     return _storage, _embeddings, _buffer, _consolidation, _staleness
 
@@ -1732,6 +2646,15 @@ def shutdown():
     global _prospective, _narrative, _sleep, _fractal, _pool, _kg, _reconsolidation, _write_gate, _engram
     global _rules_engine, _hopfield, _cls, _compressor, _hdc, _cognitive_map, _causal, _metacognition, _crdt
     global _replay, _groomer, _write_queue, _cache, _pipeline
+    global _task_sync, _gitlab_client
+
+    # Stop task sync thread first (final push attempt)
+    if _task_sync is not None:
+        _task_sync.stop()
+        _task_sync = None
+    if _gitlab_client is not None:
+        _gitlab_client.close()
+        _gitlab_client = None
 
     if _write_queue is not None:
         # Sync path (signal handler): stop the loop and do a best-effort drain.
@@ -1784,6 +2707,158 @@ def shutdown():
     _write_queue = None
     _cache = None
     _pipeline = None
+
+
+# ── mTLS HTTPS Server ─────────────────────────────────────────────────
+
+
+def _cn_from_peercert(peercert: dict) -> str | None:
+    """Extract the Common Name from an ssl.getpeercert() dict."""
+    subject = peercert.get("subject", ())
+    for rdn in subject:
+        for attr_type, attr_value in rdn:
+            if attr_type == "commonName":
+                return attr_value
+    return None
+
+
+class MTLSMiddleware:
+    """ASGI middleware that sets transport_ctx for HTTPS requests.
+
+    Identity extraction priority:
+      1. TLS client certificate CN (from ASGI extensions or transport)
+      2. X-Vaire-CN header (fallback, logged as warning)
+      3. "unknown" (no identity available)
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            from vaire.transport_context import TransportInfo
+
+            cn = self._extract_cert_cn(scope)
+            client = scope.get("client", ("unknown", 0))
+            token = transport_ctx.set(TransportInfo(
+                is_remote=True, agent_cn=cn, client_ip=str(client[0]),
+            ))
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                transport_ctx.reset(token)
+        else:
+            # lifespan, websocket — pass through
+            await self.app(scope, receive, send)
+
+    @staticmethod
+    def _extract_cert_cn(scope: dict) -> str:
+        """Extract Common Name from TLS client certificate.
+
+        Tries ASGI-standard TLS extensions first, then uvicorn transport
+        fallback, then X-Vaire-CN header as last resort (with warning).
+        """
+        # Strategy 1: ASGI extensions (future-proof)
+        tls_info = scope.get("extensions", {}).get("tls", {})
+        peercert = tls_info.get("peercert")
+        if peercert:
+            cn = _cn_from_peercert(peercert)
+            if cn:
+                return cn
+
+        # Strategy 2: uvicorn transport fallback
+        try:
+            transport = scope.get("_transport")
+            if transport is None:
+                transport = scope.get("extensions", {}).get("transport")
+            if transport is not None:
+                ssl_object = transport.get_extra_info("ssl_object")
+                if ssl_object:
+                    peercert = ssl_object.getpeercert()
+                    if peercert:
+                        cn = _cn_from_peercert(peercert)
+                        if cn:
+                            return cn
+        except Exception:
+            pass
+
+        # Strategy 3: Fall back to X-Vaire-CN header (log warning)
+        cn_bytes = b"unknown"
+        for key, val in scope.get("headers", []):
+            if key.lower() == b"x-vaire-cn":
+                cn_bytes = val
+                break
+        cn = cn_bytes.decode("utf-8", errors="replace")
+        if cn != "unknown":
+            logger.warning(
+                "Using X-Vaire-CN header for identity (cert CN extraction "
+                "unavailable). Client claims: %s", cn
+            )
+        return cn
+
+
+async def run_https(settings_override=None):
+    """Start the mTLS HTTPS server alongside the socket server.
+
+    Reuses the existing FastMCP Starlette app (same tool routes),
+    wrapping it with MTLSMiddleware and SSL.
+    """
+    import ssl as _ssl
+    import uvicorn
+
+    _settings = settings_override or settings
+
+    if not _settings.tls_enabled:
+        logger.info("HTTPS disabled (VAIRE_HTTPS_BIND not set)")
+        return
+
+    transport = _settings.HTTPS_TRANSPORT
+
+    # Override DNS rebinding protection for HTTPS — mTLS is the auth boundary.
+    # VAIRE_HTTPS_ALLOWED_HOSTS="*" (default) disables the check entirely;
+    # a comma-separated list restricts to those hosts.
+    allowed = _settings.HTTPS_ALLOWED_HOSTS.strip()
+    if allowed == "*":
+        https_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    else:
+        hosts = [
+            h.strip() + ":*" if ":" not in h.strip() else h.strip()
+            for h in allowed.split(",") if h.strip()
+        ]
+        https_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=hosts,
+        )
+
+    original_security = mcp_server.settings.transport_security
+    mcp_server.settings.transport_security = https_security
+    try:
+        if transport == "sse":
+            app = mcp_server.sse_app()
+        else:
+            app = mcp_server.streamable_http_app()
+    finally:
+        mcp_server.settings.transport_security = original_security
+
+    # Wrap with mTLS context middleware
+    app = MTLSMiddleware(app)
+
+    config = uvicorn.Config(
+        app,
+        host=_settings.https_host,
+        port=_settings.https_port,
+        ssl_certfile=str(_settings.tls_cert_resolved),
+        ssl_keyfile=str(_settings.tls_key_resolved),
+        ssl_ca_certs=str(_settings.tls_ca_resolved),
+        ssl_cert_reqs=_ssl.CERT_REQUIRED,
+        log_level="info",
+    )
+    server = uvicorn.Server(config)
+    logger.info(
+        "mTLS HTTPS server starting on %s:%d (transport=%s)",
+        _settings.https_host, _settings.https_port, transport,
+    )
+    await server.serve()
 
 
 def _signal_handler(signum, frame):

@@ -29,7 +29,7 @@ def graph(storage, settings):
 class TestAddTypedRelationship:
     def test_creates_relationship_with_type(self, graph, storage):
         rid = graph.add_relationship("module_a", "module_b", "imports")
-        row = storage._conn.execute(
+        row = storage._test_conn.execute(
             "SELECT * FROM relationships WHERE id = ?", (rid,)
         ).fetchone()
         row = storage._row_to_dict(row)
@@ -48,7 +48,7 @@ class TestAddTypedRelationship:
     def test_stores_event_time_and_record_time(self, graph, storage):
         event = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
         rid = graph.add_relationship("x", "y", "calls", event_time=event)
-        row = storage._conn.execute(
+        row = storage._test_conn.execute(
             "SELECT event_time, record_time FROM relationships WHERE id = ?",
             (rid,),
         ).fetchone()
@@ -58,7 +58,7 @@ class TestAddTypedRelationship:
 
     def test_confidence_stored(self, graph, storage):
         rid = graph.add_relationship("a", "b", "derived_from", confidence=0.75)
-        row = storage._conn.execute(
+        row = storage._test_conn.execute(
             "SELECT confidence FROM relationships WHERE id = ?", (rid,)
         ).fetchone()
         assert row[0] == pytest.approx(0.75)
@@ -69,7 +69,7 @@ class TestRelationshipReinforcement:
         rid1 = graph.add_relationship("foo", "bar", "co_occurrence")
         rid2 = graph.add_relationship("foo", "bar", "co_occurrence")
         assert rid1 == rid2  # same relationship returned
-        row = storage._conn.execute(
+        row = storage._test_conn.execute(
             "SELECT weight FROM relationships WHERE id = ?", (rid1,)
         ).fetchone()
         assert row[0] == pytest.approx(2.0)
@@ -78,7 +78,7 @@ class TestRelationshipReinforcement:
         rid = graph.add_relationship("a", "b", "imports")
         graph.add_relationship("a", "b", "imports")
         graph.add_relationship("a", "b", "imports")
-        row = storage._conn.execute(
+        row = storage._test_conn.execute(
             "SELECT weight FROM relationships WHERE id = ?", (rid,)
         ).fetchone()
         assert row[0] == pytest.approx(3.0)
@@ -93,7 +93,7 @@ class TestBiTemporal:
     def test_event_time_vs_record_time(self, graph, storage):
         past = datetime(2024, 1, 1, tzinfo=timezone.utc)
         rid = graph.add_relationship("a", "b", "imports", event_time=past)
-        row = storage._conn.execute(
+        row = storage._test_conn.execute(
             "SELECT event_time, record_time FROM relationships WHERE id = ?",
             (rid,),
         ).fetchone()
@@ -156,7 +156,7 @@ class TestCausalDetection:
         assert created >= 1
 
         # Verify causal edge exists
-        rows = storage._conn.execute(
+        rows = storage._test_conn.execute(
             "SELECT * FROM relationships WHERE relationship_type = 'caused_by' "
             "AND is_causal = 1"
         ).fetchall()

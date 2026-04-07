@@ -165,10 +165,10 @@ class TestReconsolidate:
             directory="/home/user/webapp",
         )
         # Set plasticity high to ensure we can trigger update
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET plasticity = 0.8, stability = 0.0 WHERE id = ?", (mid,)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         result = engine.reconsolidate(
             mid,
@@ -190,10 +190,10 @@ class TestReconsolidate:
             directory="/home/user/backend",
         )
         # Force archive by setting low stability, high plasticity
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET plasticity = 0.8, stability = 0.0 WHERE id = ?", (mid,)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         # Use completely different context to force high mismatch
         result = engine.reconsolidate(
@@ -216,10 +216,10 @@ class TestReconsolidate:
             directory="/home/user/db",
         )
         # Set plasticity high to make it susceptible
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET plasticity = 0.8, stability = 0.0 WHERE id = ?", (mid,)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         mem_before = storage.get_memory(mid)
         initial_count = mem_before.get("reconsolidation_count", 0)
@@ -244,11 +244,11 @@ class TestPlasticity:
         mid = _make_memory(storage, embeddings, "test plasticity content")
 
         # Set plasticity to a known low value
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET plasticity = 0.2, last_excitability_update = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         new_plasticity = engine.update_plasticity(mid)
 
@@ -262,11 +262,11 @@ class TestPlasticity:
 
         # Set plasticity high and last update 12 hours ago (2 half-lives)
         past = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET plasticity = 1.0, last_excitability_update = ? WHERE id = ?",
             (past, mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         new_plasticity = engine.update_plasticity(mid)
 
@@ -279,11 +279,11 @@ class TestPlasticity:
         mid = _make_memory(storage, embeddings, "cap test")
 
         # Set plasticity already high
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET plasticity = 0.9, last_excitability_update = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         new_plasticity = engine.update_plasticity(mid)
         assert new_plasticity <= 1.0
@@ -293,10 +293,10 @@ class TestStability:
     def test_stability_increases_on_useful(self, engine, storage, embeddings):
         """Stability should increase when memory is rated useful."""
         mid = _make_memory(storage, embeddings, "useful content")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET stability = 0.3 WHERE id = ?", (mid,)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         new_stability = engine.update_stability(mid, was_useful=True)
         assert new_stability == pytest.approx(0.4, abs=0.01)
@@ -304,10 +304,10 @@ class TestStability:
     def test_stability_decreases_on_not_useful_high_access(self, engine, storage, embeddings):
         """Stability should decrease for non-useful memories with many accesses."""
         mid = _make_memory(storage, embeddings, "frequently recalled but useless")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET stability = 0.5, access_count = 10 WHERE id = ?", (mid,)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         new_stability = engine.update_stability(mid, was_useful=False)
         assert new_stability == pytest.approx(0.45, abs=0.01)
@@ -315,10 +315,10 @@ class TestStability:
     def test_stability_not_decreased_low_access(self, engine, storage, embeddings):
         """Stability should not decrease for low-access memories even if not useful."""
         mid = _make_memory(storage, embeddings, "rarely recalled")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET stability = 0.5, access_count = 2 WHERE id = ?", (mid,)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         new_stability = engine.update_stability(mid, was_useful=False)
         assert new_stability == pytest.approx(0.5, abs=0.01)
@@ -326,10 +326,10 @@ class TestStability:
     def test_stability_caps_at_one(self, engine, storage, embeddings):
         """Stability should not exceed 1.0."""
         mid = _make_memory(storage, embeddings, "almost fully stable")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET stability = 0.95 WHERE id = ?", (mid,)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         new_stability = engine.update_stability(mid, was_useful=True)
         assert new_stability <= 1.0
@@ -337,10 +337,10 @@ class TestStability:
     def test_stability_floors_at_zero(self, engine, storage, embeddings):
         """Stability should not go below 0.0."""
         mid = _make_memory(storage, embeddings, "barely stable")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET stability = 0.01, access_count = 10 WHERE id = ?", (mid,)
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         new_stability = engine.update_stability(mid, was_useful=False)
         assert new_stability >= 0.0

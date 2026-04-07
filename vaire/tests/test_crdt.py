@@ -332,11 +332,11 @@ class TestDetectConflicts:
         # Insert a conflicted memory
         content = "version A\n--- [Agent: agent-beta] ---\nversion B"
         mid = _insert_memory(storage, content)
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET provenance_agent = ? WHERE id = ?",
             ("agent-alpha", mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         conflicts = crdt.detect_conflicts()
         assert len(conflicts) == 1
@@ -361,11 +361,11 @@ class TestDetectConflicts:
             "version C"
         )
         mid = _insert_memory(storage, content)
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET provenance_agent = ? WHERE id = ?",
             ("agent-alpha", mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         conflicts = crdt.detect_conflicts()
         assert len(conflicts) == 1
@@ -377,11 +377,11 @@ class TestResolveConflict:
     def _make_conflicted(self, storage):
         content = "version from alpha\n--- [Agent: agent-beta] ---\nversion from beta"
         mid = _insert_memory(storage, content)
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET provenance_agent = ? WHERE id = ?",
             ("agent-alpha", mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
         return mid
 
     def test_resolve_latest(self, crdt, storage):
@@ -409,11 +409,11 @@ class TestResolveConflict:
         """Resolution with 'longest' keeps the longest version."""
         content = "short\n--- [Agent: agent-beta] ---\nthis is a much longer version of the text"
         mid = _insert_memory(storage, content)
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET provenance_agent = ? WHERE id = ?",
             ("agent-alpha", mid),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         result = crdt.resolve_conflict(mid, "longest")
         assert result["content"] == "this is a much longer version of the text"
@@ -468,11 +468,11 @@ class TestSyncMemories:
     def test_sync_unchanged(self, crdt, storage):
         """Matching memories with equal clocks should be unchanged."""
         _insert_memory(storage, "existing memory")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET vector_clock = ? WHERE id = 1",
             (json.dumps({"agent-alpha": 1}),),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         remote_memories = [
             {
@@ -491,11 +491,11 @@ class TestSyncMemories:
     def test_sync_with_conflicts(self, crdt, storage):
         """Concurrent edits should be detected and merged with conflict markers."""
         _insert_memory(storage, "original content")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET vector_clock = ?, provenance_agent = ? WHERE id = 1",
             (json.dumps({"agent-alpha": 2, "agent-beta": 1}), "agent-alpha"),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         # Remote has a concurrent edit (alpha:1, beta:2 vs local alpha:2, beta:1)
         remote_memories = [
@@ -520,11 +520,11 @@ class TestSyncMemories:
     def test_sync_with_content_conflict(self, crdt, storage):
         """Different content with concurrent clocks should produce conflict."""
         _insert_memory(storage, "local version")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET vector_clock = ?, provenance_agent = ? WHERE id = 1",
             (json.dumps({"agent-alpha": 2, "agent-beta": 1}), "agent-alpha"),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         # Trick: we need to match by content, but content differs.
         # In this scenario, we manually set up a second memory with
@@ -547,11 +547,11 @@ class TestSyncMemories:
     def test_sync_remote_newer(self, crdt, storage):
         """When remote is strictly newer, merge updates local."""
         _insert_memory(storage, "shared content")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET vector_clock = ?, provenance_agent = ?, heat = 0.3 WHERE id = 1",
             (json.dumps({"agent-alpha": 1}), "agent-alpha"),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         remote_memories = [
             {
@@ -577,12 +577,12 @@ class TestAgentStats:
         """Should return correct counts and agent info."""
         # Insert memories with different provenances
         mid1 = _insert_memory(storage, "memory by alpha")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET provenance_agent = ? WHERE id = ?",
             ("agent-alpha", mid1),
         )
         mid2 = _insert_memory(storage, "memory by beta")
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET provenance_agent = ? WHERE id = ?",
             ("agent-beta", mid2),
         )
@@ -591,11 +591,11 @@ class TestAgentStats:
             storage,
             "version A\n--- [Agent: agent-beta] ---\nversion B",
         )
-        storage._conn.execute(
+        storage._test_conn.execute(
             "UPDATE memories SET provenance_agent = ? WHERE id = ?",
             ("agent-alpha", mid3),
         )
-        storage._conn.commit()
+        storage._test_conn.commit()
 
         stats = crdt.get_agent_stats()
         assert stats["agent_id"] == "agent-alpha"

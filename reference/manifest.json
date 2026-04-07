@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "categories": {
+    "examples": {
+      "description": "Example references for demonstration",
+      "integrity": "optional"
+    }
+  },
+  "references": {
+    "example:hello": {
+      "path": "examples/hello.md",
+      "category": "examples",
+      "description": "Example reference document",
+      "keywords": ["example", "demo"],
+      "sections": ["intro", "usage"],
+      "sha256": ""
+    }
+  }
+}

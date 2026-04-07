@@ -11,6 +11,21 @@ from vaire.thermodynamics import MemoryThermodynamics
 
 logger = logging.getLogger(__name__)
 
+# Patterns that indicate a "specific" entity worth deriving patterns from.
+# File paths, dotted module names, CamelCase classes, snake_case functions,
+# error types — anything that looks like a code identifier rather than
+# a plain English word.
+_SPECIFIC_ENTITY_RE = re.compile(
+    r"(?:"
+    r"/[\w./-]+"          # file paths: /foo/bar.py
+    r"|[\w]+\.[\w.]+"     # dotted names: vaire.consolidation, Chart.yaml
+    r"|[A-Z][a-z]+[A-Z]"  # CamelCase: AstrocyteEngine, TypeError
+    r"|[\w]+_[\w]+"       # snake_case: _process_action_log, memory_stats
+    r"|[\w]*(?:Error|Exception|Warning)\b"  # error types
+    r"|[\w]+\.\w{1,5}$"  # file extensions: foo.py, values.yaml
+    r")"
+)
+
 # Negation patterns for contradiction detection
 _NEGATION_RE = re.compile(
     r"\b(not|don't|doesn't|didn't|won't|can't|cannot|isn't|aren't|wasn't|weren't|"
@@ -52,6 +67,20 @@ class MemoryCurator:
         self._embeddings = embeddings
         self._thermo = thermodynamics
         self._settings = settings
+
+    @staticmethod
+    def _is_specific_entity(name: str) -> bool:
+        """Return True if the entity name looks like a code identifier.
+
+        Rejects plain English words (password, correctly, looping, yaml, etc.)
+        in favour of file paths, dotted modules, CamelCase classes,
+        snake_case functions, and error types.
+        """
+        # Must be at least 4 chars
+        if len(name) < 4:
+            return False
+        # Must match at least one "specific" pattern
+        return _SPECIFIC_ENTITY_RE.search(name) is not None
 
     # ── a. Active Curation on Ingestion ──────────────────────────────────
 
@@ -175,20 +204,18 @@ class MemoryCurator:
         merged_embedding = self._embeddings.encode(embed_text)
 
         # Update memory in DB
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE memories SET content = ?, tags = ?, heat = 1.0, "
             "last_accessed = ? WHERE id = ?",
             (merged_content, json.dumps(merged_tags), self._storage._now_iso(), existing_id),
         )
-        self._storage._conn.commit()
 
         # Update embedding in vec0
         if merged_embedding is not None:
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET embedding = ? WHERE id = ?",
                 (merged_embedding, existing_id),
             )
-            self._storage._conn.commit()
             try:
                 self._storage.update_vector(existing_id, merged_embedding)
             except Exception:
@@ -226,11 +253,10 @@ class MemoryCurator:
         })
 
         if contextual_prefix:
-            self._storage._conn.execute(
+            self._storage.execute_write(
                 "UPDATE memories SET contextual_prefix = ? WHERE id = ?",
                 (contextual_prefix, memory_id),
             )
-            self._storage._conn.commit()
 
         self._storage.update_memory_scores(
             memory_id,
@@ -305,11 +331,10 @@ class MemoryCurator:
                 })
                 # Reduce confidence of old contradicting memory
                 old_confidence = mem.get("confidence", 1.0)
-                self._storage._conn.execute(
+                self._storage.execute_write(
                     "UPDATE memories SET confidence = ? WHERE id = ?",
                     (max(old_confidence - 0.2, 0.1), mem_id),
                 )
-                self._storage._conn.commit()
                 continue
 
             # Check 2: same entities but different actions
@@ -326,11 +351,10 @@ class MemoryCurator:
                         "reason": "action_divergence",
                     })
                     old_confidence = mem.get("confidence", 1.0)
-                    self._storage._conn.execute(
+                    self._storage.execute_write(
                         "UPDATE memories SET confidence = ? WHERE id = ?",
                         (max(old_confidence - 0.1, 0.1), mem_id),
                     )
-                    self._storage._conn.commit()
 
         return contradictions
 
@@ -353,34 +377,29 @@ class MemoryCurator:
 
     def _memify_prune(self, stats: dict) -> None:
         """Delete memories with heat < 0.01 AND confidence < 0.3 AND access_count == 0."""
-        rows = self._storage._conn.execute(
-            "SELECT id FROM memories WHERE heat < 0.01 AND confidence < 0.3 "
-            "AND access_count = 0"
-        ).fetchall()
+        memories = self._storage.get_memories_for_pruning()
 
-        for row in rows:
-            self._storage.delete_memory(row[0])
+        for mem in memories:
+            self._storage.delete_memory(mem["id"])
             stats["pruned"] += 1
 
     def _memify_strengthen(self, stats: dict) -> None:
         """Boost importance for memories accessed > 5 times with confidence > 0.8."""
-        rows = self._storage._conn.execute(
-            "SELECT id, importance FROM memories "
-            "WHERE access_count > 5 AND confidence > 0.8 AND importance < 1.0"
-        ).fetchall()
+        memories = self._storage.get_memories_for_strengthening()
 
-        for row in rows:
-            mem_id = row[0]
-            current_importance = row[1] if row[1] is not None else 0.5
+        writes: list[tuple[str, tuple]] = []
+        for mem in memories:
+            mem_id = mem["id"]
+            current_importance = mem.get("importance") or 0.5
             new_importance = min(current_importance + 0.1, 1.0)
-            self._storage._conn.execute(
+            writes.append((
                 "UPDATE memories SET importance = ? WHERE id = ?",
                 (new_importance, mem_id),
-            )
+            ))
             stats["strengthened"] += 1
 
-        if rows:
-            self._storage._conn.commit()
+        if writes:
+            self._storage.execute_writes(writes)
 
     def _memify_reweight(self, stats: dict) -> None:
         """Adjust relationship weights based on usage patterns.
@@ -388,28 +407,23 @@ class MemoryCurator:
         Relationships between frequently co-retrieved memories get weight boost.
         Relationships between rarely-used entities get weight decay.
         """
-        rows = self._storage._conn.execute(
-            "SELECT r.id, r.weight, r.source_entity_id, r.target_entity_id "
-            "FROM relationships r"
-        ).fetchall()
+        rels = self._storage.get_relationships_by_weight(min_weight=0.0)
 
-        for row in rows:
-            rel_id, weight, src_id, tgt_id = row[0], row[1], row[2], row[3]
-            if weight is None:
-                weight = 1.0
+        writes: list[tuple[str, tuple]] = []
+        for rel in rels:
+            rel_id = rel["id"]
+            weight = rel.get("weight") or 1.0
+            src_id = rel["source_entity_id"]
+            tgt_id = rel["target_entity_id"]
 
-            src = self._storage._conn.execute(
-                "SELECT heat FROM entities WHERE id = ?", (src_id,)
-            ).fetchone()
-            tgt = self._storage._conn.execute(
-                "SELECT heat FROM entities WHERE id = ?", (tgt_id,)
-            ).fetchone()
+            src_entity = self._storage.get_entity_by_id(src_id)
+            tgt_entity = self._storage.get_entity_by_id(tgt_id)
 
-            if src is None or tgt is None:
+            if src_entity is None or tgt_entity is None:
                 continue
 
-            src_heat = src[0] if src[0] is not None else 0.0
-            tgt_heat = tgt[0] if tgt[0] is not None else 0.0
+            src_heat = src_entity.get("heat") or 0.0
+            tgt_heat = tgt_entity.get("heat") or 0.0
             avg_heat = (src_heat + tgt_heat) / 2.0
 
             if avg_heat > 0.7 and weight >= 5.0:
@@ -422,49 +436,45 @@ class MemoryCurator:
                 continue
 
             if abs(new_weight - weight) > 1e-9:
-                self._storage._conn.execute(
+                writes.append((
                     "UPDATE relationships SET weight = ? WHERE id = ?",
                     (new_weight, rel_id),
-                )
+                ))
                 stats["reweighted"] += 1
 
-        if stats["reweighted"] > 0:
-            self._storage._conn.commit()
+        if writes:
+            self._storage.execute_writes(writes)
 
     def _memify_derive(self, stats: dict) -> None:
         """Generate synthetic derived-fact memories for high-weight entity pairs."""
-        rows = self._storage._conn.execute(
-            "SELECT r.source_entity_id, r.target_entity_id, r.weight "
-            "FROM relationships r "
-            "WHERE r.weight > 5.0 AND r.relationship_type = 'co_occurrence'"
-        ).fetchall()
+        rels = self._storage.get_relationships_by_weight(
+            min_weight=5.0, relationship_type="co_occurrence"
+        )
 
-        for row in rows:
-            src_id, tgt_id, weight = row[0], row[1], row[2]
+        for rel in rels:
+            src_id = rel["source_entity_id"]
+            tgt_id = rel["target_entity_id"]
+            weight = rel["weight"]
 
             # Check if co-occurrence count is high enough (weight as proxy)
             if weight < 10.0:
                 continue
 
-            src_entity = self._storage._conn.execute(
-                "SELECT name FROM entities WHERE id = ?", (src_id,)
-            ).fetchone()
-            tgt_entity = self._storage._conn.execute(
-                "SELECT name FROM entities WHERE id = ?", (tgt_id,)
-            ).fetchone()
+            src_name = self._storage.get_entity_name(src_id)
+            tgt_name = self._storage.get_entity_name(tgt_id)
 
-            if src_entity is None or tgt_entity is None:
+            if src_name is None or tgt_name is None:
                 continue
 
-            src_name = src_entity[0]
-            tgt_name = tgt_entity[0]
+            # Skip generic entities that produce meaningless patterns.
+            # A useful entity is a file path, function name, class name,
+            # error type, or similar identifier — not a plain English word.
+            if not self._is_specific_entity(src_name) or not self._is_specific_entity(tgt_name):
+                continue
 
             # Check if we already derived a fact for this pair
             derived_content = f"{src_name} and {tgt_name} are frequently modified together"
-            existing = self._storage._conn.execute(
-                "SELECT id FROM memories WHERE content = ?", (derived_content,)
-            ).fetchone()
-            if existing:
+            if self._storage.memory_exists_with_content(derived_content):
                 continue
 
             embedding = self._embeddings.encode(derived_content)

@@ -1,0 +1,43 @@
+services:
+  vaire-dev:
+    build: .
+    container_name: vaire-dev
+    # Run as the host user so the socket and DB files are owned correctly.
+    user: "${UID}:${GID}"
+    volumes:
+      - ${HOME}/.vaire-dev:/data
+      - ${HOME}/workspace:/workspace:ro
+      - ./tests/fixtures/ingest:/ingest:ro
+      - ${HOME}/.vaire-dev/certs:/certs:ro
+    environment:
+      - VAIRE_PATH_REMAP=/workspace:${VAIRE_HOST_WORKSPACE:-${HOME}/workspace}
+      - VAIRE_COGNITIVE_LOAD_LIMIT=8
+
+      # ── mTLS remote access ──────────────────────────────────────────────
+      - VAIRE_TLS_CERT=/certs/server.crt
+      - VAIRE_TLS_KEY=/certs/server.key
+      - VAIRE_TLS_CA=/certs/ca.crt
+      - VAIRE_HTTPS_BIND=0.0.0.0:8744
+
+      # ── Security limits ─────────────────────────────────────────────────
+      - VAIRE_INGEST_ALLOWED_DIRS=/workspace,/ingest
+
+      # ── Reranking / enrichment (match prod) ─────────────────────────────
+      - VAIRE_NLI_RERANKING_ENABLED=false
+      - VAIRE_COMET_ENRICHMENT_ENABLED=false
+      - VAIRE_CONCEPTNET_ENRICHMENT_ENABLED=false
+      - VAIRE_WRRF_FTS_WEIGHT=0.3
+      - VAIRE_CANDIDATE_POOL_MULTIPLIER=5
+      - VAIRE_WRRF_CANDIDATE_MULTIPLIER=5
+
+      # ── Low gate for testing ────────────────────────────────────────────
+      - VAIRE_WRITE_GATE_THRESHOLD=0.1
+    ports:
+      - "127.0.0.1:8744:8744"
+    healthcheck:
+      test: ["CMD", "python", "-m", "vaire", "health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped

@@ -48,6 +48,12 @@ class StorageEngine:
         # asyncio event-loop thread (and run_in_executor threads) all call storage
         # methods at the same time.
         self._tls = threading.local()
+
+        # Write serialization: all DB mutations go through this lock so the
+        # consolidation daemon thread and the asyncio write queue never compete
+        # for the SQLite WAL writer lock.
+        self._write_lock = threading.Lock()
+
         self._init_schema()
         self._migrate_schema()
 
@@ -66,15 +72,55 @@ class StorageEngine:
         return conn
 
     @property
-    def _conn(self) -> sqlite3.Connection:
+    def __conn(self) -> sqlite3.Connection:
         conn = getattr(self._tls, "conn", None)
         if conn is None:
             conn = self._make_connection()
             self._tls.conn = conn
         return conn
 
+    @property
+    def _test_conn(self) -> sqlite3.Connection:
+        """Direct connection access for test setup/teardown only.
+
+        Production code must use domain methods or execute_write/execute_writes.
+        """
+        return self.__conn
+
+    # ── Write serialization helpers ─────────────────────────────────────────────
+
+    @property
+    def _in_batch(self) -> bool:
+        """True when a batch transaction is active on this thread (suppresses auto-commit)."""
+        return getattr(self._tls, "_in_batch", False)
+
+    @_in_batch.setter
+    def _in_batch(self, value: bool) -> None:
+        self._tls._in_batch = value
+
+    def _guarded_commit(self) -> None:
+        """Commit unless we're inside a batch transaction (write queue)."""
+        if not self._in_batch:
+            self.__conn.commit()
+
+    def execute_write(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        """Execute a single write statement under the write lock. Auto-commits."""
+        with self._write_lock:
+            cur = self.__conn.execute(sql, params)
+            self._guarded_commit()
+            return cur
+
+    def execute_writes(self, statements: list[tuple[str, tuple]]) -> None:
+        """Execute multiple write statements atomically under the write lock."""
+        with self._write_lock:
+            for sql, params in statements:
+                self.__conn.execute(sql, params)
+            self._guarded_commit()
+
+    # ── Schema initialization ─────────────────────────────────────────────────
+
     def _init_schema(self):
-        c = self._conn
+        c = self.__conn
         c.executescript("""
             CREATE TABLE IF NOT EXISTS episodes(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,6 +219,15 @@ class StorageEngine:
         except sqlite3.OperationalError:
             pass  # already exists
 
+        # Int8 quantized vec0 table for compressed memories (TurboQuant)
+        try:
+            c.execute(
+                f"CREATE VIRTUAL TABLE memory_vectors_int8 USING vec0("
+                f"embedding int8[{self._embedding_dim}])"
+            )
+        except sqlite3.OperationalError:
+            pass  # already exists
+
         # -- user_profiles table --
         c.execute("""
             CREATE TABLE IF NOT EXISTS user_profiles(
@@ -227,40 +282,16 @@ class StorageEngine:
         except sqlite3.OperationalError:
             pass
 
-        # Triggers for FTS sync — drop first to allow updates
-        c.execute("DROP TRIGGER IF EXISTS memories_fts_insert")
-        c.execute("DROP TRIGGER IF EXISTS memories_fts_update")
-        for trigger_sql in [
-            """
-            CREATE TRIGGER IF NOT EXISTS memories_fts_insert
-            AFTER INSERT ON memories
-            BEGIN
-                INSERT INTO memories_fts(rowid, content)
-                VALUES (new.id, new.content);
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS memories_fts_update
-            AFTER UPDATE ON memories
-            BEGIN
-                UPDATE memories_fts SET content = new.content WHERE rowid = new.id;
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS memories_fts_delete
-            AFTER DELETE ON memories
-            BEGIN
-                DELETE FROM memories_fts WHERE rowid = old.id;
-            END
-            """,
-        ]:
-            c.execute(trigger_sql)
+        # FTS triggers removed (Phase 2 refactor) — FTS sync is now explicit
+        # in insert_memory(), _delete_memory_inner(), update_memory_compression(),
+        # and upsert_memory(). This prevents non-content UPDATEs from silently
+        # reverting enriched FTS content.
 
         c.commit()
 
     def _migrate_schema(self):
         """Add v2 columns and tables. Safe to run repeatedly."""
-        c = self._conn
+        c = self.__conn
 
         # -- New columns on existing tables --
         memory_columns = [
@@ -304,6 +335,8 @@ class StorageEngine:
             # v25 dual-vector columns
             ("implicit_embedding", "BLOB DEFAULT NULL"),
             ("implicit_embedding_model", "TEXT DEFAULT NULL"),
+            # v26 tiered compression — decouple protection from compression
+            ("content_fidelity", "TEXT DEFAULT 'auto'"),
         ]
         for col_name, col_def in memory_columns:
             try:
@@ -332,6 +365,39 @@ class StorageEngine:
                 c.execute(f"ALTER TABLE relationships ADD COLUMN {col_name} {col_def}")
             except sqlite3.OperationalError:
                 pass
+
+        # -- Data migrations (idempotent) --
+        # v26: Protected memories get content_fidelity='full' (never compress)
+        c.execute(
+            "UPDATE memories SET content_fidelity = 'full' "
+            "WHERE is_protected = 1 AND content_fidelity = 'auto'"
+        )
+
+        # v26: Backfill int8 vectors for existing memories that have float32 vectors
+        # but no int8 entry. Only runs if int8 table exists and has fewer rows.
+        try:
+            float_count = c.execute("SELECT COUNT(*) FROM memory_vectors").fetchone()[0]
+            int8_count = c.execute("SELECT COUNT(*) FROM memory_vectors_int8").fetchone()[0]
+            if float_count > 0 and int8_count < float_count:
+                from vaire.embeddings import EmbeddingEngine
+                rows = c.execute(
+                    "SELECT v.rowid, m.embedding FROM memory_vectors v "
+                    "JOIN memories m ON m.id = v.rowid "
+                    "WHERE v.rowid NOT IN (SELECT rowid FROM memory_vectors_int8) "
+                    "AND m.embedding IS NOT NULL"
+                ).fetchall()
+                for rowid, emb in rows:
+                    if emb:
+                        int8_vec = EmbeddingEngine.quantize_int8(emb)
+                        c.execute(
+                            "INSERT OR IGNORE INTO memory_vectors_int8(rowid, embedding) VALUES (?, vec_int8(?))",
+                            (rowid, int8_vec),
+                        )
+                if rows:
+                    c.commit()
+                    logger.info("Backfilled %d int8 vectors", len(rows))
+        except Exception:
+            pass  # int8 table may not exist yet
 
         # -- New tables --
         c.executescript("""
@@ -492,6 +558,20 @@ class StorageEngine:
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_action_log_processed ON action_log(processed, timestamp)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS metadata(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        c.commit()
+
+        # --- Migration: Remove FTS triggers (Phase 2 refactor) ---
+        # These triggers silently reverted enriched FTS content on any UPDATE.
+        # FTS sync is now handled explicitly in insert/update/delete methods.
+        c.execute("DROP TRIGGER IF EXISTS memories_fts_insert")
+        c.execute("DROP TRIGGER IF EXISTS memories_fts_update")
+        c.execute("DROP TRIGGER IF EXISTS memories_fts_delete")
         c.commit()
 
     # -- helpers --
@@ -520,7 +600,7 @@ class StorageEngine:
     # -- Episodes --
 
     def insert_episode(self, episode: dict) -> int:
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO episodes(session_id, timestamp, directory, raw_content, "
             "overlap_start, overlap_end) VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -532,11 +612,11 @@ class StorageEngine:
                 episode.get("overlap_end"),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_session_episodes(self, session_id: str) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM episodes WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
@@ -549,7 +629,7 @@ class StorageEngine:
         now = self._now_iso()
         embedding = memory.get("embedding")
         embedding_model = memory.get("embedding_model")
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO memories(content, embedding, tags, source_episode_id, "
             "directory_context, created_at, last_accessed, heat, is_stale, file_hash, "
             "embedding_model) "
@@ -568,16 +648,15 @@ class StorageEngine:
                 embedding_model,
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         memory_id = cur.lastrowid
-        # Enrich FTS content with split identifiers
+        # Explicit FTS insert with enriched content (no trigger — Phase 2)
         enriched = self._enrich_content_for_fts(memory["content"])
-        if enriched != memory["content"]:
-            self._conn.execute(
-                "UPDATE memories_fts SET content = ? WHERE rowid = ?",
-                (enriched, memory_id),
-            )
-            self._conn.commit()
+        self.__conn.execute(
+            "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+            (memory_id, enriched),
+        )
+        self._guarded_commit()
         # Index-time enrichment
         enrichment_data = {}
         if (settings and getattr(settings, 'INDEX_ENRICHMENT_ENABLED', False)
@@ -603,7 +682,7 @@ class StorageEngine:
                             params.append(val)
                     if set_clauses:
                         params.append(memory_id)
-                        self._conn.execute(
+                        self.__conn.execute(
                             f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
                             params,
                         )
@@ -614,11 +693,11 @@ class StorageEngine:
                                 memory["content"], enrichment_data["enriched_content"]
                             )
                             if new_embedding is not None:
-                                self._conn.execute(
+                                self.__conn.execute(
                                     "UPDATE memories SET embedding = ? WHERE id = ?",
                                     (new_embedding, memory_id),
                                 )
-                        self._conn.commit()
+                        self._guarded_commit()
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).warning("Enrichment failed: %s", e)
@@ -635,19 +714,25 @@ class StorageEngine:
                 import logging
                 logging.getLogger(__name__).warning("Profile extraction failed: %s", e)
 
-        # Also insert into sqlite-vec for vector search
+        # Also insert into sqlite-vec for vector search (float32 + int8)
         if embedding is not None:
             self.insert_vector(memory_id, embedding)
+            try:
+                from vaire.embeddings import EmbeddingEngine
+                int8_vec = EmbeddingEngine.quantize_int8(embedding)
+                self.insert_vector_int8(memory_id, int8_vec)
+            except Exception:
+                pass  # int8 table may not exist yet in tests
         return memory_id
 
     def get_memory(self, memory_id: int) -> dict | None:
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT * FROM memories WHERE id = ?", (memory_id,)
         ).fetchone()
         return self._row_to_dict(row)
 
     def get_memories_by_heat(self, min_heat: float, limit: int = 100) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE heat >= ? ORDER BY heat DESC LIMIT ?",
             (min_heat, limit),
         ).fetchall()
@@ -711,7 +796,7 @@ class StorageEngine:
         self, query: str, min_heat: float = 0.1, limit: int = 5
     ) -> list[dict]:
         fts_query = self._preprocess_fts_query(query)
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT m.* FROM memories m "
             "JOIN memories_fts fts ON m.id = fts.rowid "
             "WHERE memories_fts MATCH ? AND m.heat >= ? "
@@ -729,7 +814,7 @@ class StorageEngine:
         We negate them so higher = better.
         """
         fts_query = self._preprocess_fts_query(query)
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT m.id, -bm25(memories_fts) as score FROM memories m "
             "JOIN memories_fts fts ON m.id = fts.rowid "
             "WHERE memories_fts MATCH ? AND m.heat >= ? "
@@ -739,36 +824,55 @@ class StorageEngine:
         return [(row[0], row[1]) for row in rows]
 
     def update_memory_heat(self, memory_id: int, new_heat: float):
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET heat = ? WHERE id = ?", (new_heat, memory_id)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def update_memory_staleness(self, memory_id: int, is_stale: bool):
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET is_stale = ? WHERE id = ?",
             (int(is_stale), memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def delete_memory(self, memory_id: int):
-        # Delete from sqlite-vec first (ignore if not present)
+        # Inline vector + archive + memory deletion for atomicity.
+        # When called standalone, acquires lock; when in batch, lock is already held.
+        if self._in_batch:
+            self._delete_memory_inner(memory_id)
+        else:
+            with self._write_lock:
+                self._delete_memory_inner(memory_id)
+                self.__conn.commit()
+
+    def _delete_memory_inner(self, memory_id: int):
+        """Delete vector, archives, and memory row (no commit, no lock)."""
         try:
-            self.delete_vector(memory_id)
+            self.__conn.execute(
+                "DELETE FROM memory_vectors WHERE rowid = ?", (memory_id,)
+            )
         except Exception:
-            pass
-        # memory_archives has a bare FK to memories(id) without ON DELETE CASCADE,
-        # so we must remove archive rows first or the DELETE will raise an IntegrityError.
-        self._conn.execute(
+            logger.debug("Vec0 delete failed for memory %d", memory_id, exc_info=True)
+        try:
+            self.__conn.execute(
+                "DELETE FROM memory_implicit_vectors WHERE rowid = ?", (memory_id,)
+            )
+        except Exception:
+            logger.debug("Implicit vec0 delete failed for memory %d", memory_id, exc_info=True)
+        self.__conn.execute(
             "DELETE FROM memory_archives WHERE original_memory_id = ?", (memory_id,)
         )
-        self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        self._conn.commit()
+        # Explicit FTS delete before memory row (no trigger — Phase 2)
+        self.__conn.execute(
+            "DELETE FROM memories_fts WHERE rowid = ?", (memory_id,)
+        )
+        self.__conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
 
     def get_memories_for_directory(
         self, directory: str, min_heat: float = 0.1
     ) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE directory_context = ? AND heat >= ? "
             "ORDER BY heat DESC",
             (directory, min_heat),
@@ -776,13 +880,13 @@ class StorageEngine:
         return self._rows_to_dicts(rows)
 
     def get_stale_memories(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE is_stale = 1"
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def get_memories_by_file_hash(self, file_hash: str) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE file_hash = ?", (file_hash,)
         ).fetchall()
         return self._rows_to_dicts(rows)
@@ -795,7 +899,7 @@ class StorageEngine:
         Returns id, content, heat, embedding, tags, directory_context,
         created_at, last_accessed. Excludes stale rows.
         """
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT id, content, heat, embedding, tags, directory_context, "
             "created_at, last_accessed FROM memories WHERE is_stale = 0"
         ).fetchall()
@@ -803,19 +907,19 @@ class StorageEngine:
 
     def get_active_rules(self) -> list[dict]:
         """Return all active memory rules sorted by priority DESC."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memory_rules WHERE is_active = 1 ORDER BY priority DESC"
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def get_all_memories_for_decay(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE heat > 0"
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def get_all_memories_with_embeddings(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE embedding IS NOT NULL AND heat > 0"
         ).fetchall()
         return self._rows_to_dicts(rows)
@@ -839,7 +943,7 @@ class StorageEngine:
         if not terms:
             return []
         fts_query = " OR ".join(terms)
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT m.* FROM memories m "
             "JOIN memories_fts fts ON m.id = fts.rowid "
             "WHERE memories_fts MATCH ? AND m.heat >= ? "
@@ -856,7 +960,7 @@ class StorageEngine:
         limit: int = 50,
     ) -> list[dict]:
         """Query memories by created_at timestamp range."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE created_at >= ? AND created_at <= ? "
             "AND heat >= ? ORDER BY created_at DESC LIMIT ?",
             (start_date, end_date, min_heat, limit),
@@ -880,17 +984,20 @@ class StorageEngine:
             "september": "09", "october": "10", "november": "11", "december": "12",
         }
         conditions = []
+        params: list = []
         for hint in month_hints:
             mm = month_map.get(hint.lower())
             if mm:
                 # Match ISO dates like 2023-05-...
-                conditions.append(f"substr(created_at, 6, 2) = '{mm}'")
+                conditions.append("substr(created_at, 6, 2) = ?")
+                params.append(mm)
         if not conditions:
             return []
         where = " OR ".join(conditions)
-        rows = self._conn.execute(
+        params.extend([min_heat, limit])
+        rows = self.__conn.execute(
             f"SELECT id FROM memories WHERE ({where}) AND heat >= ? LIMIT ?",
-            (min_heat, limit),
+            params,
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -898,18 +1005,18 @@ class StorageEngine:
 
     def insert_vector(self, memory_id: int, embedding: bytes):
         """Insert an embedding into the memory_vectors vec0 table."""
-        self._conn.execute(
+        self.__conn.execute(
             "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
             (memory_id, embedding),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def delete_vector(self, memory_id: int):
         """Delete an embedding from the memory_vectors vec0 table."""
-        self._conn.execute(
+        self.__conn.execute(
             "DELETE FROM memory_vectors WHERE rowid = ?", (memory_id,)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def update_vector(self, memory_id: int, embedding: bytes):
         """Update an embedding in memory_vectors (delete + re-insert)."""
@@ -918,11 +1025,11 @@ class StorageEngine:
 
     def insert_implicit_vector(self, memory_id: int, embedding: bytes):
         """Insert an embedding into the memory_implicit_vectors vec0 table."""
-        self._conn.execute(
+        self.__conn.execute(
             "INSERT INTO memory_implicit_vectors(rowid, embedding) VALUES (?, ?)",
             (memory_id, embedding),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def search_implicit_vectors(
         self,
@@ -934,7 +1041,7 @@ class StorageEngine:
         Returns list of (memory_id, distance) tuples sorted by ascending distance.
         """
         fetch_k = min(top_k * 4, 4096)
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT v.rowid, v.distance "
             "FROM memory_implicit_vectors v "
             "WHERE v.embedding MATCH ? AND k = ? "
@@ -942,6 +1049,50 @@ class StorageEngine:
             (query_embedding, fetch_k),
         ).fetchall()
         return [(row[0], row[1]) for row in rows[:top_k]]
+
+    # -- Int8 quantized vector operations (TurboQuant) --
+
+    def insert_vector_int8(self, memory_id: int, embedding_int8: bytes):
+        """Insert a quantized int8 embedding into the memory_vectors_int8 vec0 table."""
+        self.__conn.execute(
+            "INSERT INTO memory_vectors_int8(rowid, embedding) VALUES (?, vec_int8(?))",
+            (memory_id, embedding_int8),
+        )
+        self._guarded_commit()
+
+    def delete_vector_int8(self, memory_id: int):
+        """Delete an int8 embedding from the memory_vectors_int8 vec0 table."""
+        self.__conn.execute(
+            "DELETE FROM memory_vectors_int8 WHERE rowid = ?", (memory_id,)
+        )
+        self._guarded_commit()
+
+    def search_vectors_int8(
+        self,
+        query_embedding_int8: bytes,
+        top_k: int = 10,
+        min_heat: float = 0.1,
+    ) -> list[tuple[int, float]]:
+        """KNN search via int8 vec0, filtered by min_heat.
+
+        Returns list of (memory_id, distance) tuples sorted by ascending distance.
+        """
+        fetch_k = min(top_k * 4, 4096)
+        rows = self.__conn.execute(
+            "SELECT v.rowid, v.distance, m.heat "
+            "FROM memory_vectors_int8 v "
+            "JOIN memories m ON m.id = v.rowid "
+            "WHERE v.embedding MATCH vec_int8(?) AND k = ? "
+            "ORDER BY v.distance",
+            (query_embedding_int8, fetch_k),
+        ).fetchall()
+        results = []
+        for row in rows:
+            if row[2] >= min_heat:
+                results.append((row[0], row[1]))
+            if len(results) >= top_k:
+                break
+        return results
 
     def search_vectors(
         self,
@@ -955,7 +1106,7 @@ class StorageEngine:
         """
         # Fetch more candidates than needed so we have enough after heat filtering
         fetch_k = min(top_k * 4, 4096)  # sqlite-vec KNN limit is 4096
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT v.rowid, v.distance, m.heat "
             "FROM memory_vectors v "
             "JOIN memories m ON m.id = v.rowid "
@@ -973,7 +1124,7 @@ class StorageEngine:
 
     def get_memories_needing_reembedding(self, current_model: str) -> list[dict]:
         """Return memories where embedding_model != current_model or is NULL."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE embedding IS NOT NULL "
             "AND (embedding_model IS NULL OR embedding_model != ?)",
             (current_model,),
@@ -983,21 +1134,35 @@ class StorageEngine:
     def update_memory_embedding(
         self, memory_id: int, embedding: bytes, embedding_model: str
     ):
-        """Update a memory's embedding and embedding_model field."""
-        self._conn.execute(
+        """Update a memory's embedding and embedding_model field + vec0 table atomically."""
+        if self._in_batch:
+            self._update_embedding_inner(memory_id, embedding, embedding_model)
+        else:
+            with self._write_lock:
+                self._update_embedding_inner(memory_id, embedding, embedding_model)
+                self.__conn.commit()
+
+    def _update_embedding_inner(self, memory_id: int, embedding: bytes, embedding_model: str):
+        """Update embedding in memories + vec0 table (no commit, no lock)."""
+        self.__conn.execute(
             "UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?",
             (embedding, embedding_model, memory_id),
         )
-        self._conn.commit()
         # Update the vec0 table too
         try:
-            self.update_vector(memory_id, embedding)
+            self.__conn.execute("DELETE FROM memory_vectors WHERE rowid = ?", (memory_id,))
+            self.__conn.execute(
+                "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                (memory_id, embedding),
+            )
         except Exception:
-            # Vector may not exist yet; insert instead
             try:
-                self.insert_vector(memory_id, embedding)
+                self.__conn.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                    (memory_id, embedding),
+                )
             except Exception:
-                pass
+                logger.debug("Vec0 update failed for memory %d", memory_id, exc_info=True)
 
     def recreate_vector_table(self, new_dim: int):
         """Recreate the memory_vectors vec0 table with new dimensions.
@@ -1005,19 +1170,19 @@ class StorageEngine:
         This is needed when switching to a model with different output dimensions.
         All existing vectors are dropped — caller must re-embed after calling this.
         """
-        self._conn.execute("DROP TABLE IF EXISTS memory_vectors")
-        self._conn.execute(
+        self.__conn.execute("DROP TABLE IF EXISTS memory_vectors")
+        self.__conn.execute(
             f"CREATE VIRTUAL TABLE memory_vectors USING vec0("
             f"embedding float[{new_dim}])"
         )
-        self._conn.commit()
+        self._guarded_commit()
         self._embedding_dim = new_dim
 
     # -- Entities --
 
     def insert_entity(self, entity: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO entities(name, type, created_at, last_accessed, heat, archived) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -1029,11 +1194,11 @@ class StorageEngine:
                 int(entity.get("archived", False)),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_entity_by_name(self, name: str) -> dict | None:
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT * FROM entities WHERE name = ?", (name,)
         ).fetchone()
         return self._row_to_dict(row)
@@ -1042,12 +1207,12 @@ class StorageEngine:
         self, min_heat: float = 0.0, include_archived: bool = False
     ) -> list[dict]:
         if include_archived:
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT * FROM entities WHERE heat >= ? ORDER BY heat DESC",
                 (min_heat,),
             ).fetchall()
         else:
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT * FROM entities WHERE heat >= ? AND archived = 0 "
                 "ORDER BY heat DESC",
                 (min_heat,),
@@ -1055,36 +1220,36 @@ class StorageEngine:
         return self._rows_to_dicts(rows)
 
     def update_entity_heat(self, entity_id: int, new_heat: float):
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE entities SET heat = ? WHERE id = ?", (new_heat, entity_id)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_all_entities_for_decay(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM entities WHERE archived = 0"
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def archive_entity(self, entity_id: int):
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE entities SET archived = 1 WHERE id = ?", (entity_id,)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def reinforce_entity(self, entity_id: int, heat_bump: float = 0.1):
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE entities SET heat = MIN(heat + ?, 1.0), last_accessed = ? "
             "WHERE id = ?",
             (heat_bump, self._now_iso(), entity_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Relationships --
 
     def insert_relationship(self, relationship: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO relationships(source_entity_id, target_entity_id, "
             "relationship_type, weight, created_at, last_reinforced) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -1097,13 +1262,13 @@ class StorageEngine:
                 relationship.get("last_reinforced", now),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_relationship_between(
         self, source_id: int, target_id: int
     ) -> dict | None:
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT * FROM relationships WHERE "
             "(source_entity_id = ? AND target_entity_id = ?) OR "
             "(source_entity_id = ? AND target_entity_id = ?)",
@@ -1112,53 +1277,53 @@ class StorageEngine:
         return self._row_to_dict(row)
 
     def reinforce_relationship(self, rel_id: int, weight_increase: float = 1.0):
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE relationships SET weight = weight + ?, last_reinforced = ? "
             "WHERE id = ?",
             (weight_increase, self._now_iso(), rel_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Episodes (additional) --
 
     def get_episodes_since(self, episode_id: int) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM episodes WHERE id > ? ORDER BY id",
             (episode_id,),
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def get_max_episode_id(self) -> int:
-        row = self._conn.execute("SELECT MAX(id) FROM episodes").fetchone()
+        row = self.__conn.execute("SELECT MAX(id) FROM episodes").fetchone()
         return row[0] if row[0] is not None else 0
 
     # -- File Hashes --
 
     def upsert_file_hash(self, filepath: str, hash_value: str):
         now = self._now_iso()
-        existing = self._conn.execute(
+        existing = self.__conn.execute(
             "SELECT id FROM file_hashes WHERE filepath = ?", (filepath,)
         ).fetchone()
         if existing:
-            self._conn.execute(
+            self.__conn.execute(
                 "UPDATE file_hashes SET hash = ?, last_checked = ? WHERE filepath = ?",
                 (hash_value, now, filepath),
             )
         else:
-            self._conn.execute(
+            self.__conn.execute(
                 "INSERT INTO file_hashes(filepath, hash, last_checked) VALUES (?, ?, ?)",
                 (filepath, hash_value, now),
             )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_file_hash(self, filepath: str) -> str | None:
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT hash FROM file_hashes WHERE filepath = ?", (filepath,)
         ).fetchone()
         return row["hash"] if row else None
 
     def get_filepath_by_hash(self, hash_value: str) -> str | None:
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT filepath FROM file_hashes WHERE hash = ? LIMIT 1",
             (hash_value,),
         ).fetchone()
@@ -1167,7 +1332,7 @@ class StorageEngine:
     # -- Consolidation Log --
 
     def insert_consolidation_log(self, log: dict) -> int:
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO consolidation_log(timestamp, memories_added, memories_updated, "
             "memories_archived, memories_deleted, duration_ms) VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -1179,27 +1344,27 @@ class StorageEngine:
                 log.get("duration_ms", 0),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     # -- Stats --
 
     def get_memory_stats(self) -> dict:
-        total = self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-        active = self._conn.execute(
+        total = self.__conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        active = self.__conn.execute(
             "SELECT COUNT(*) FROM memories WHERE is_stale = 0 AND heat >= 0.05"
         ).fetchone()[0]
-        archived = self._conn.execute(
+        archived = self.__conn.execute(
             "SELECT COUNT(*) FROM memories WHERE heat < 0.05"
         ).fetchone()[0]
-        stale = self._conn.execute(
+        stale = self.__conn.execute(
             "SELECT COUNT(*) FROM memories WHERE is_stale = 1"
         ).fetchone()[0]
-        avg_heat_row = self._conn.execute(
+        avg_heat_row = self.__conn.execute(
             "SELECT AVG(heat) FROM memories"
         ).fetchone()[0]
         avg_heat = avg_heat_row if avg_heat_row is not None else 0.0
-        last_consolidation_row = self._conn.execute(
+        last_consolidation_row = self.__conn.execute(
             "SELECT timestamp FROM consolidation_log ORDER BY id DESC LIMIT 1"
         ).fetchone()
         last_consolidation = (
@@ -1218,7 +1383,7 @@ class StorageEngine:
 
     def insert_cluster(self, cluster: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO memory_clusters(name, level, parent_cluster_id, summary, "
             "centroid_embedding, member_count, created_at, last_updated, heat) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1234,17 +1399,17 @@ class StorageEngine:
                 cluster.get("heat", 1.0),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_cluster(self, cluster_id: int) -> dict | None:
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT * FROM memory_clusters WHERE id = ?", (cluster_id,)
         ).fetchone()
         return self._row_to_dict(row)
 
     def get_clusters_by_level(self, level: int) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memory_clusters WHERE level = ? ORDER BY heat DESC",
             (level,),
         ).fetchall()
@@ -1262,16 +1427,16 @@ class StorageEngine:
             fields["last_updated"] = self._now_iso()
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [cluster_id]
-        self._conn.execute(
+        self.__conn.execute(
             f"UPDATE memory_clusters SET {set_clause} WHERE id = ?", values
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Prospective Memories --
 
     def insert_prospective_memory(self, pm: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO prospective_memories(content, trigger_condition, trigger_type, "
             "target_directory, is_active, created_at, triggered_at, triggered_count) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1286,29 +1451,29 @@ class StorageEngine:
                 pm.get("triggered_count", 0),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_active_prospective_memories(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM prospective_memories WHERE is_active = 1"
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def trigger_prospective_memory(self, pm_id: int):
         now = self._now_iso()
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE prospective_memories SET triggered_at = ?, "
             "triggered_count = triggered_count + 1 WHERE id = ?",
             (now, pm_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Narrative Entries --
 
     def insert_narrative_entry(self, entry: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO narrative_entries(directory_context, summary, period_start, "
             "period_end, key_decisions, key_events, created_at, heat) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1323,13 +1488,13 @@ class StorageEngine:
                 entry.get("heat", 1.0),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_narratives_for_directory(
         self, directory: str, limit: int = 10
     ) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM narrative_entries WHERE directory_context = ? "
             "ORDER BY period_end DESC LIMIT ?",
             (directory, limit),
@@ -1340,7 +1505,7 @@ class StorageEngine:
 
     def insert_astrocyte_process(self, proc: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO astrocyte_processes(name, domain, specialization, "
             "memory_ids, entity_ids, heat, created_at, last_active) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1355,11 +1520,11 @@ class StorageEngine:
                 proc.get("last_active", now),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_astrocyte_processes(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM astrocyte_processes ORDER BY heat DESC"
         ).fetchall()
         return self._rows_to_dicts(rows)
@@ -1383,10 +1548,10 @@ class StorageEngine:
             fields["last_active"] = self._now_iso()
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [proc_id]
-        self._conn.execute(
+        self.__conn.execute(
             f"UPDATE astrocyte_processes SET {set_clause} WHERE id = ?", values
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # -- Thermodynamics helpers --
 
@@ -1409,10 +1574,10 @@ class StorageEngine:
             return
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [memory_id]
-        self._conn.execute(
+        self.__conn.execute(
             f"UPDATE memories SET {set_clause} WHERE id = ?", values
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def update_memory_metamemory(
         self,
@@ -1422,18 +1587,18 @@ class StorageEngine:
         confidence: float,
     ):
         """Update metamemory tracking fields."""
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET access_count = ?, useful_count = ?, confidence = ? "
             "WHERE id = ?",
             (access_count, useful_count, confidence, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_memories_in_time_window(
         self, center_time: str, window_minutes: int
     ) -> list[dict]:
         """Return memories created within window_minutes of center_time."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE heat > 0 "
             "AND abs((julianday(created_at) - julianday(?)) * 24 * 60) <= ?",
             (center_time, window_minutes),
@@ -1444,7 +1609,7 @@ class StorageEngine:
 
     def insert_rule(self, rule: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO memory_rules(rule_type, scope, scope_value, condition, "
             "action, priority, created_at, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -1458,17 +1623,17 @@ class StorageEngine:
                 int(rule.get("is_active", True)),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_rules_for_scope(self, scope: str, scope_value: str | None = None) -> list[dict]:
         if scope == "global":
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT * FROM memory_rules WHERE scope = 'global' AND is_active = 1 "
                 "ORDER BY priority DESC",
             ).fetchall()
         else:
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT * FROM memory_rules WHERE scope = ? AND scope_value = ? "
                 "AND is_active = 1 ORDER BY priority DESC",
                 (scope, scope_value),
@@ -1489,20 +1654,20 @@ class StorageEngine:
             return
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [rule_id]
-        self._conn.execute(
+        self.__conn.execute(
             f"UPDATE memory_rules SET {set_clause} WHERE id = ?", values
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def delete_rule(self, rule_id: int):
-        self._conn.execute("DELETE FROM memory_rules WHERE id = ?", (rule_id,))
-        self._conn.commit()
+        self.__conn.execute("DELETE FROM memory_rules WHERE id = ?", (rule_id,))
+        self._guarded_commit()
 
     # -- Memory Archives --
 
     def insert_archive(self, archive: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO memory_archives(original_memory_id, content, embedding, "
             "archived_at, mismatch_score, archive_reason) VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -1514,22 +1679,37 @@ class StorageEngine:
                 archive.get("archive_reason", ""),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_archives_for_memory(self, memory_id: int) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memory_archives WHERE original_memory_id = ? "
             "ORDER BY archived_at DESC",
             (memory_id,),
         ).fetchall()
         return self._rows_to_dicts(rows)
 
+    def get_all_archives(self, limit: int = 5000) -> list[dict]:
+        """Return all archive entries (for credential scanning)."""
+        rows = self.__conn.execute(
+            "SELECT * FROM memory_archives ORDER BY id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def update_archive_content(self, archive_id: int, new_content: str) -> None:
+        """Update the content of a single archive entry. [COMMITS]"""
+        self.execute_write(
+            "UPDATE memory_archives SET content = ? WHERE id = ?",
+            (new_content, archive_id),
+        )
+
     # -- Memory Transitions --
 
     def insert_transition(self, transition: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO memory_transitions(from_memory_id, to_memory_id, count, "
             "last_transition, session_id) VALUES (?, ?, ?, ?, ?)",
             (
@@ -1540,11 +1720,11 @@ class StorageEngine:
                 transition.get("session_id", ""),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_transition(self, from_id: int, to_id: int) -> dict | None:
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT * FROM memory_transitions WHERE from_memory_id = ? AND to_memory_id = ?",
             (from_id, to_id),
         ).fetchone()
@@ -1552,15 +1732,15 @@ class StorageEngine:
 
     def increment_transition(self, from_id: int, to_id: int):
         now = self._now_iso()
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memory_transitions SET count = count + 1, last_transition = ? "
             "WHERE from_memory_id = ? AND to_memory_id = ?",
             (now, from_id, to_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_transitions_from(self, memory_id: int) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memory_transitions WHERE from_memory_id = ? "
             "ORDER BY count DESC",
             (memory_id,),
@@ -1568,20 +1748,20 @@ class StorageEngine:
         return self._rows_to_dicts(rows)
 
     def get_all_transitions(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT from_memory_id, to_memory_id, count FROM memory_transitions"
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def update_memory_sr_coords(self, memory_id: int, sr_x: float, sr_y: float):
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET sr_x = ?, sr_y = ? WHERE id = ?",
             (sr_x, sr_y, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_memories_with_sr_coords(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT id, sr_x, sr_y FROM memories WHERE sr_x != 0.0 OR sr_y != 0.0"
         ).fetchall()
         return self._rows_to_dicts(rows)
@@ -1590,7 +1770,7 @@ class StorageEngine:
 
     def insert_causal_edge(self, edge: dict) -> int:
         now = self._now_iso()
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO causal_dag_edges(source_entity_id, target_entity_id, "
             "algorithm, confidence, discovered_at, is_validated) VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -1602,18 +1782,18 @@ class StorageEngine:
                 int(edge.get("is_validated", False)),
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_causal_edges_for_entity(self, entity_id: int) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM causal_dag_edges WHERE source_entity_id = ? OR target_entity_id = ?",
             (entity_id, entity_id),
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def get_all_causal_edges(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM causal_dag_edges ORDER BY confidence DESC"
         ).fetchall()
         return self._rows_to_dicts(rows)
@@ -1623,46 +1803,46 @@ class StorageEngine:
     def init_engram_slots(self, num_slots: int):
         """Ensure all slot indices exist in the engram_slots table."""
         for i in range(num_slots):
-            self._conn.execute(
+            self.__conn.execute(
                 "INSERT OR IGNORE INTO engram_slots(slot_index, excitability, last_activated) "
                 "VALUES (?, 0.0, ?)",
                 (i, self._now_iso()),
             )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_engram_slot(self, slot_index: int) -> dict | None:
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT * FROM engram_slots WHERE slot_index = ?", (slot_index,)
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
     def get_all_engram_slots(self) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM engram_slots ORDER BY slot_index"
         ).fetchall()
         return [dict(r) for r in rows]
 
     def update_engram_slot(self, slot_index: int, excitability: float, last_activated: str):
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE engram_slots SET excitability = ?, last_activated = ? "
             "WHERE slot_index = ?",
             (excitability, last_activated, slot_index),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def assign_memory_slot(self, memory_id: int, slot_index: int):
         """Assign a memory to an engram slot and update excitability timestamp."""
         now = self._now_iso()
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET slot_index = ?, excitability = ?, "
             "last_excitability_update = ? WHERE id = ?",
             (slot_index, 1.0, now, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_memories_in_slot(self, slot_index: int) -> list[dict]:
         """Return all memory IDs assigned to a given slot."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE slot_index = ? AND heat > 0 ORDER BY created_at",
             (slot_index,),
         ).fetchall()
@@ -1670,7 +1850,7 @@ class StorageEngine:
 
     def get_slot_occupancy(self) -> dict:
         """Return {slot_index: count} for all occupied slots."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT slot_index, COUNT(*) as cnt FROM memories "
             "WHERE slot_index IS NOT NULL GROUP BY slot_index"
         ).fetchall()
@@ -1694,18 +1874,24 @@ class StorageEngine:
     ):
         """Update a memory's content and compression level after compression."""
         if original_content is not None:
-            self._conn.execute(
+            self.__conn.execute(
                 "UPDATE memories SET content = ?, embedding = ?, compression_level = ?, "
                 "original_content = ? WHERE id = ?",
                 (content, embedding, compression_level, original_content, memory_id),
             )
         else:
-            self._conn.execute(
+            self.__conn.execute(
                 "UPDATE memories SET content = ?, embedding = ?, compression_level = ? "
                 "WHERE id = ?",
                 (content, embedding, compression_level, memory_id),
             )
-        self._conn.commit()
+        # Explicit FTS update with enriched compressed content (no trigger — Phase 2)
+        enriched = self._enrich_content_for_fts(content)
+        self.__conn.execute(
+            "UPDATE memories_fts SET content = ? WHERE rowid = ?",
+            (enriched, memory_id),
+        )
+        self._guarded_commit()
         # Update the vec0 table too
         if embedding is not None:
             try:
@@ -1714,15 +1900,15 @@ class StorageEngine:
                 try:
                     self.insert_vector(memory_id, embedding)
                 except Exception:
-                    pass
+                    logger.debug("Vec0 sync failed for memory %d in update_memory_compression", memory_id, exc_info=True)
 
     # -- Checkpoints (Hippocampal Replay) --
 
     def insert_checkpoint(self, data: dict) -> int:
         """Insert a new checkpoint, deactivating all previous ones."""
         now = self._now_iso()
-        self._conn.execute("UPDATE checkpoints SET is_active = 0 WHERE is_active = 1")
-        cursor = self._conn.execute(
+        self.__conn.execute("UPDATE checkpoints SET is_active = 0 WHERE is_active = 1")
+        cursor = self.__conn.execute(
             """INSERT INTO checkpoints
                (session_id, directory_context, current_task, files_being_edited,
                 key_decisions, open_questions, next_steps, active_errors,
@@ -1742,12 +1928,12 @@ class StorageEngine:
                 now,
             ),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cursor.lastrowid
 
     def get_active_checkpoint(self) -> dict | None:
         """Get the most recent active checkpoint."""
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT * FROM checkpoints WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
         if row is None:
@@ -1763,7 +1949,7 @@ class StorageEngine:
 
     def get_current_epoch(self) -> int:
         """Get the current compaction epoch number."""
-        row = self._conn.execute("SELECT MAX(epoch) FROM checkpoints").fetchone()
+        row = self.__conn.execute("SELECT MAX(epoch) FROM checkpoints").fetchone()
         return row[0] if row[0] is not None else 0
 
     def increment_epoch(self) -> int:
@@ -1785,8 +1971,8 @@ class StorageEngine:
     ) -> int:
         now = self._now_iso()
         # Check if profile already exists
-        existing = self._conn.execute(
-            "SELECT id, confidence, evidence_memory_ids FROM user_profiles "
+        existing = self.__conn.execute(
+            "SELECT id, confidence, evidence_memory_ids, attribute_value FROM user_profiles "
             "WHERE entity_name = ? AND attribute_type = ? AND attribute_key = ? "
             "AND directory_context IS ?",
             (entity_name, attribute_type, attribute_key, directory_context),
@@ -1801,27 +1987,28 @@ class StorageEngine:
                 evidence = []
             if memory_id is not None and memory_id not in evidence:
                 evidence.append(memory_id)
-            self._conn.execute(
+            self.__conn.execute(
                 "UPDATE user_profiles SET attribute_value = ?, confidence = ?, "
                 "evidence_memory_ids = ?, updated_at = ? WHERE id = ?",
                 (attribute_value, new_confidence, json.dumps(evidence), now, row["id"]),
             )
-            # Sync FTS
-            self._conn.execute(
+            # Sync FTS — delete OLD values, insert NEW (M2 fix: Phase 2)
+            old_attribute_value = row["attribute_value"]
+            self.__conn.execute(
                 "INSERT INTO profiles_fts(profiles_fts, rowid, entity_name, attribute_type, attribute_key, attribute_value) "
                 "VALUES('delete', ?, ?, ?, ?, ?)",
-                (row["id"], entity_name, attribute_type, attribute_key, attribute_value),
+                (row["id"], entity_name, attribute_type, attribute_key, old_attribute_value),
             )
-            self._conn.execute(
+            self.__conn.execute(
                 "INSERT INTO profiles_fts(rowid, entity_name, attribute_type, attribute_key, attribute_value) "
                 "VALUES(?, ?, ?, ?, ?)",
                 (row["id"], entity_name, attribute_type, attribute_key, attribute_value),
             )
-            self._conn.commit()
+            self._guarded_commit()
             return row["id"]
 
         evidence = [memory_id] if memory_id is not None else []
-        cursor = self._conn.execute(
+        cursor = self.__conn.execute(
             "INSERT INTO user_profiles "
             "(entity_name, attribute_type, attribute_key, attribute_value, "
             "evidence_memory_ids, confidence, created_at, updated_at, directory_context) "
@@ -1831,16 +2018,16 @@ class StorageEngine:
         )
         row_id = cursor.lastrowid
         # Sync FTS
-        self._conn.execute(
+        self.__conn.execute(
             "INSERT INTO profiles_fts(rowid, entity_name, attribute_type, attribute_key, attribute_value) "
             "VALUES(?, ?, ?, ?, ?)",
             (row_id, entity_name, attribute_type, attribute_key, attribute_value),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return row_id
 
     def search_profiles_fts(self, query: str, limit: int = 10) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT u.* FROM profiles_fts f "
             "JOIN user_profiles u ON f.rowid = u.id "
             "WHERE profiles_fts MATCH ? LIMIT ?",
@@ -1850,12 +2037,12 @@ class StorageEngine:
 
     def get_profiles_for_entity(self, entity_name: str, directory_context: str | None = None) -> list[dict]:
         if directory_context is not None:
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT * FROM user_profiles WHERE entity_name = ? AND directory_context = ?",
                 (entity_name, directory_context),
             ).fetchall()
         else:
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT * FROM user_profiles WHERE entity_name = ?",
                 (entity_name,),
             ).fetchall()
@@ -1876,7 +2063,7 @@ class StorageEngine:
     ) -> int:
         now = self._now_iso()
         evidence = evidence_memory_ids or []
-        cursor = self._conn.execute(
+        cursor = self.__conn.execute(
             "INSERT INTO derived_beliefs "
             "(belief_type, subject, content, evidence_memory_ids, confidence, "
             "embedding, embedding_model, created_at, updated_at, directory_context) "
@@ -1886,16 +2073,16 @@ class StorageEngine:
         )
         row_id = cursor.lastrowid
         # Sync FTS
-        self._conn.execute(
+        self.__conn.execute(
             "INSERT INTO beliefs_fts(rowid, subject, belief_type, content) "
             "VALUES(?, ?, ?, ?)",
             (row_id, subject, belief_type, content),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return row_id
 
     def search_beliefs_fts(self, query: str, limit: int = 10) -> list[dict]:
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT b.* FROM beliefs_fts f "
             "JOIN derived_beliefs b ON f.rowid = b.id "
             "WHERE beliefs_fts MATCH ? LIMIT ?",
@@ -1905,12 +2092,12 @@ class StorageEngine:
 
     def get_beliefs_for_subject(self, subject: str, directory_context: str | None = None) -> list[dict]:
         if directory_context is not None:
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT * FROM derived_beliefs WHERE subject = ? AND directory_context = ?",
                 (subject, directory_context),
             ).fetchall()
         else:
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT * FROM derived_beliefs WHERE subject = ?",
                 (subject,),
             ).fetchall()
@@ -1923,7 +2110,7 @@ class StorageEngine:
         if not ids:
             return []
         placeholders = ",".join("?" * len(ids))
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             f"SELECT * FROM memories WHERE id IN ({placeholders})", ids
         ).fetchall()
         return self._rows_to_dicts(rows)
@@ -1932,7 +2119,7 @@ class StorageEngine:
         self, project_dir: str, min_heat: float = 0.0
     ) -> list[dict]:
         """Return non-stale memories for a directory, sorted heat DESC."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE directory_context = ? "
             "AND heat >= ? AND is_stale = 0 ORDER BY heat DESC",
             (project_dir, min_heat),
@@ -1948,7 +2135,7 @@ class StorageEngine:
         we negate them so higher = better, consistent with vector scores.
         """
         try:
-            rows = self._conn.execute(
+            rows = self.__conn.execute(
                 "SELECT m.id, -bm25(memories_fts) AS score "
                 "FROM memories m "
                 "JOIN memories_fts fts ON m.id = fts.rowid "
@@ -1958,6 +2145,7 @@ class StorageEngine:
             ).fetchall()
             return [(int(r[0]), float(r[1])) for r in rows]
         except Exception:
+            logger.debug("FTS5 query failed for %r", query, exc_info=True)
             return []
 
     def get_relationships_for_entities(
@@ -1967,7 +2155,7 @@ class StorageEngine:
         if not entity_names:
             return []
         placeholders = ",".join("?" * len(entity_names))
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             f"SELECT r.* FROM relationships r "
             f"JOIN entities e_src ON e_src.id = r.source_entity_id "
             f"JOIN entities e_tgt ON e_tgt.id = r.target_entity_id "
@@ -1979,7 +2167,7 @@ class StorageEngine:
 
     def get_entity_relationships_graph(self) -> list[dict]:
         """Return all non-archived entity relationships with endpoint names."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT r.id, r.relationship_type, r.weight, r.created_at, "
             "r.last_reinforced, r.confidence, "
             "e_src.name AS source_name, e_tgt.name AS target_name "
@@ -2017,25 +2205,25 @@ class StorageEngine:
         now = self._now_iso()
 
         if memory_id is not None:
-            existing = self._conn.execute(
+            existing = self.__conn.execute(
                 "SELECT id FROM memories WHERE id = ?", (memory_id,)
             ).fetchone()
             if existing:
-                self._conn.execute(
+                self.__conn.execute(
                     "UPDATE memories SET content=?, embedding=?, heat=?, "
                     "directory_context=?, tags=?, last_accessed=?, "
                     "provenance_agent=? WHERE id=?",
                     (content, embedding, heat, project_dir, tags_json,
                      now, agent_id, memory_id),
                 )
-                self._conn.commit()
+                self._guarded_commit()
                 # Sync FTS
                 enriched = self._enrich_content_for_fts(content)
-                self._conn.execute(
+                self.__conn.execute(
                     "UPDATE memories_fts SET content=? WHERE rowid=?",
                     (enriched, memory_id),
                 )
-                self._conn.commit()
+                self._guarded_commit()
                 # Sync vector table
                 if embedding is not None:
                     try:
@@ -2044,51 +2232,52 @@ class StorageEngine:
                         try:
                             self.insert_vector(memory_id, embedding)
                         except Exception:
-                            pass
+                            logger.debug("Vec0 sync failed for memory %d in upsert (update path)", memory_id, exc_info=True)
                 return memory_id
 
         # Insert new
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO memories(content, embedding, heat, importance, is_protected, "
             "directory_context, tags, created_at, last_accessed, is_stale, provenance_agent) "
             "VALUES (?,?,?,?,?,?,?,?,?,0,?)",
             (content, embedding, heat, importance, int(is_protected),
              project_dir, tags_json, now, now, agent_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
         new_id = cur.lastrowid
+        # Explicit FTS INSERT (no trigger — Phase 2)
         enriched = self._enrich_content_for_fts(content)
-        self._conn.execute(
-            "UPDATE memories_fts SET content=? WHERE rowid=?",
-            (enriched, new_id),
+        self.__conn.execute(
+            "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+            (new_id, enriched),
         )
-        self._conn.commit()
+        self._guarded_commit()
         if embedding is not None:
             try:
                 self.insert_vector(new_id, embedding)
             except Exception:
-                pass
+                logger.debug("Vec0 insert failed for new memory %d in upsert", new_id, exc_info=True)
         return new_id
 
     def update_memory_access(
         self, memory_id: int, new_heat: float, accessed_at: str
     ) -> None:  # [COMMITS]
         """Update heat and last_accessed together (single commit)."""
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET heat=?, last_accessed=? WHERE id=?",
             (new_heat, accessed_at, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def update_memory_tags(
         self, memory_id: int, tags: list[str], agent_id: str
     ) -> None:  # [COMMITS]
         import json as _json
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET tags=?, provenance_agent=? WHERE id=?",
             (_json.dumps(tags), agent_id, memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def upsert_entity(
         self,
@@ -2099,23 +2288,23 @@ class StorageEngine:
     ) -> int:  # [COMMITS]
         """Insert or reinforce an entity by name. Returns entity id."""
         now = self._now_iso()
-        existing = self._conn.execute(
+        existing = self.__conn.execute(
             "SELECT id FROM entities WHERE name = ?", (name,)
         ).fetchone()
         if existing:
-            self._conn.execute(
+            self.__conn.execute(
                 "UPDATE entities SET heat=MIN(heat+0.1,1.0), last_accessed=?, "
                 "archived=0 WHERE id=?",
                 (now, existing[0]),
             )
-            self._conn.commit()
+            self._guarded_commit()
             return int(existing[0])
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO entities(name, type, created_at, last_accessed, heat) "
             "VALUES (?,?,?,?,?)",
             (name, entity_type, now, now, heat),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def upsert_relationship(
@@ -2134,26 +2323,26 @@ class StorageEngine:
         event_time = event_time or now
         src_id = self.upsert_entity(source, "concept", "system")
         tgt_id = self.upsert_entity(target, "concept", "system")
-        existing = self._conn.execute(
+        existing = self.__conn.execute(
             "SELECT id FROM relationships "
             "WHERE source_entity_id=? AND target_entity_id=?",
             (src_id, tgt_id),
         ).fetchone()
         if existing:
-            self._conn.execute(
+            self.__conn.execute(
                 "UPDATE relationships SET weight=weight+1, last_reinforced=?, "
                 "confidence=?, event_time=? WHERE id=?",
                 (now, confidence, event_time, existing[0]),
             )
-            self._conn.commit()
+            self._guarded_commit()
             return int(existing[0])
-        cur = self._conn.execute(
+        cur = self.__conn.execute(
             "INSERT INTO relationships(source_entity_id, target_entity_id, "
             "relationship_type, weight, created_at, last_reinforced, "
             "confidence, event_time) VALUES (?,?,?,1.0,?,?,?,?)",
             (src_id, tgt_id, rel_type, now, now, confidence, event_time),
         )
-        self._conn.commit()
+        self._guarded_commit()
         return cur.lastrowid
 
     def get_memory_by_id(self, memory_id: int) -> dict | None:
@@ -2161,16 +2350,31 @@ class StorageEngine:
         return self.get_memory(memory_id)
 
     def begin_transaction(self) -> None:
-        """Begin an explicit SQLite transaction (deferred)."""
-        self._conn.execute("BEGIN")
+        """Begin an explicit batch transaction.
+
+        Acquires the write lock and suppresses auto-commit in individual
+        storage methods until commit() or rollback() is called.  The write
+        queue uses this to batch multiple operations atomically.
+        """
+        self._write_lock.acquire()
+        self._in_batch = True
+        self.__conn.execute("BEGIN")
 
     def commit(self) -> None:
-        """Commit the current transaction."""
-        self._conn.commit()
+        """Commit the current transaction and release the write lock."""
+        try:
+            self.__conn.commit()
+        finally:
+            self._in_batch = False
+            self._write_lock.release()
 
     def rollback(self) -> None:
-        """Roll back the current transaction."""
-        self._conn.rollback()
+        """Roll back the current transaction and release the write lock."""
+        try:
+            self.__conn.rollback()
+        finally:
+            self._in_batch = False
+            self._write_lock.release()
 
     def batch_update_heat(
         self, updates: list[tuple[int, float]]
@@ -2178,11 +2382,11 @@ class StorageEngine:
         """Update heat for multiple memories in a single transaction."""
         if not updates:
             return
-        self._conn.executemany(
+        self.__conn.executemany(
             "UPDATE memories SET heat=? WHERE id=?",
             [(heat, mid) for mid, heat in updates],
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # ── Group C — background / consolidation ──────────────────────────────────
 
@@ -2190,7 +2394,7 @@ class StorageEngine:
         self, older_than: str, min_heat: float = 0.0
     ) -> list[dict]:
         """Return non-stale memories last accessed before *older_than* ISO timestamp."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE last_accessed < ? "
             "AND heat >= ? AND is_stale = 0 ORDER BY heat ASC",
             (older_than, min_heat),
@@ -2207,7 +2411,7 @@ class StorageEngine:
         """
         import numpy as np
 
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT id, embedding FROM memories "
             "WHERE embedding IS NOT NULL AND is_stale = 0"
         ).fetchall()
@@ -2238,7 +2442,7 @@ class StorageEngine:
 
     def get_orphaned_entities(self) -> list[dict]:
         """Return non-archived entities not referenced by any relationship."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT e.* FROM entities e "
             "WHERE e.archived = 0 "
             "AND e.id NOT IN ("
@@ -2260,7 +2464,7 @@ class StorageEngine:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=days_since_access)
         ).isoformat()
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE last_accessed < ? "
             "AND heat <= ? AND is_stale = 0 ORDER BY heat ASC",
             (cutoff, max_heat),
@@ -2269,7 +2473,7 @@ class StorageEngine:
 
     def get_consolidation_candidates(self, limit: int = 100) -> list[dict]:
         """Return lowest-heat non-stale memories as consolidation candidates."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT * FROM memories WHERE is_stale = 0 "
             "ORDER BY heat ASC LIMIT ?",
             (limit,),
@@ -2278,14 +2482,14 @@ class StorageEngine:
 
     def mark_memory_archived(self, memory_id: int) -> None:  # [COMMITS]
         """Mark a memory as stale/archived so it is excluded from cache and search."""
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET is_stale = 1 WHERE id = ?", (memory_id,)
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def get_episodes_for_memory(self, memory_id: int) -> list[dict]:
         """Return episodes that sourced this memory (via source_episode_id)."""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT e.* FROM episodes e "
             "JOIN memories m ON m.source_episode_id = e.id "
             "WHERE m.id = ?",
@@ -2305,7 +2509,7 @@ class StorageEngine:
 
         Creates the crdt_entries table on first use (lazy migration).
         """
-        self._conn.execute(
+        self.__conn.execute(
             "CREATE TABLE IF NOT EXISTS crdt_entries("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
             "memory_id INTEGER NOT NULL,"
@@ -2315,12 +2519,12 @@ class StorageEngine:
             "timestamp TEXT NOT NULL"
             ")"
         )
-        self._conn.execute(
+        self.__conn.execute(
             "INSERT INTO crdt_entries(memory_id, agent_id, operation, "
             "vector_clock, timestamp) VALUES (?,?,?,?,?)",
             (memory_id, agent_id, operation, vector_clock, timestamp),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     # ── Phase 7: Grooming queries ──────────────────────────────────────────────
 
@@ -2367,7 +2571,7 @@ class StorageEngine:
             params.append(compression_level)
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             f"SELECT * FROM memories {where} ORDER BY created_at ASC LIMIT ?",
             params + [limit],
         ).fetchall()
@@ -2376,15 +2580,23 @@ class StorageEngine:
     def get_orphan_memories(
         self,
         directory: str | None = None,
+        max_heat: float = 0.15,
+        include_tagged: bool = False,
+        min_content_length: int | None = None,
         limit: int = 50,
     ) -> list[dict]:
-        """Return low-connectivity memories (cold, untagged). NO COMMIT."""
-        cond = "WHERE heat < 0.15 AND (tags IS NULL OR tags = '[]' OR tags = '')"
-        params: list = []
+        """Return low-connectivity memories. NO COMMIT."""
+        cond = "WHERE heat < ?"
+        params: list = [max_heat]
+        if not include_tagged:
+            cond += " AND (tags IS NULL OR tags = '[]' OR tags = '')"
         if directory:
             cond += " AND directory_context = ?"
             params.append(directory)
-        rows = self._conn.execute(
+        if min_content_length is not None:
+            cond += " AND LENGTH(content) >= ?"
+            params.append(min_content_length)
+        rows = self.__conn.execute(
             f"SELECT * FROM memories {cond} ORDER BY heat ASC LIMIT ?",
             params + [limit],
         ).fetchall()
@@ -2401,7 +2613,7 @@ class StorageEngine:
 
         dir_cond = "AND directory_context = ?" if directory else ""
         dir_params = [directory] if directory else []
-        rows = self._conn.execute(
+        rows = self.__conn.execute(
             "SELECT id, content, embedding, heat, created_at FROM memories "
             f"WHERE embedding IS NOT NULL AND heat > 0 {dir_cond}",
             dir_params,
@@ -2466,13 +2678,13 @@ class StorageEngine:
 
     def get_memory_full(self, memory_id: int) -> dict | None:
         """Full memory record including archive history. NO COMMIT."""
-        row = self._conn.execute(
+        row = self.__conn.execute(
             "SELECT * FROM memories WHERE id = ?", (memory_id,)
         ).fetchone()
         if row is None:
             return None
         d = self._row_to_dict(row)
-        archives = self._conn.execute(
+        archives = self.__conn.execute(
             "SELECT * FROM memory_archives WHERE original_memory_id = ? "
             "ORDER BY archived_at DESC",
             (memory_id,),
@@ -2480,7 +2692,7 @@ class StorageEngine:
         d["archive_history"] = self._rows_to_dicts(archives)
         # Also include groomer-specific archive entries if the table exists.
         try:
-            groomer_archives = self._conn.execute(
+            groomer_archives = self.__conn.execute(
                 "SELECT * FROM grooming_archives WHERE memory_id = ? "
                 "ORDER BY archived_at DESC",
                 (memory_id,),
@@ -2497,7 +2709,7 @@ class StorageEngine:
         reason: str = "groomer",
     ) -> None:  # [COMMITS]
         """Copy memory to grooming_archives. [COMMITS]"""
-        self._conn.execute(
+        self.__conn.execute(
             "CREATE TABLE IF NOT EXISTS grooming_archives("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
             "memory_id INTEGER NOT NULL,"
@@ -2509,11 +2721,11 @@ class StorageEngine:
             "reason TEXT DEFAULT 'groomer'"
             ")"
         )
-        mem = self._conn.execute(
+        mem = self.__conn.execute(
             "SELECT content, heat, tags FROM memories WHERE id = ?", (memory_id,)
         ).fetchone()
         if mem:
-            self._conn.execute(
+            self.__conn.execute(
                 "INSERT INTO grooming_archives "
                 "(memory_id, replacement_id, content, heat, tags, archived_at, reason) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -2527,7 +2739,7 @@ class StorageEngine:
                     reason,
                 ),
             )
-        self._conn.commit()
+        self._guarded_commit()
 
     def bulk_delete_by_filter(self, filter: dict) -> int:  # [COMMITS]
         """Delete memories matching filter. At least one criterion required. [COMMITS]"""
@@ -2583,19 +2795,19 @@ class StorageEngine:
         if "last_accessed" not in fields:
             fields["last_accessed"] = self._now_iso()
         set_clause = ", ".join(f"{k} = ?" for k in fields)
-        self._conn.execute(
+        self.__conn.execute(
             f"UPDATE memories SET {set_clause} WHERE id = ?",
             list(fields.values()) + [memory_id],
         )
         if content is not None:
             enriched = self._enrich_content_for_fts(content)
-            self._conn.execute(
+            self.__conn.execute(
                 "UPDATE memories_fts SET content = ? WHERE rowid = ?",
                 (enriched, memory_id),
             )
         if embedding is not None:
             try:
-                self._conn.execute(
+                self.__conn.execute(
                     "UPDATE memory_vectors SET embedding = ? WHERE rowid = ?",
                     (embedding, memory_id),
                 )
@@ -2603,8 +2815,8 @@ class StorageEngine:
                 try:
                     self.insert_vector(memory_id, embedding)
                 except Exception:
-                    pass
-        self._conn.commit()
+                    logger.debug("Vec0 sync failed for memory %d in update_memory_full", memory_id, exc_info=True)
+        self._guarded_commit()
 
     def promote_memory(self, memory_id: int) -> None:  # [COMMITS]
         """Set heat=1.0, is_protected=1, add _anchor tag. [COMMITS]"""
@@ -2614,11 +2826,11 @@ class StorageEngine:
         existing_tags: list = mem.get("tags", [])
         if "_anchor" not in existing_tags:
             existing_tags = list(existing_tags) + ["_anchor"]
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET heat=1.0, is_protected=1, tags=? WHERE id=?",
             (json.dumps(existing_tags), memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
 
     def demote_memory(self, memory_id: int) -> None:  # [COMMITS]
         """Set heat=0.01, is_protected=0, remove _anchor tag. [COMMITS]"""
@@ -2626,11 +2838,682 @@ class StorageEngine:
         if mem is None:
             return
         existing_tags = [t for t in (mem.get("tags") or []) if t != "_anchor"]
-        self._conn.execute(
+        self.__conn.execute(
             "UPDATE memories SET heat=0.01, is_protected=0, tags=? WHERE id=?",
             (json.dumps(existing_tags), memory_id),
         )
-        self._conn.commit()
+        self._guarded_commit()
+
+    # ── Groomer query tools ─────────────────────────────────────────────────────
+
+    def groomer_search(
+        self,
+        provenance_agent: str | None = None,
+        content_like: str | None = None,
+        content_length_min: int | None = None,
+        content_length_max: int | None = None,
+        tags_empty: bool | None = None,
+        created_before: str | None = None,
+        created_after: str | None = None,
+        id_range: list[int] | None = None,
+        directory: str | None = None,
+        max_heat: float | None = None,
+        limit: int = 50,
+        fields: list[str] | None = None,
+    ) -> list[dict]:
+        """Raw filtered SELECT for groomer — no embedding search, no reranking. NO COMMIT."""
+        conditions: list[str] = []
+        params: list = []
+
+        if max_heat is not None:
+            conditions.append("heat <= ?")
+            params.append(max_heat)
+        if provenance_agent:
+            conditions.append("provenance_agent = ?")
+            params.append(provenance_agent)
+        if content_like:
+            conditions.append("content LIKE ?")
+            params.append(f"%{content_like}%")
+        if content_length_min is not None:
+            conditions.append("LENGTH(content) >= ?")
+            params.append(content_length_min)
+        if content_length_max is not None:
+            conditions.append("LENGTH(content) <= ?")
+            params.append(content_length_max)
+        if tags_empty is True:
+            conditions.append("(tags IS NULL OR tags = '[]' OR tags = '')")
+        elif tags_empty is False:
+            conditions.append("tags IS NOT NULL AND tags != '[]' AND tags != ''")
+        if created_before:
+            conditions.append("created_at < ?")
+            params.append(created_before)
+        if created_after:
+            conditions.append("created_at > ?")
+            params.append(created_after)
+        if id_range and len(id_range) == 2:
+            conditions.append("id >= ? AND id <= ?")
+            params.extend(id_range[:2])
+        if directory:
+            conditions.append("directory_context = ?")
+            params.append(directory)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = self.__conn.execute(
+            f"SELECT * FROM memories {where} ORDER BY id ASC LIMIT ?",
+            params + [limit],
+        ).fetchall()
+
+        results = self._rows_to_dicts(rows)
+        # Strip embeddings (not useful for groomer output, not JSON-serializable)
+        for r in results:
+            r.pop("embedding", None)
+
+        if fields:
+            allowed = set(fields) | {"id"}
+            results = [{k: v for k, v in r.items() if k in allowed} for r in results]
+
+        return results
+
+    def groomer_provenance(self, directory: str | None = None) -> list[dict]:
+        """Distinct provenance_agent values with counts, date ranges, top tags. NO COMMIT."""
+        dir_cond = "WHERE directory_context = ?" if directory else ""
+        dir_params = [directory] if directory else []
+
+        rows = self.__conn.execute(
+            f"SELECT provenance_agent, COUNT(*) as count, "
+            f"MIN(created_at) as first_seen, MAX(created_at) as last_seen, "
+            f"GROUP_CONCAT(tags, '|||') as all_tags "
+            f"FROM memories {dir_cond} "
+            f"GROUP BY provenance_agent ORDER BY count DESC",
+            dir_params,
+        ).fetchall()
+
+        result = []
+        for row in rows:
+            row_dict = dict(row)
+            # Extract top tags from concatenated tag arrays
+            tag_counts: dict[str, int] = {}
+            raw_tags = row_dict.pop("all_tags", "") or ""
+            for tag_json in raw_tags.split("|||"):
+                try:
+                    tags = json.loads(tag_json) if tag_json.strip() else []
+                except (ValueError, TypeError):
+                    tags = []
+                for t in tags:
+                    if t and not t.startswith("_"):
+                        tag_counts[t] = tag_counts.get(t, 0) + 1
+            top_tags = sorted(tag_counts, key=tag_counts.get, reverse=True)[:5]
+            row_dict["top_tags"] = top_tags
+            result.append(row_dict)
+        return result
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Domain methods (Phase 1 refactor)
+    # Mostly READ-only. Write methods noted with [COMMITS].
+    # Use thread-local _conn via property.
+    # These replace direct _conn access from outside StorageEngine.
+    # ═══════════════════════════════════════════════════════════════════
+
+    # -- Memory counting & stats --
+
+    def count_memories(
+        self,
+        store_type: str | None = None,
+        min_heat: float = 0.0,
+        compression_level: int | None = None,
+    ) -> int:
+        """Count memories matching optional filters. Uses heat > min_heat."""
+        sql = "SELECT COUNT(*) FROM memories WHERE heat > ?"
+        params: list = [min_heat]
+        if store_type is not None:
+            sql += " AND store_type = ?"
+            params.append(store_type)
+        if compression_level is not None:
+            sql += " AND compression_level = ?"
+            params.append(compression_level)
+        row = self.__conn.execute(sql, params).fetchone()
+        return row[0] if row else 0
+
+    def sum_reconsolidation_count(self) -> int:
+        """Sum of reconsolidation_count across all memories."""
+        row = self.__conn.execute(
+            "SELECT COALESCE(SUM(reconsolidation_count), 0) FROM memories"
+        ).fetchone()
+        return row[0] if row else 0
+
+    def count_causal_relationships(self) -> int:
+        """Count relationships marked as causal."""
+        row = self.__conn.execute(
+            "SELECT COUNT(*) FROM relationships WHERE is_causal = 1"
+        ).fetchone()
+        return row[0] if row else 0
+
+    # -- Specialized memory queries --
+
+    def get_memories_by_store_type(
+        self,
+        store_type: str,
+        directory: str | None = None,
+        min_heat: float = 0.0,
+        require_embedding: bool = False,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """Get memories filtered by store_type with optional directory/embedding filters."""
+        sql = "SELECT * FROM memories WHERE store_type = ? AND heat > ?"
+        params: list = [store_type, min_heat]
+        if require_embedding:
+            sql += " AND embedding IS NOT NULL"
+        if directory is not None:
+            sql += " AND directory_context = ?"
+            params.append(directory)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self.__conn.execute(sql, params).fetchall()
+        return self._rows_to_dicts(rows)
+
+    # SQL pattern for matching _anchor tag literally (escaping _ wildcard)
+    _ANCHOR_LIKE = '%"\\_anchor"%'
+    _ANCHOR_ESCAPE = '\\'
+
+    def get_anchored_memories(self, min_heat: float = 0.0, limit: int = 50) -> list[dict]:
+        """Get protected anchor memories, ordered by created_at DESC.
+
+        Uses ESCAPE to treat _ literally (not as SQL wildcard).
+        """
+        rows = self.__conn.execute(
+            "SELECT * FROM memories WHERE is_protected = 1 AND heat > ? "
+            "AND tags LIKE ? ESCAPE ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (min_heat, self._ANCHOR_LIKE, self._ANCHOR_ESCAPE, limit),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_recent_memories(
+        self, exclude_anchored: bool = True, min_heat: float = 0.0, limit: int = 50
+    ) -> list[dict]:
+        """Get recent memories, optionally excluding anchored ones."""
+        sql = "SELECT * FROM memories WHERE heat > ?"
+        params: list = [min_heat]
+        if exclude_anchored:
+            sql += " AND is_protected = 0 AND tags NOT LIKE ? ESCAPE ?"
+            params.extend([self._ANCHOR_LIKE, self._ANCHOR_ESCAPE])
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self.__conn.execute(sql, params).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_memories_for_pruning(self, limit: int = 500) -> list[dict]:
+        """Get low-quality memories eligible for deletion by memify."""
+        rows = self.__conn.execute(
+            "SELECT * FROM memories WHERE heat < 0.01 AND confidence < 0.3 "
+            "AND access_count = 0 AND store_type != 'reference' LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_memories_for_strengthening(self) -> list[dict]:
+        """Get frequently-accessed high-confidence memories for importance boost."""
+        rows = self.__conn.execute(
+            "SELECT id, importance FROM memories "
+            "WHERE access_count > 5 AND confidence > 0.8 AND importance < 1.0 "
+            "AND store_type != 'reference'"
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_memories_in_cluster(self, cluster_id: int, min_heat: float = 0.0) -> list[dict]:
+        """Get memories assigned to a cluster, ordered by heat DESC."""
+        rows = self.__conn.execute(
+            "SELECT * FROM memories WHERE cluster_id = ? AND heat > ? "
+            "ORDER BY heat DESC",
+            (cluster_id, min_heat),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_old_verbose_memories(self, before: str, min_length: int = 1000) -> list[dict]:
+        """Get old uncompressed memories exceeding min_length chars."""
+        rows = self.__conn.execute(
+            "SELECT id, content FROM memories "
+            "WHERE created_at < ? AND LENGTH(content) > ? "
+            "AND (compressed = 0 OR compressed IS NULL)",
+            (before, min_length),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_memory_ids_by_heat(self, min_heat: float, limit: int) -> list[int]:
+        """Get memory IDs with heat above threshold."""
+        rows = self.__conn.execute(
+            "SELECT id FROM memories WHERE heat > ? LIMIT ?",
+            (min_heat, limit),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def get_hdc_vector(self, memory_id: int) -> bytes | None:
+        """Get the HDC vector for a memory, or None if not set."""
+        row = self.__conn.execute(
+            "SELECT hdc_vector FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def find_memories_mentioning(self, text: str, min_heat: float = 0.0) -> list[int]:
+        """Find memory IDs whose content mentions text. FTS5 first, LIKE fallback.
+
+        Returns empty list for empty/whitespace-only text.
+        """
+        if not text or not text.strip():
+            return []
+        # Always run LIKE as the ground truth (substring match).
+        # FTS5 tokenization can miss exact substrings, so LIKE is the
+        # reliable fallback. FTS5 is tried first only as an optimisation.
+        try:
+            fts_query = self._preprocess_fts_query(text)
+            if fts_query and fts_query.strip():
+                rows = self.__conn.execute(
+                    "SELECT m.id FROM memories m "
+                    "JOIN memories_fts fts ON m.id = fts.rowid "
+                    "WHERE memories_fts MATCH ? AND m.heat > ?",
+                    (fts_query, min_heat),
+                ).fetchall()
+                if rows:
+                    return [r[0] for r in rows]
+        except Exception:
+            pass
+        # LIKE fallback — always runs if FTS returned nothing
+        escaped = text.replace("%", "\\%").replace("_", "\\_")
+        rows = self.__conn.execute(
+            "SELECT id FROM memories WHERE content LIKE ? ESCAPE '\\' AND heat > ?",
+            (f"%{escaped}%", min_heat),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_hot_memories_all(
+        self, min_heat: float = 0.0, limit: int = 5000
+    ) -> list[dict]:
+        """Get all memories with heat above threshold (no directory filter).
+
+        Default limit of 5000 prevents unbounded result sets. Pass limit=0
+        to disable (use with caution).
+        """
+        if limit > 0:
+            rows = self.__conn.execute(
+                "SELECT * FROM memories WHERE heat > ? LIMIT ?",
+                (min_heat, limit),
+            ).fetchall()
+        else:
+            rows = self.__conn.execute(
+                "SELECT * FROM memories WHERE heat > ?",
+                (min_heat,),
+            ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def memory_exists_with_content(self, content: str) -> bool:
+        """Check if a memory with this exact content exists."""
+        row = self.__conn.execute(
+            "SELECT 1 FROM memories WHERE content = ? LIMIT 1",
+            (content,),
+        ).fetchone()
+        return row is not None
+
+    def get_latest_memory_date_mentioning(self, text: str) -> str | None:
+        """Get created_at of the most recent memory mentioning text, or None."""
+        escaped = text.replace("%", "\\%").replace("_", "\\_")
+        row = self.__conn.execute(
+            "SELECT created_at FROM memories "
+            "WHERE content LIKE ? ESCAPE '\\' AND heat > 0 "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f"%{escaped}%",),
+        ).fetchone()
+        return row[0] if row else None
+
+    # -- Entity queries --
+
+    def get_entity_name(self, entity_id: int) -> str | None:
+        """Get entity name by ID, or None if not found."""
+        row = self.__conn.execute(
+            "SELECT name FROM entities WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_entity_heat(self, entity_id: int) -> float | None:
+        """Get entity heat by ID, or None if entity not found."""
+        row = self.__conn.execute(
+            "SELECT heat FROM entities WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_entity_by_id(self, entity_id: int) -> dict | None:
+        """Get full entity dict by ID."""
+        row = self.__conn.execute(
+            "SELECT * FROM entities WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        return self._row_to_dict(row)
+
+    # -- Relationship queries --
+
+    def get_relationships_by_weight(
+        self,
+        min_weight: float,
+        relationship_type: str | None = None,
+    ) -> list[dict]:
+        """Get relationships with weight >= min_weight. NULL weight treated as 0."""
+        conditions: list[str] = []
+        params: list = []
+        if min_weight > 0:
+            conditions.append("COALESCE(weight, 0) >= ?")
+            params.append(min_weight)
+        if relationship_type is not None:
+            conditions.append("relationship_type = ?")
+            params.append(relationship_type)
+        sql = "SELECT * FROM relationships"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        rows = self.__conn.execute(sql, params).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_relationships_at_time(self, entity_id: int, before_time: str) -> list[dict]:
+        """Get relationships for an entity at or before a timestamp, with entity names."""
+        rows = self.__conn.execute(
+            "SELECT r.*, e1.name AS source_name, e2.name AS target_name "
+            "FROM relationships r "
+            "JOIN entities e1 ON e1.id = r.source_entity_id "
+            "JOIN entities e2 ON e2.id = r.target_entity_id "
+            "WHERE (r.source_entity_id = ? OR r.target_entity_id = ?) "
+            "AND r.event_time <= ? "
+            "ORDER BY r.event_time DESC",
+            (entity_id, entity_id, before_time),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_relationship_history(self, entity_id_a: int, entity_id_b: int) -> list[dict]:
+        """Get all relationships between two entities (bidirectional), with names."""
+        rows = self.__conn.execute(
+            "SELECT r.*, e1.name AS source_name, e2.name AS target_name "
+            "FROM relationships r "
+            "JOIN entities e1 ON e1.id = r.source_entity_id "
+            "JOIN entities e2 ON e2.id = r.target_entity_id "
+            "WHERE (r.source_entity_id = ? AND r.target_entity_id = ?) "
+            "OR (r.source_entity_id = ? AND r.target_entity_id = ?) "
+            "ORDER BY r.created_at ASC",
+            (entity_id_a, entity_id_b, entity_id_b, entity_id_a),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_adjacent_relationships(
+        self, entity_id: int, relationship_types: list[str] | None = None
+    ) -> list[dict]:
+        """Get relationships adjacent to an entity, optionally filtered by type. Includes names."""
+        if relationship_types:
+            placeholders = ",".join("?" for _ in relationship_types)
+            sql = (
+                "SELECT r.*, e1.name AS source_name, e2.name AS target_name "
+                "FROM relationships r "
+                "JOIN entities e1 ON e1.id = r.source_entity_id "
+                "JOIN entities e2 ON e2.id = r.target_entity_id "
+                "WHERE (r.source_entity_id = ? OR r.target_entity_id = ?) "
+                f"AND r.relationship_type IN ({placeholders})"
+            )
+            params = [entity_id, entity_id] + relationship_types
+        else:
+            sql = (
+                "SELECT r.*, e1.name AS source_name, e2.name AS target_name "
+                "FROM relationships r "
+                "JOIN entities e1 ON e1.id = r.source_entity_id "
+                "JOIN entities e2 ON e2.id = r.target_entity_id "
+                "WHERE r.source_entity_id = ? OR r.target_entity_id = ?"
+            )
+            params = [entity_id, entity_id]
+        rows = self.__conn.execute(sql, params).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_all_relationships_for_graph(self, limit: int = 10000) -> list[dict]:
+        """Lightweight relationship data for graph building (IDs + weight only).
+
+        Default limit of 10000 prevents unbounded result sets. Pass limit=0
+        to disable.
+        """
+        sql = "SELECT source_entity_id, target_entity_id, weight FROM relationships"
+        if limit > 0:
+            sql += " LIMIT ?"
+            rows = self.__conn.execute(sql, (limit,)).fetchall()
+        else:
+            rows = self.__conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+    def relationship_exists(self, entity_id_a: int, entity_id_b: int) -> bool:
+        """Check if any relationship exists between two entities (bidirectional)."""
+        row = self.__conn.execute(
+            "SELECT 1 FROM relationships "
+            "WHERE (source_entity_id = ? AND target_entity_id = ?) "
+            "OR (source_entity_id = ? AND target_entity_id = ?) LIMIT 1",
+            (entity_id_a, entity_id_b, entity_id_b, entity_id_a),
+        ).fetchone()
+        return row is not None
+
+    def get_relationships_by_type_for_entity(
+        self, entity_id: int, relationship_type: str
+    ) -> list[dict]:
+        """Get relationships from an entity of a specific type."""
+        rows = self.__conn.execute(
+            "SELECT * FROM relationships "
+            "WHERE source_entity_id = ? AND relationship_type = ?",
+            (entity_id, relationship_type),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_distinct_relationship_types(self) -> list[str]:
+        """Get all distinct relationship types in the graph."""
+        rows = self.__conn.execute(
+            "SELECT DISTINCT relationship_type FROM relationships"
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def get_typed_relationship(
+        self, source_id: int, target_id: int, relationship_type: str
+    ) -> dict | None:
+        """Get a specific relationship by source, target, and type (directional)."""
+        row = self.__conn.execute(
+            "SELECT * FROM relationships "
+            "WHERE source_entity_id = ? AND target_entity_id = ? "
+            "AND relationship_type = ?",
+            (source_id, target_id, relationship_type),
+        ).fetchone()
+        return self._row_to_dict(row)
+
+    # -- Episode queries --
+
+    def get_all_episode_contents(self, limit: int = 5000) -> list[dict]:
+        """Get episodes (id, raw_content, timestamp) ordered by timestamp ASC.
+
+        Default limit of 5000 prevents unbounded result sets. Pass limit=0
+        to disable.
+        """
+        sql = "SELECT id, raw_content, timestamp FROM episodes ORDER BY timestamp ASC"
+        if limit > 0:
+            sql += " LIMIT ?"
+            rows = self.__conn.execute(sql, (limit,)).fetchall()
+        else:
+            rows = self.__conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_episodes_since_time(self, since: str) -> list[dict]:
+        """Get episodes with timestamp >= since, ordered ASC."""
+        rows = self.__conn.execute(
+            "SELECT * FROM episodes WHERE timestamp >= ? ORDER BY timestamp ASC",
+            (since,),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_episode_session_id(self, episode_id: int) -> str | None:
+        """Get the session_id for an episode, or None if not found."""
+        row = self.__conn.execute(
+            "SELECT session_id FROM episodes WHERE id = ?",
+            (episode_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    # -- Causal DAG queries --
+
+    def get_causal_causes(self, entity_id: int) -> list[dict]:
+        """Get upstream causes for an entity from the causal DAG, with source names."""
+        rows = self.__conn.execute(
+            "SELECT cde.*, e.name AS source_name "
+            "FROM causal_dag_edges cde "
+            "JOIN entities e ON e.id = cde.source_entity_id "
+            "WHERE cde.target_entity_id = ?",
+            (entity_id,),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_causal_effects(self, entity_id: int) -> list[dict]:
+        """Get downstream effects for an entity from the causal DAG, with target names."""
+        rows = self.__conn.execute(
+            "SELECT cde.*, e.name AS target_name "
+            "FROM causal_dag_edges cde "
+            "JOIN entities e ON e.id = cde.target_entity_id "
+            "WHERE cde.source_entity_id = ?",
+            (entity_id,),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    # -- Cluster queries --
+
+    def get_child_clusters(self, parent_cluster_id: int) -> list[dict]:
+        """Get sub-clusters of a parent cluster, ordered by heat DESC."""
+        rows = self.__conn.execute(
+            "SELECT * FROM memory_clusters WHERE parent_cluster_id = ? "
+            "ORDER BY heat DESC",
+            (parent_cluster_id,),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_cluster_dominant_directory(self, cluster_id: int) -> str | None:
+        """Get the most common directory_context among memories in a cluster."""
+        row = self.__conn.execute(
+            "SELECT directory_context FROM memories "
+            "WHERE cluster_id = ? "
+            "GROUP BY directory_context ORDER BY COUNT(*) DESC LIMIT 1",
+            (cluster_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_cluster_member_ids(self, cluster_id: int, min_heat: float = 0.0) -> list[int]:
+        """Get memory IDs belonging to a cluster."""
+        rows = self.__conn.execute(
+            "SELECT id FROM memories WHERE cluster_id = ? AND heat > ?",
+            (cluster_id, min_heat),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    # -- Action log & metadata --
+
+    def get_unprocessed_action_log(self, limit: int = 200) -> list[dict]:
+        """Get unprocessed action_log entries ordered by timestamp ASC."""
+        rows = self.__conn.execute(
+            "SELECT id, tool_name, tool_input_summary, directory, timestamp "
+            "FROM action_log WHERE processed = 0 "
+            "ORDER BY timestamp ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_metadata_value(self, key: str) -> str | None:
+        """Get a value from the metadata key-value table.
+
+        Returns None if key not found or metadata table doesn't exist yet.
+        """
+        import sqlite3
+        try:
+            row = self.__conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
+            return row[0] if row else None
+        except sqlite3.OperationalError:
+            # Table may not exist on very old DBs
+            return None
+
+    def set_metadata_value(self, key: str, value: str) -> None:
+        """Insert or update a metadata key-value pair. [COMMITS]"""
+        self.execute_write(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+    # -- Directory queries --
+
+    def get_active_directories(self, min_heat: float = 0.0) -> list[str]:
+        """Get distinct directory contexts with memories at or above min_heat.
+
+        Uses >= (not >) to match narrative.py semantics.
+        """
+        rows = self.__conn.execute(
+            "SELECT DISTINCT directory_context FROM memories WHERE heat >= ?",
+            (min_heat,),
+        ).fetchall()
+        return [row[0] for row in rows if row[0]]
+
+    # -- Rule queries --
+
+    def rule_exists(self, rule_id: int) -> bool:
+        """Check if a memory rule exists by ID."""
+        row = self.__conn.execute(
+            "SELECT 1 FROM memory_rules WHERE id = ?",
+            (rule_id,),
+        ).fetchone()
+        return row is not None
+
+    def get_all_rules_sorted(self) -> list[dict]:
+        """Get all active rules sorted by scope then priority DESC."""
+        rows = self.__conn.execute(
+            "SELECT * FROM memory_rules WHERE is_active = 1 "
+            "ORDER BY scope, priority DESC"
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    def get_rules_by_scope_type(self, scope: str) -> list[dict]:
+        """Get all active rules for a scope type (no scope_value filter).
+
+        Used by RulesEngine which does its own prefix matching on scope_value.
+        """
+        rows = self.__conn.execute(
+            "SELECT * FROM memory_rules WHERE scope = ? AND is_active = 1 "
+            "ORDER BY priority DESC",
+            (scope,),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
+    # -- Tag & seed queries --
+
+    def get_memory_ids_by_tag(self, tag: str) -> list[int]:
+        """Get memory IDs that have a specific tag (JSON-aware check)."""
+        rows = self.__conn.execute(
+            "SELECT id FROM memories WHERE tags LIKE ?",
+            (f'%"{tag}"%',),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    # -- Astrocyte process queries --
+
+    def get_astrocyte_process(self, process_id: int) -> dict | None:
+        """Get an astrocyte process by ID."""
+        row = self.__conn.execute(
+            "SELECT * FROM astrocyte_processes WHERE id = ?",
+            (process_id,),
+        ).fetchone()
+        return self._row_to_dict(row)
+
+    # -- Write connection (sanctioned escape hatch for WriteQueue) --
+
+    def get_write_connection(self):
+        """Return the thread-local connection for transaction management.
+
+        Only WriteQueue should call this — for BEGIN/COMMIT/ROLLBACK.
+        """
+        return self.__conn
 
     def close(self):
-        self._conn.close()
+        self.__conn.close()

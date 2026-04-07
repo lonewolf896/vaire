@@ -44,6 +44,9 @@ class IngestionJob:
 class MarkdownChunker:
     """Splits a Markdown file into semantically meaningful chunks."""
 
+    # Match YAML frontmatter: starts at beginning of file, delimited by ---
+    _FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*\n?", re.DOTALL)
+
     def __init__(self, settings: Settings) -> None:
         self._min = settings.INGEST_CHUNK_MIN
         self._max = settings.INGEST_CHUNK_MAX
@@ -54,6 +57,10 @@ class MarkdownChunker:
 
     def chunk_file(self, file_path: str) -> list[Chunk]:
         text = Path(file_path).read_text(encoding="utf-8")
+        if not text.strip():
+            return []
+        # Strip YAML frontmatter — it's metadata, not content worth chunking
+        text = self._FRONTMATTER_RE.sub("", text)
         if not text.strip():
             return []
         chunks = self._split_on_pattern(text, self._h2_re, file_path, [])
@@ -141,10 +148,20 @@ class MarkdownChunker:
         result: list[Chunk] = []
         offset = chunk.char_offset
 
+        # Group heading lines with the paragraph that follows them so
+        # headings don't become orphan fragments.
+        grouped: list[str] = []
         for para in paragraphs:
             para = para.strip()
             if not para:
                 continue
+            # A bare heading (e.g. "### Foo") should attach to the next paragraph
+            if grouped and grouped[-1].startswith("#") and len(grouped[-1]) < self._min:
+                grouped[-1] = grouped[-1] + "\n\n" + para
+            else:
+                grouped.append(para)
+
+        for para in grouped:
             if len(para) > self._max:
                 result.extend(self._hard_split(para, chunk))
             else:
@@ -264,11 +281,29 @@ class IngestionPipeline:
         # consolidation tasks (one consolidated run happens at the end instead).
         self._bulk_ingest_active: bool = False
 
+    def _check_path_allowed(self, file_path: str) -> str | None:
+        """R12: Return error message if path is outside allowed directories."""
+        allowed = self._settings.ingest_allowed_dirs_list
+        if not allowed:
+            return None  # no restriction configured
+
+        resolved = str(Path(file_path).resolve())
+        for allowed_dir in allowed:
+            allowed_resolved = str(Path(allowed_dir).resolve())
+            if resolved.startswith(allowed_resolved + "/") or resolved == allowed_resolved:
+                return None
+        return f"Path {file_path} is outside allowed directories: {allowed}"
+
     async def ingest_file(self, params: dict, agent_id: str) -> dict:
         file_path = params.get("file_path", "")
         dry_run = params.get("dry_run", False)
         project_dir = params.get("project_dir", "")
         tags = params.get("tags", [])
+
+        # R12: Path traversal check
+        path_err = self._check_path_allowed(file_path)
+        if path_err:
+            return {"error": path_err}
 
         # S1: validate
         p = Path(file_path)
@@ -364,6 +399,12 @@ class IngestionPipeline:
 
     async def ingest_directory(self, params: dict, agent_id: str) -> dict:
         dir_path = params.get("directory_path", "")
+
+        # R12: Path traversal check
+        path_err = self._check_path_allowed(dir_path)
+        if path_err:
+            return {"error": path_err}
+
         p = Path(dir_path)
         if not p.exists() or not p.is_dir():
             return {"error": f"Directory not found: {dir_path}"}

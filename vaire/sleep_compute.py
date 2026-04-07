@@ -18,10 +18,7 @@ from vaire.thermodynamics import MemoryThermodynamics
 
 logger = logging.getLogger(__name__)
 
-# Sentence boundary splitter
-_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
-
-# Entity-like patterns for identifying key sentences during compression
+# Entity-like patterns for identifying key sentences
 _ENTITY_PATTERN_RE = re.compile(
     r"(?:[\w@.-]+/[\w@.-]+\.\w+"  # file paths
     r"|\bdef\s+\w+"  # python defs
@@ -208,6 +205,41 @@ class SleepComputeEngine:
 
     # -- b. Community Detection --
 
+    def _cleanup_community_clusters(self) -> int:
+        """Remove community clusters from previous sleep cycles.
+
+        Only removes clusters with name matching 'community_*' at level 1.
+        Unsets cluster_id on memories that referenced them.
+        Returns count of clusters removed.
+        """
+        old_clusters = self._storage.get_clusters_by_level(1)
+        removed = 0
+
+        for cluster in old_clusters:
+            if not cluster.get("name", "").startswith("community_"):
+                continue
+
+            cluster_id = cluster["id"]
+
+            # Unset cluster_id on memories that referenced this cluster
+            self._storage.execute_write(
+                "UPDATE memories SET cluster_id = NULL WHERE cluster_id = ?",
+                (cluster_id,),
+            )
+
+            # Delete the cluster record
+            self._storage.execute_write(
+                "DELETE FROM memory_clusters WHERE id = ?",
+                (cluster_id,),
+            )
+
+            removed += 1
+
+        if removed > 0:
+            logger.info("Cleaned up %d old community clusters", removed)
+
+        return removed
+
     def detect_communities(self) -> list[dict]:
         """Build a networkx graph from entity relationships and detect communities."""
         import networkx as nx
@@ -222,13 +254,10 @@ class SleepComputeEngine:
         for e in entities:
             G.add_node(e["id"], name=e["name"], type=e["type"])
 
-        rows = self._storage._conn.execute(
-            "SELECT source_entity_id, target_entity_id, weight "
-            "FROM relationships"
-        ).fetchall()
+        rels = self._storage.get_all_relationships_for_graph()
 
-        for row in rows:
-            src, tgt, weight = row[0], row[1], row[2]
+        for rel in rels:
+            src, tgt, weight = rel["source_entity_id"], rel["target_entity_id"], rel["weight"]
             if src in entity_map and tgt in entity_map:
                 G.add_edge(src, tgt, weight=weight or 1.0)
 
@@ -242,6 +271,9 @@ class SleepComputeEngine:
         except Exception:
             from networkx.algorithms.community import label_propagation_communities
             communities = list(label_propagation_communities(G))
+
+        # Clean up previous community clusters before creating new ones (Phase 4)
+        self._cleanup_community_clusters()
 
         results = []
         for comm_idx, community in enumerate(communities):
@@ -272,12 +304,10 @@ class SleepComputeEngine:
 
             # Assign memories to this cluster
             for mid in memory_ids:
-                self._storage._conn.execute(
+                self._storage.execute_write(
                     "UPDATE memories SET cluster_id = ? WHERE id = ?",
                     (cluster_id, mid),
                 )
-            if memory_ids:
-                self._storage._conn.commit()
 
             results.append({
                 "cluster_id": cluster_id,
@@ -294,15 +324,13 @@ class SleepComputeEngine:
             return []
 
         memory_ids: set[int] = set()
-        all_memories = self._storage._conn.execute(
-            "SELECT id, content FROM memories WHERE heat > 0"
-        ).fetchall()
+        all_memories = self._storage.get_hot_memories_all()
 
         for mem in all_memories:
-            content = mem[1]
+            content = mem["content"]
             for name in entity_names:
                 if name in content:
-                    memory_ids.add(mem[0])
+                    memory_ids.add(mem["id"])
                     break
 
         return list(memory_ids)
@@ -318,17 +346,13 @@ class SleepComputeEngine:
                 continue
 
             cluster_id = cluster["id"]
-            rows = self._storage._conn.execute(
-                "SELECT id, content, embedding, heat FROM memories "
-                "WHERE cluster_id = ? AND heat > 0",
-                (cluster_id,),
-            ).fetchall()
+            members = self._storage.get_memories_in_cluster(cluster_id, min_heat=0.0)
 
-            if len(rows) <= 3:
+            if len(members) <= 3:
                 continue
 
             # Extract entities and keywords from all member contents
-            all_content = " ".join(r[1] for r in rows)
+            all_content = " ".join(m["content"] for m in members)
             entities = _ENTITY_PATTERN_RE.findall(all_content)
             entity_counts = Counter(entities)
             top_entities = [e for e, _ in entity_counts.most_common(10)]
@@ -352,7 +376,7 @@ class SleepComputeEngine:
             summary = "; ".join(summary_parts) if summary_parts else cluster["summary"]
 
             # Compute centroid embedding (average of member embeddings, normalized)
-            embeddings_list = [r[2] for r in rows if r[2] is not None]
+            embeddings_list = [m["embedding"] for m in members if m.get("embedding") is not None]
             centroid = None
             if embeddings_list:
                 arrays = [np.frombuffer(e, dtype=np.float32) for e in embeddings_list]
@@ -378,14 +402,7 @@ class SleepComputeEngine:
 
         dir_groups: dict[str, list[dict]] = {}
         for cluster in clusters:
-            rows = self._storage._conn.execute(
-                "SELECT directory_context, COUNT(*) as cnt FROM memories "
-                "WHERE cluster_id = ? GROUP BY directory_context "
-                "ORDER BY cnt DESC LIMIT 1",
-                (cluster["id"],),
-            ).fetchall()
-
-            dominant_dir = rows[0][0] if rows else "unknown"
+            dominant_dir = self._storage.get_cluster_dominant_directory(cluster["id"]) or "unknown"
             dir_groups.setdefault(dominant_dir, []).append(cluster)
 
         for dir_ctx, group_clusters in dir_groups.items():
@@ -434,59 +451,11 @@ class SleepComputeEngine:
 
         return count
 
-    # -- e. Memory Compression --
-
-    def compress_old_memories(self, days_threshold: int = 30) -> int:
-        """Compress old verbose memories by extracting key entity-bearing sentences."""
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=days_threshold)
-        ).isoformat()
-
-        rows = self._storage._conn.execute(
-            "SELECT id, content FROM memories "
-            "WHERE created_at < ? AND LENGTH(content) > 1000 "
-            "AND (compressed = 0 OR compressed IS NULL)",
-            (cutoff,),
-        ).fetchall()
-
-        compressed_count = 0
-        for row in rows:
-            mem_id, content = row[0], row[1]
-
-            # Split into sentences and keep those containing entity patterns
-            sentences = _SENTENCE_RE.split(content)
-            key_sentences = [s for s in sentences if _ENTITY_PATTERN_RE.search(s)]
-
-            if not key_sentences:
-                # Fallback: keep first and last sentences
-                key_sentences = [sentences[0]]
-                if len(sentences) > 1:
-                    key_sentences.append(sentences[-1])
-
-            compressed_content = " ".join(key_sentences)
-
-            # Only compress if actually shorter
-            if len(compressed_content) >= len(content):
-                continue
-
-            # Update content, set compressed flag, re-embed
-            new_embedding = self._embeddings.encode(compressed_content)
-            self._storage._conn.execute(
-                "UPDATE memories SET content = ?, compressed = 1 WHERE id = ?",
-                (compressed_content, mem_id),
-            )
-            self._storage._conn.commit()
-
-            if new_embedding is not None:
-                self._storage.update_memory_embedding(
-                    mem_id, new_embedding, self._embeddings.get_model_name()
-                )
-
-            compressed_count += 1
-
-        return compressed_count
-
-    # -- f. Full Sleep Cycle --
+    # -- e. Full Sleep Cycle --
+    # Note: Memory compression is handled exclusively by MemoryCompressor
+    # during full consolidation cycles, which archives originals and manages
+    # compression levels properly (Phase 4 — removed conflicting sleep
+    # compression that bypassed archival).
 
     def run_sleep_cycle(self) -> dict:
         """Orchestrate all sleep-time operations in order."""
@@ -505,10 +474,7 @@ class SleepComputeEngine:
         logger.info("Sleep cycle phase 4: re-embedding")
         stats["reembedded"] = self.reembed_stale()
 
-        logger.info("Sleep cycle phase 5: compression")
-        stats["compressed"] = self.compress_old_memories()
-
-        logger.info("Sleep cycle phase 6: auto-narrate")
+        logger.info("Sleep cycle phase 5: auto-narrate")
         stats["narrative"] = self._narrative.auto_narrate()
 
         logger.info("Sleep cycle complete: %s", stats)

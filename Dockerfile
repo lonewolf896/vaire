@@ -45,6 +45,9 @@ RUN chown -R 1000:1000 /app/.cache
 COPY README.md LICENSE ./
 COPY vaire/ vaire/
 
+# Static reference library — immutable at runtime, versioned with code
+COPY reference/ /app/reference/
+
 # Install the package itself without re-downloading dependencies.
 RUN pip install --no-cache-dir --no-deps .
 
@@ -57,7 +60,7 @@ ENV TRANSFORMERS_OFFLINE=1 \
 # /data is bind-mounted from the host's ~/.vaire at runtime.
 # Both the SQLite database and the Unix domain socket land here so the
 # host-side thin client can reach the socket at ~/.vaire/vaire.sock.
-RUN mkdir -p /data
+RUN mkdir -p /data /certs
 
 ENV VAIRE_DB_PATH=/data/memory.db
 ENV VAIRE_SOCKET_PATH=/data/vaire.sock
@@ -65,6 +68,8 @@ ENV VAIRE_PID_FILE=/data/vaire.pid
 
 RUN mkdir -p /data/replicas
 
-# litestream wraps the server process: streams WAL changes to /data/replicas/
-# then forwards all signals to the child so graceful shutdown still works.
-ENTRYPOINT ["litestream", "replicate", "-config", "/etc/litestream.yml", "-exec", "python -m vaire server"]
+# Entrypoint wrapper: litestream + vaire server with circuit breaker.
+# If the server crashes 3 times within 5 minutes, the wrapper halts
+# instead of restart-looping.
+COPY entrypoint.sh /app/entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]

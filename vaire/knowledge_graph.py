@@ -39,14 +39,59 @@ _CHOSE_RE = re.compile(
     r"(?:chose|switched\s+to|opted\s+for|went\s+with|using\s+instead)\s+([\w][a-zA-Z0-9_.]{1,30})",
     re.IGNORECASE,
 )
-# Common Python keywords to exclude from prose function extraction
-_PY_KEYWORDS = frozenset({
+# Code token stoplist: common keywords across Python, Go, Bash, and Fish.
+# These produce false entities and flood detect_gaps with noise.
+# Extend via GRAPH_ENTITY_EXTRA_STOPWORDS in config.
+_CODE_TOKEN_STOPLIST = frozenset({
+    # Python keywords & builtins
     "if", "else", "elif", "for", "while", "with", "try", "except",
     "finally", "return", "yield", "lambda", "assert", "raise", "pass",
     "and", "not", "or", "in", "is", "del", "print", "len", "range",
     "str", "int", "list", "dict", "set", "tuple", "bool", "type",
     "super", "self", "cls", "open", "zip", "map", "filter", "any", "all",
+    "def", "class", "import", "from", "as", "global", "nonlocal",
+    "break", "continue", "None", "True", "False", "async", "await",
+    "isinstance", "getattr", "setattr", "hasattr", "property",
+    "staticmethod", "classmethod", "enumerate", "sorted", "reversed",
+    "min", "max", "sum", "abs", "round", "hex", "oct", "bin", "chr",
+    "ord", "repr", "hash", "id", "dir", "vars", "help", "input",
+    "float", "complex", "bytes", "bytearray", "memoryview", "object",
+    "frozenset", "slice", "format", "iter", "next", "callable",
+    # Go keywords & builtins
+    "func", "var", "const", "struct", "interface", "package", "main",
+    "switch", "case", "default", "select", "chan", "go", "defer",
+    "fallthrough", "goto", "byte", "rune", "make", "append", "copy",
+    "delete", "cap", "new", "panic", "recover", "close", "string",
+    "error", "nil", "iota", "uint", "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64", "float32", "float64",
+    "complex64", "complex128", "uintptr", "bool",
+    # Bash keywords & builtins
+    "echo", "read", "local", "export", "source", "eval", "exec",
+    "shift", "trap", "wait", "test", "expr", "let", "declare",
+    "unset", "readonly", "typeset", "getopts", "exit", "true", "false",
+    "fi", "do", "done", "then", "esac", "elif", "case", "function",
+    "select", "until", "coproc", "time", "printf", "cd", "pwd",
+    "pushd", "popd", "dirs", "jobs", "fg", "bg", "kill", "alias",
+    "unalias", "bind", "builtin", "caller", "command", "compgen",
+    "complete", "compopt", "disown", "enable", "hash", "logout",
+    "mapfile", "readarray", "shopt", "ulimit", "umask",
+    "sed", "awk", "grep", "cut", "sort", "head", "tail", "cat",
+    "wc", "tr", "tee", "xargs", "find", "chmod", "chown", "mkdir",
+    "rmdir", "touch", "cp", "mv", "rm", "ln", "ls", "stat",
+    # Fish keywords & builtins
+    "begin", "end", "status", "contains", "emit", "argparse",
+    "string", "math", "count", "path",
+    # Common short tokens that are never meaningful entities
+    "f", "i", "j", "k", "n", "x", "y", "v", "e", "r", "s", "t",
+    "ok", "err", "arg", "val", "key", "ctx", "buf", "msg", "cmd",
+    "tmp", "cfg", "src", "dst", "idx", "fmt", "gen", "ref", "ret",
+    "req", "res", "opt", "out", "log", "run", "add", "get", "put",
+    "pop", "raw", "nil", "end", "use", "sys", "env", "pid", "uid",
+    "gid", "tty", "eof", "nop", "sig", "sep", "num", "max", "min",
+    "tag", "doc", "pre", "sub", "mod",
 })
+# Keep backward compat alias
+_PY_KEYWORDS = _CODE_TOKEN_STOPLIST
 
 
 class KnowledgeGraph:
@@ -61,6 +106,14 @@ class KnowledgeGraph:
     def __init__(self, storage: StorageEngine, settings: Settings) -> None:
         self._storage = storage
         self._settings = settings
+        # Build effective stoplist: defaults + config extras
+        extra = settings.GRAPH_ENTITY_EXTRA_STOPWORDS.strip()
+        if extra:
+            self._stoplist = _CODE_TOKEN_STOPLIST | frozenset(
+                w.strip().lower() for w in extra.split(",") if w.strip()
+            )
+        else:
+            self._stoplist = _CODE_TOKEN_STOPLIST
 
     # -- a. Typed Relationship Management --
 
@@ -102,18 +155,7 @@ class KnowledgeGraph:
             return []
         eid = entity["id"]
         event_iso = event_time.isoformat()
-        rows = self._storage._conn.execute(
-            "SELECT r.*, "
-            "  e1.name AS source_name, e2.name AS target_name "
-            "FROM relationships r "
-            "JOIN entities e1 ON e1.id = r.source_entity_id "
-            "JOIN entities e2 ON e2.id = r.target_entity_id "
-            "WHERE (r.source_entity_id = ? OR r.target_entity_id = ?) "
-            "  AND r.event_time <= ? "
-            "ORDER BY r.event_time DESC",
-            (eid, eid, event_iso),
-        ).fetchall()
-        return self._storage._rows_to_dicts(rows)
+        return self._storage.get_relationships_at_time(eid, event_iso)
 
     def get_relationship_history(
         self, source: str, target: str
@@ -123,18 +165,7 @@ class KnowledgeGraph:
         if not source_entity or not target_entity:
             return []
         sid, tid = source_entity["id"], target_entity["id"]
-        rows = self._storage._conn.execute(
-            "SELECT r.*, "
-            "  e1.name AS source_name, e2.name AS target_name "
-            "FROM relationships r "
-            "JOIN entities e1 ON e1.id = r.source_entity_id "
-            "JOIN entities e2 ON e2.id = r.target_entity_id "
-            "WHERE (r.source_entity_id = ? AND r.target_entity_id = ?) "
-            "   OR (r.source_entity_id = ? AND r.target_entity_id = ?) "
-            "ORDER BY r.created_at ASC",
-            (sid, tid, tid, sid),
-        ).fetchall()
-        return self._storage._rows_to_dicts(rows)
+        return self._storage.get_relationship_history(sid, tid)
 
     # -- c. Causal Edge Detection --
 
@@ -150,12 +181,9 @@ class KnowledgeGraph:
             if not e.get("name", "").startswith("memory:")
         }
 
-        co_rels = self._storage._conn.execute(
-            "SELECT * FROM relationships WHERE relationship_type = 'co_occurrence' "
-            "AND weight >= ?",
-            (threshold,),
-        ).fetchall()
-        co_rels = self._storage._rows_to_dicts(co_rels)
+        co_rels = self._storage.get_relationships_by_weight(
+            min_weight=threshold, relationship_type="co_occurrence"
+        )
 
         for rel in co_rels:
             sid, tid = rel["source_entity_id"], rel["target_entity_id"]
@@ -181,17 +209,16 @@ class KnowledgeGraph:
                     existing["id"],
                     datetime.now(timezone.utc).isoformat(),
                 )
-                self._storage._conn.execute(
+                self._storage.execute_write(
                     "UPDATE relationships SET is_causal = 1 WHERE id = ?",
                     (existing["id"],),
                 )
-                self._storage._conn.commit()
             else:
                 src_e = self._storage.get_entity_by_name(causal_src)
                 tgt_e = self._storage.get_entity_by_name(causal_tgt)
                 if src_e and tgt_e:
                     now = datetime.now(timezone.utc).isoformat()
-                    self._storage._conn.execute(
+                    self._storage.execute_write(
                         "INSERT INTO relationships("
                         "source_entity_id, target_entity_id, relationship_type, "
                         "weight, created_at, last_reinforced, event_time, record_time, "
@@ -200,7 +227,6 @@ class KnowledgeGraph:
                         (src_e["id"], tgt_e["id"], "caused_by",
                          1.0, now, now, now, now, 1, 0.8),
                     )
-                    self._storage._conn.commit()
                     created += 1
         return created
 
@@ -271,10 +297,15 @@ class KnowledgeGraph:
         for m in _FILE_REF_RE.finditer(content):
             results.append((m.group(1), "file", ""))
 
-        # Deduplicate preserving order
+        # Deduplicate preserving order, filter code token stoplist.
+        # Only filter lowercase names — CamelCase/PascalCase are real entities
+        # (e.g., "Path" is a class, "path" is a Fish builtin).
         seen: set[tuple[str, str, str]] = set()
         unique: list[tuple[str, str, str]] = []
         for triple in results:
+            name = triple[0]
+            if name == name.lower() and name in self._stoplist:
+                continue
             if triple not in seen:
                 seen.add(triple)
                 unique.append(triple)
@@ -347,11 +378,8 @@ class KnowledgeGraph:
             for neighbor in neighbors:
                 nid = neighbor["entity_id"]
                 if nid not in nodes:
-                    nent = self._storage._conn.execute(
-                        "SELECT * FROM entities WHERE id = ?", (nid,)
-                    ).fetchone()
+                    nent = self._storage.get_entity_by_id(nid)
                     if nent:
-                        nent = self._storage._row_to_dict(nent)
                         nodes[nid] = {
                             "id": nid,
                             "name": nent["name"],
@@ -386,21 +414,13 @@ class KnowledgeGraph:
         if existing:
             return existing
         eid = self._storage.insert_entity({"name": name, "type": "variable"})
-        row = self._storage._conn.execute(
-            "SELECT * FROM entities WHERE id = ?", (eid,)
-        ).fetchone()
-        return self._storage._row_to_dict(row) if row else {"id": eid, "name": name}
+        entity = self._storage.get_entity_by_id(eid)
+        return entity if entity else {"id": eid, "name": name}
 
     def _get_typed_relationship(
         self, source_id: int, target_id: int, rel_type: str
     ) -> dict | None:
-        row = self._storage._conn.execute(
-            "SELECT * FROM relationships "
-            "WHERE source_entity_id = ? AND target_entity_id = ? "
-            "AND relationship_type = ?",
-            (source_id, target_id, rel_type),
-        ).fetchone()
-        return self._storage._row_to_dict(row)
+        return self._storage.get_typed_relationship(source_id, target_id, rel_type)
 
     def _get_typed_relationship_by_name(
         self, source_name: str, target_name: str, rel_type: str
@@ -420,7 +440,7 @@ class KnowledgeGraph:
         record_time_iso: str,
         confidence: float,
     ) -> int:
-        cur = self._storage._conn.execute(
+        cur = self._storage.execute_write(
             "INSERT INTO relationships("
             "source_entity_id, target_entity_id, relationship_type, "
             "weight, created_at, last_reinforced, event_time, record_time, "
@@ -431,44 +451,24 @@ class KnowledgeGraph:
              event_time_iso, record_time_iso,
              0, confidence),
         )
-        self._storage._conn.commit()
         return cur.lastrowid
 
     def _reinforce_typed_relationship(self, rel_id: int, now_iso: str) -> None:
-        self._storage._conn.execute(
+        self._storage.execute_write(
             "UPDATE relationships SET weight = weight + 1, last_reinforced = ? "
             "WHERE id = ?",
             (now_iso, rel_id),
         )
-        self._storage._conn.commit()
 
     def _get_adjacent(
         self, entity_id: int, rel_types: list[str] | None
     ) -> list[dict]:
-        if rel_types:
-            placeholders = ",".join("?" for _ in rel_types)
-            rows = self._storage._conn.execute(
-                f"SELECT r.*, e1.name AS source_name, e2.name AS target_name "
-                f"FROM relationships r "
-                f"JOIN entities e1 ON e1.id = r.source_entity_id "
-                f"JOIN entities e2 ON e2.id = r.target_entity_id "
-                f"WHERE (r.source_entity_id = ? OR r.target_entity_id = ?) "
-                f"AND r.relationship_type IN ({placeholders})",
-                (entity_id, entity_id, *rel_types),
-            ).fetchall()
-        else:
-            rows = self._storage._conn.execute(
-                "SELECT r.*, e1.name AS source_name, e2.name AS target_name "
-                "FROM relationships r "
-                "JOIN entities e1 ON e1.id = r.source_entity_id "
-                "JOIN entities e2 ON e2.id = r.target_entity_id "
-                "WHERE r.source_entity_id = ? OR r.target_entity_id = ?",
-                (entity_id, entity_id),
-            ).fetchall()
+        rows = self._storage.get_adjacent_relationships(
+            entity_id, relationship_types=rel_types
+        )
 
         result = []
-        for row in rows:
-            row_d = self._storage._row_to_dict(row)
+        for row_d in rows:
             other_id = (
                 row_d["target_entity_id"]
                 if row_d["source_entity_id"] == entity_id
@@ -499,10 +499,9 @@ class KnowledgeGraph:
         b_before_a = 0
 
         # Search episodes (live session content)
-        episodes = self._storage._conn.execute(
-            "SELECT raw_content FROM episodes ORDER BY timestamp ASC"
-        ).fetchall()
-        for (content,) in episodes:
+        episodes = self._storage.get_all_episode_contents()
+        for ep in episodes:
+            content = ep["raw_content"]
             pos_a = content.find(entity_a)
             pos_b = content.find(entity_b)
             if pos_a >= 0 and pos_b >= 0:
@@ -512,11 +511,10 @@ class KnowledgeGraph:
                     b_before_a += 1
 
         # Also search memory content (covers bulk-ingested memories)
-        memories = self._storage._conn.execute(
-            "SELECT content FROM memories "
-            "WHERE heat > 0 ORDER BY created_at ASC"
-        ).fetchall()
-        for (content,) in memories:
+        memories = self._storage.get_hot_memories_all()
+        memories.sort(key=lambda m: m.get("created_at", ""))
+        for mem in memories:
+            content = mem.get("content")
             if content is None:
                 continue
             pos_a = content.find(entity_a)
