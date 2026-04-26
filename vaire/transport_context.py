@@ -16,11 +16,23 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class TransportInfo:
-    """Metadata about the transport that originated the current request."""
+    """Metadata about the transport that originated the current request.
+
+    Identity precedence used by callers (see ``MTLSMiddleware`` and
+    ``SVIDMiddleware`` in :mod:`vaire.server`):
+
+    * ``caller_spiffe_id`` set ⇒ request authenticated via SPIFFE SVID.
+    * ``agent_cn`` set         ⇒ request authenticated via legacy CN-only
+      mTLS (or X-Vaire-CN header fallback).
+
+    A remote request that reaches a tool handler MUST have at least one of
+    these set; absence of both is a 401 condition enforced upstream.
+    """
 
     is_remote: bool = False
-    agent_cn: str = ""       # Client certificate Common Name
-    client_ip: str = ""      # Remote IP address
+    agent_cn: str = ""           # Client certificate Common Name (legacy mTLS)
+    client_ip: str = ""          # Remote IP address
+    caller_spiffe_id: str = ""   # SPIFFE ID, e.g. "spiffe://prod.ilmarin/groomer"
 
 
 transport_ctx: ContextVar[TransportInfo] = ContextVar(

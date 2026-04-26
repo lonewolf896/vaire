@@ -491,8 +491,10 @@ def remember(content: str, context: str, tags: list[str], force: bool = False) -
         if "unprocessed" not in tags:
             tags.append("unprocessed")
         logger.info(
-            "Remote remember from %s (%s)",
-            transport_info.agent_cn, transport_info.client_ip,
+            "Remote remember from cn=%s spiffe=%s (%s)",
+            transport_info.agent_cn or "-",
+            transport_info.caller_spiffe_id or "-",
+            transport_info.client_ip,
         )
 
     storage = _get_storage()
@@ -1220,8 +1222,10 @@ def create_trigger(
     transport_info = transport_ctx.get()
     if transport_info.is_remote:
         logger.warning(
-            "Remote create_trigger blocked from %s (%s)",
-            transport_info.agent_cn, transport_info.client_ip,
+            "Remote create_trigger blocked from cn=%s spiffe=%s (%s)",
+            transport_info.agent_cn or "-",
+            transport_info.caller_spiffe_id or "-",
+            transport_info.client_ip,
         )
         return {"status": "error", "message": "Prospective triggers cannot be created remotely"}
 
@@ -2727,6 +2731,13 @@ class MTLSMiddleware:
       1. TLS client certificate CN (from ASGI extensions or transport)
       2. X-Vaire-CN header (fallback, logged as warning)
       3. "unknown" (no identity available)
+
+    Coexists with :class:`SVIDMiddleware` (Phase 2 / SPIFFE migration).
+    The SVID middleware runs first; if it sets ``caller_spiffe_id`` this
+    middleware leaves the existing context alone and only fills in
+    ``agent_cn`` / ``client_ip`` when no SPIFFE identity was found. A
+    request reaches a tool handler with EITHER ``caller_spiffe_id`` OR
+    ``agent_cn`` populated — never neither (rejected upstream).
     """
 
     def __init__(self, app):
@@ -2735,6 +2746,13 @@ class MTLSMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             from vaire.transport_context import TransportInfo
+
+            current = transport_ctx.get()
+            # If SVIDMiddleware already authenticated the caller, do not
+            # overwrite the SPIFFE identity — just pass through.
+            if current.is_remote and current.caller_spiffe_id:
+                await self.app(scope, receive, send)
+                return
 
             cn = self._extract_cert_cn(scope)
             client = scope.get("client", ("unknown", 0))
@@ -2795,11 +2813,161 @@ class MTLSMiddleware:
         return cn
 
 
+# ── SPIFFE SVID middleware (Phase 2 of ilmarin:ecosystem-evolution) ───
+#
+# Runs *before* MTLSMiddleware in the ASGI chain. If the peer cert carries
+# a SPIFFE URI SAN, this middleware validates it against the trust bundle
+# and populates ``caller_spiffe_id`` on the transport context. MTLSMiddleware
+# then sees a request that is already authenticated and leaves the SPIFFE
+# identity intact (it only fills in ``agent_cn`` for legacy CN-only certs).
+#
+# Rejection (invalid SVID): emits an audit-log line of the form
+# ``event=svid_rejected reason=<stable-string> ...`` and returns 403.
+
+def _peercert_x509_from_scope(scope: dict) -> "object | None":
+    """Best-effort extraction of an x509 ``Certificate`` from an ASGI scope.
+
+    Strategy mirrors :meth:`MTLSMiddleware._extract_cert_cn` but pulls the
+    DER-encoded cert (preferred) or the structured peercert dict so we can
+    rebuild a cryptography.x509 object. Returns ``None`` if no cert can be
+    obtained — the SVID middleware then short-circuits and lets
+    MTLSMiddleware handle the request via its own fallbacks.
+    """
+    from cryptography import x509
+
+    # Strategy 1: ASGI extensions surfacing DER bytes (future ASGI TLS spec).
+    tls_info = scope.get("extensions", {}).get("tls", {})
+    der = tls_info.get("peercert_der")
+    if der:
+        try:
+            return x509.load_der_x509_certificate(der)
+        except Exception:
+            pass
+
+    # Strategy 2: uvicorn transport — get_extra_info("ssl_object").
+    try:
+        transport = scope.get("_transport") or scope.get("extensions", {}).get("transport")
+        if transport is not None:
+            ssl_object = transport.get_extra_info("ssl_object")
+            if ssl_object is not None:
+                der = ssl_object.getpeercert(binary_form=True)
+                if der:
+                    return x509.load_der_x509_certificate(der)
+    except Exception:
+        pass
+
+    # Strategy 3: explicit DER stashed by an outer test harness.
+    der = scope.get("_peercert_der")
+    if der:
+        try:
+            return x509.load_der_x509_certificate(der)
+        except Exception:
+            pass
+
+    return None
+
+
+class SVIDMiddleware:
+    """ASGI middleware that validates SPIFFE SVIDs on incoming HTTPS requests.
+
+    Runs before :class:`MTLSMiddleware`. Behavior:
+
+    * No URI SAN on the peer cert → pass through unchanged so the legacy
+      ``MTLSMiddleware`` can handle the request as a CN-only mTLS caller.
+    * URI SAN present but validation fails (foreign trust domain, expired,
+      untrusted issuer, malformed URI, …) → emit an
+      ``event=svid_rejected`` audit log and return ``403 Forbidden``.
+    * Validation succeeds → set ``caller_spiffe_id`` on the transport
+      context and emit an ``event=svid_authenticated`` audit log.
+
+    Trust-bundle and trust-domain configuration are read at request time
+    from the environment (``SPIRE_TRUST_BUNDLE_PATH`` /
+    ``SPIRE_TRUST_DOMAIN``) so operators can rotate the bundle file on
+    disk without restarting Vaire.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        from vaire.svid import (
+            SVIDValidationError,
+            extract_spiffe_id_from_cert,
+            validate_svid,
+        )
+        from vaire.transport_context import TransportInfo
+
+        cert = _peercert_x509_from_scope(scope)
+        if cert is None:
+            # No cert available at all — let MTLSMiddleware deal with it
+            # (header-based fallback, legacy CN, or its own rejection).
+            await self.app(scope, receive, send)
+            return
+
+        # Quick check: does this cert even claim to be an SVID? If it has
+        # no URI SAN we treat it as a legacy CN-only cert and pass through.
+        try:
+            extract_spiffe_id_from_cert(cert)
+        except SVIDValidationError as e:
+            if e.reason == "no_uri_san":
+                await self.app(scope, receive, send)
+                return
+            # Has a URI SAN but it does not parse as a SPIFFE ID —
+            # fall through to validate_svid which will reject for the
+            # same reason and emit a structured audit event.
+
+        client = scope.get("client", ("unknown", 0))
+        client_ip = str(client[0])
+
+        try:
+            spiffe_id = validate_svid(cert)
+        except SVIDValidationError as e:
+            logger.warning(
+                "event=svid_rejected reason=%s client_ip=%s detail=%s",
+                e.reason, client_ip, e.detail,
+            )
+            await _send_403(send, e.reason)
+            return
+
+        token = transport_ctx.set(TransportInfo(
+            is_remote=True,
+            agent_cn="",  # MTLSMiddleware fills this only for legacy callers
+            client_ip=client_ip,
+            caller_spiffe_id=str(spiffe_id),
+        ))
+        logger.info(
+            "event=svid_authenticated caller_spiffe_id=%s client_ip=%s",
+            str(spiffe_id), client_ip,
+        )
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            transport_ctx.reset(token)
+
+
+async def _send_403(send, reason: str) -> None:
+    """Send a minimal 403 response. Reason is in the body for operator triage."""
+    body = (f'{{"error":"svid_rejected","reason":"{reason}"}}').encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": 403,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
 async def run_https(settings_override=None):
     """Start the mTLS HTTPS server alongside the socket server.
 
     Reuses the existing FastMCP Starlette app (same tool routes),
-    wrapping it with MTLSMiddleware and SSL.
+    wrapping it with SVIDMiddleware → MTLSMiddleware → SSL.
     """
     import ssl as _ssl
     import uvicorn
@@ -2838,8 +3006,11 @@ async def run_https(settings_override=None):
     finally:
         mcp_server.settings.transport_security = original_security
 
-    # Wrap with mTLS context middleware
+    # Wrap with mTLS context middleware. SVIDMiddleware must be the outer
+    # layer so it sees the raw scope/peer cert before MTLSMiddleware does
+    # its CN-extraction fallback chain.
     app = MTLSMiddleware(app)
+    app = SVIDMiddleware(app)
 
     config = uvicorn.Config(
         app,
